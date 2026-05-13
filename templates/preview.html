@@ -1,0 +1,594 @@
+{% extends "base.html" %}
+{% block title %}Preview — MSM Shipment Tracker{% endblock %}
+
+{% block content %}
+
+<!-- Header -->
+<div class="flex items-start justify-between mb-6">
+  <div>
+    <h1 class="text-2xl font-bold text-gray-900">Shipment Preview</h1>
+    <p class="text-gray-500 text-sm mt-1">{{ filename }} — {{ rows|length }} box(es) across {{ by_gear|length }} gear type(s)</p>
+  </div>
+  <a href="/" class="text-sm text-gray-500 hover:text-gray-700">← Upload another</a>
+</div>
+
+{% if matched_order %}
+<div class="bg-blue-50 border border-blue-200 rounded-lg px-5 py-3 mb-6 text-sm text-blue-800 flex items-center gap-3">
+  <span class="text-xl">🔗</span>
+  <div>
+    <strong>Matched to saved order:</strong>
+    {{ matched_order.market }} {{ matched_order.season }} {{ matched_order.sport }} #{{ matched_order.order_num }}
+    — {{ matched_gear_tasks | length }} gear type(s) already in ClickUp.
+    Pushing will <strong>update</strong> those tasks and add box subtasks.
+  </div>
+</div>
+{% endif %}
+
+{% if not has_settings %}
+<div class="bg-amber-50 border border-amber-200 rounded-lg px-5 py-3 mb-6 text-sm text-amber-800 flex items-center justify-between">
+  <span>⚠️ API keys not configured — actions below will fail until you add them.</span>
+  <a href="/settings" class="font-semibold underline ml-4">Settings →</a>
+</div>
+{% endif %}
+
+<!-- Order details + actions -->
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5 mb-6">
+
+  <!-- Row 1: Sport / Season / Order Date / Ship Date -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+    <div>
+      <label class="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wide">Sport</label>
+      <select id="sport" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300"
+              onchange="updateMeta('sport', this.value)">
+        {% for code, label in sports %}
+        <option value="{{ code }}" {% if meta.get('sport', 'BSBL') == code %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wide">Season</label>
+      <select id="season" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300"
+              onchange="updateMeta('season', this.value)">
+        {% for s in seasons %}
+        <option value="{{ s }}" {% if meta.get('season', 'Fall') == s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wide">Order Date</label>
+      <input type="date" id="orderDate"
+             value="{{ meta.get('order_date', '') }}"
+             class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300"
+             onchange="updateMeta('order_date', this.value)">
+    </div>
+    <div>
+      <label class="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wide">Ship Date (Actual)</label>
+      <input type="date" id="shipDate"
+             value="{{ meta.get('ship_date', today) }}"
+             class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300"
+             onchange="updateMeta('ship_date', this.value)">
+      <p class="text-xs text-gray-400 mt-0.5">Only set when tracking # exists</p>
+    </div>
+  </div>
+
+  <!-- Row 2: Order sheet link -->
+  <div class="mb-5">
+    <label class="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wide">Order Sheet Link</label>
+    <input type="url" id="orderSheetUrl"
+           placeholder="https://docs.google.com/spreadsheets/d/..."
+           value="{{ meta.get('order_sheet_url', '') }}"
+           class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
+           oninput="updateMeta('order_sheet_url', this.value)">
+  </div>
+
+  <h2 class="font-semibold text-gray-700 text-sm uppercase tracking-wide mb-4">Push to Integrations</h2>
+  <div class="flex flex-wrap gap-3">
+
+    <button onclick="pushTo('clickup')" id="btn-clickup"
+            class="flex items-center gap-2 px-5 py-2.5 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-xl text-sm transition-all">
+      <span id="icon-clickup">📋</span> Create in ClickUp
+    </button>
+
+    <button onclick="pushTo('aftership')" id="btn-aftership"
+            class="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl text-sm transition-all">
+      <span id="icon-aftership">🚚</span> Export AfterShip CSV
+    </button>
+
+    <button onclick="copyShipmentMessage()" id="btn-copy-msg"
+            class="flex items-center gap-2 px-5 py-2.5 bg-gray-700 hover:bg-gray-800 text-white font-semibold rounded-xl text-sm transition-all">
+      <span id="icon-copy-msg">📋</span> Copy Shipment Message
+    </button>
+
+  </div>
+
+  <!-- Result messages -->
+  <div id="result-clickup" class="hidden mt-3 text-sm px-4 py-2 rounded-lg"></div>
+  <div id="result-aftership" class="hidden mt-3 text-sm px-4 py-2 rounded-lg"></div>
+</div>
+
+<!-- Data table grouped by gear type -->
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
+  <div class="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
+    <h2 class="font-semibold text-gray-700 text-sm uppercase tracking-wide">Shipment Details</h2>
+    <span class="text-xs text-gray-400">Click tracking # cells to edit</span>
+  </div>
+
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm" id="shipmentTable">
+      <thead>
+        <tr class="bg-gray-50 text-gray-500 text-xs uppercase tracking-wide">
+          <th class="px-4 py-3 text-left font-medium">Gear Type</th>
+          <th class="px-4 py-3 text-left font-medium">Shipment</th>
+          <th class="px-4 py-3 text-left font-medium">Contents</th>
+          <th class="px-4 py-3 text-left font-medium">Weight</th>
+          <th class="px-4 py-3 text-left font-medium">Declared Value</th>
+          <th class="px-4 py-3 text-left font-medium">Carrier</th>
+          <th class="px-4 py-3 text-left font-medium">Tracking Number</th>
+          <th class="px-4 py-3 text-left font-medium">Status</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-100">
+        {% for gear_type, boxes in by_gear.items() | sort %}
+          {% for box in boxes | sort(attribute='box_num') %}
+          <tr class="hover:bg-gray-50 transition-colors" data-id="{{ box.id }}">
+            <!-- Gear type cell — only show label on first box of each group -->
+            <td class="px-4 py-3 font-semibold text-gray-800">
+              {% if loop.first %}
+                <span class="inline-flex items-center gap-1.5">
+                  <span class="w-2 h-2 rounded-full bg-purple-400 inline-block"></span>
+                  {{ gear_type }}
+                </span>
+                {% if boxes|length > 1 %}
+                  <span class="ml-2 text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full">{{ boxes|length }} boxes</span>
+                {% endif %}
+                {% if gear_type in matched_gear_tasks %}
+                  <span class="ml-1 text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">🔗 update</span>
+                {% else %}
+                  <span class="ml-1 text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full">+ new</span>
+                {% endif %}
+              {% endif %}
+            </td>
+            <td class="px-4 py-3 text-gray-600 font-mono">
+              {%- if box.tracking_number -%}
+                {{ box.order_num }}{{ tracking_letters.get(box.tracking_number, '') }}
+              {%- else %}—{%- endif -%}
+            </td>
+            <td class="px-4 py-3 text-gray-600 max-w-xs truncate" title="{{ box.contents }}">{{ box.contents or '—' }}</td>
+            <td class="px-4 py-3 text-gray-600">{{ box.weight or '—' }}</td>
+            <td class="px-4 py-3 text-gray-600">{{ box.declared_value or '—' }}</td>
+
+            <!-- Carrier dropdown -->
+            <td class="px-4 py-3">
+              <select class="carrier-select text-xs border border-gray-200 rounded px-2 py-1 text-gray-600 bg-white"
+                      data-id="{{ box.id }}" onchange="updateField('{{ box.id }}', 'carrier', this.value)">
+                {% for slug, label in carriers %}
+                <option value="{{ slug }}" {% if box.carrier == slug %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+              </select>
+            </td>
+
+            <!-- Editable tracking number -->
+            <td class="px-4 py-3">
+              <input type="text"
+                     class="tracking-input border-b border-transparent hover:border-blue-300 focus:border-blue-500 outline-none px-1 py-0.5 text-gray-700 bg-transparent w-40 transition-colors"
+                     placeholder="Enter tracking #"
+                     value="{{ box.tracking_number }}"
+                     data-id="{{ box.id }}"
+                     onchange="updateField('{{ box.id }}', 'tracking_number', this.value)">
+            </td>
+
+            <!-- Status badge -->
+            <td class="px-4 py-3">
+              {% if box.tracking_number %}
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700">
+                  ✓ Has tracking
+                </span>
+              {% else %}
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-700">
+                  ⚠ Missing
+                </span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- AfterShip confirmation modal -->
+<div id="aftership-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] flex flex-col">
+    <div class="px-6 py-4 border-b border-gray-100 flex items-center justify-between shrink-0">
+      <div>
+        <h2 class="font-bold text-gray-900 text-lg">AfterShip — Review &amp; Export CSV</h2>
+        <p class="text-xs text-gray-400 mt-0.5">Review tracking details, then download the CSV to import into AfterShip</p>
+      </div>
+      <button onclick="closeAftershipModal()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none">&times;</button>
+    </div>
+
+    <div class="overflow-y-auto px-6 py-4 grow space-y-3">
+      <div id="modal-error" class="hidden px-4 py-2 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700"></div>
+      <div id="modal-body"></div>
+    </div>
+
+    <div class="px-6 py-4 border-t border-gray-100 flex items-center justify-between shrink-0">
+      <button id="copy-summary-btn" onclick="copyAftershipSummary()"
+              class="px-4 py-2 rounded-xl text-sm font-semibold text-gray-600 bg-gray-100 hover:bg-gray-200 transition-all flex items-center gap-2">
+        <span id="copy-summary-icon">📋</span> Copy Summary
+      </button>
+      <div class="flex gap-3">
+        <button onclick="closeAftershipModal()"
+                class="px-5 py-2 rounded-xl text-sm font-semibold text-gray-600 bg-gray-100 hover:bg-gray-200 transition-all">
+          Cancel
+        </button>
+        <button id="modal-confirm-btn" onclick="confirmAftershipPush()"
+                class="px-6 py-2 rounded-xl text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 transition-all flex items-center gap-2">
+          <span id="modal-confirm-icon">⬇️</span> Download CSV
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Hidden data store -->
+<script>
+  // Hydrate data from server
+  let shipmentData = {{ rows | tojson }};
+  let shipmentMeta = Object.assign(
+    { sport: 'BSBL', season: 'Fall', order_date: '', ship_date: '{{ today }}', order_sheet_url: '' },
+    {{ meta | tojson }}
+  );
+
+  function updateMeta(field, value) {
+    shipmentMeta[field] = value;
+    clearTimeout(window._saveTimer);
+    window._saveTimer = setTimeout(saveData, 800);
+  }
+
+function updateField(id, field, value) {
+    const row = shipmentData.find(r => r.id === id);
+    if (row) {
+      row[field] = value;
+      // Update status badge live
+      if (field === 'tracking_number') {
+        const tr = document.querySelector(`tr[data-id="${id}"]`);
+        if (tr) {
+          const badge = tr.querySelector('td:last-child span');
+          if (badge) {
+            if (value.trim()) {
+              badge.className = 'inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700';
+              badge.textContent = '✓ Has tracking';
+            } else {
+              badge.className = 'inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-700';
+              badge.textContent = '⚠ Missing';
+            }
+          }
+        }
+      }
+      // Debounced save to server
+      clearTimeout(window._saveTimer);
+      window._saveTimer = setTimeout(saveData, 800);
+    }
+  }
+
+  async function saveData() {
+    await fetch('/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rows: shipmentData, meta: shipmentMeta })
+    });
+  }
+
+  async function copyShipmentMessage() {
+    await saveData();
+
+    const market   = shipmentData[0]?.market || '';
+    const orderNum = shipmentData[0]?.order_num || '';
+
+    // Fetch shipment map to get order # and box count per tracking
+    let trackingLines = [];
+    let gearHeader = [...new Set(shipmentData.map(r => r.gear_type))].join(', ');
+    try {
+      const resp = await fetch('/preview/aftership', { method: 'POST' });
+      const data = await resp.json();
+      if (data.ok && data.items.length) {
+        // Build gear header: list each shipment as "Jersey 1A", "Jersey 1B", or just "Hoodie"
+        gearHeader = data.items.map(item => {
+          return item.letter ? `${item.primary_gear} ${item.order_num}${item.letter}` : item.primary_gear;
+        }).join(', ');
+
+        trackingLines = data.items.map(item => {
+          const boxMatch = item.note?.match(/^(\d+ boxes?)/);
+          const boxes = boxMatch ? boxMatch[1] : '';
+          const gear = (item.gear_types || []).join(', ');
+          return `:truck: Tracking Number: ${item.tracking_number}\nOrder #: ${item.order_id}${boxes ? ' | ' + boxes : ''}${gear ? '\nGear: ' + gear : ''}`;
+        });
+      }
+    } catch (_) {}
+
+    // Fallback to plain tracking numbers if fetch failed
+    if (!trackingLines.length) {
+      trackingLines = [...new Set(shipmentData.filter(r => r.tracking_number).map(r => r.tracking_number))]
+        .map(tn => `:truck: Tracking Number: ${tn}`);
+    }
+
+    const msg = [
+      `Hi! Here's the update on your ${market} order #${orderNum}:`,
+      `:package: Gear: ${gearHeader}`,
+      `:point_right: Status: Shipped`,
+      '',
+      trackingLines.join('\n\n'),
+    ].join('\n');
+
+    await navigator.clipboard.writeText(msg);
+
+    const btn  = document.getElementById('btn-copy-msg');
+    const icon = document.getElementById('icon-copy-msg');
+    icon.textContent = '✓';
+    btn.classList.replace('bg-gray-700', 'bg-green-600');
+    btn.classList.replace('hover:bg-gray-800', 'hover:bg-green-700');
+    setTimeout(() => {
+      icon.textContent = '📋';
+      btn.classList.replace('bg-green-600', 'bg-gray-700');
+      btn.classList.replace('hover:bg-green-700', 'hover:bg-gray-800');
+    }, 2000);
+  }
+
+  async function pushTo(target) {
+    if (target === 'aftership') {
+      await openAftershipModal();
+      return;
+    }
+    await doPush(target);
+  }
+
+  async function doPush(target) {
+    const btn = document.getElementById(`btn-${target}`);
+    const icon = document.getElementById(`icon-${target}`);
+    const result = document.getElementById(`result-${target}`);
+
+    await saveData();
+
+    btn.disabled = true;
+    btn.classList.add('opacity-70');
+    icon.innerHTML = '<svg class="spin w-4 h-4 inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>';
+
+    try {
+      const resp = await fetch(`/push/${target}`, { method: 'POST' });
+      const data = await resp.json();
+
+      result.classList.remove('hidden');
+      if (data.ok) {
+        result.className = 'mt-3 text-sm px-4 py-2 rounded-lg bg-green-50 text-green-700 border border-green-200';
+        result.textContent = '✓ ' + (data.message || 'Done!');
+      } else {
+        result.className = 'mt-3 text-sm px-4 py-2 rounded-lg bg-red-50 text-red-700 border border-red-200';
+        result.textContent = '✗ ' + (data.error || data.message || 'Something went wrong.');
+      }
+    } catch (e) {
+      result.classList.remove('hidden');
+      result.className = 'mt-3 text-sm px-4 py-2 rounded-lg bg-red-50 text-red-700 border border-red-200';
+      result.textContent = '✗ Network error: ' + e.message;
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove('opacity-70');
+      const icons = { clickup: '📋', aftership: '🚚' };
+      icon.innerHTML = icons[target];
+    }
+  }
+
+  let _aftershipItems = [];
+
+  async function openAftershipModal() {
+    await saveData();
+    _aftershipItems = [];
+    const modal    = document.getElementById('aftership-modal');
+    const body     = document.getElementById('modal-body');
+    const errBox   = document.getElementById('modal-error');
+    const confirmBtn = document.getElementById('modal-confirm-btn');
+
+    // Reset state
+    body.innerHTML = '';
+    errBox.classList.add('hidden');
+    confirmBtn.disabled = false;
+    document.getElementById('modal-confirm-icon').textContent = '🚚';
+    modal.classList.remove('hidden');
+
+    // Show spinner while loading
+    body.innerHTML = `<p class="py-6 text-center text-gray-400 text-sm">Loading preview…</p>`;
+
+    try {
+      const resp = await fetch('/preview/aftership', { method: 'POST' });
+      const data = await resp.json();
+
+      if (!data.ok) {
+        body.innerHTML = '';
+        errBox.textContent = '✗ ' + (data.error || 'Could not build preview.');
+        errBox.classList.remove('hidden');
+        confirmBtn.disabled = true;
+        return;
+      }
+
+      _aftershipItems = data.items;
+      body.innerHTML = data.items.map((item, i) => `
+        <div class="rounded-xl border border-gray-200 bg-gray-50 p-4">
+          <p class="text-xs font-bold text-purple-700 uppercase tracking-wide mb-2">${item.market} Order #${item.order_num}</p>
+          <div class="flex items-start justify-between gap-4 mb-3">
+            <div>
+              <span class="text-xs font-medium text-gray-400 uppercase tracking-wide">Tracking #</span>
+              <p class="font-mono text-sm font-semibold text-gray-800 mt-0.5">${item.tracking_number}</p>
+            </div>
+            <div class="text-right">
+              <span class="text-xs font-medium text-gray-400 uppercase tracking-wide">Order # / Title</span>
+              <p class="font-mono text-sm font-bold text-blue-700 mt-0.5">${item.order_id}</p>
+            </div>
+          </div>
+          <div class="grid grid-cols-2 gap-x-6 gap-y-2 text-sm border-t border-gray-200 pt-3">
+            <div>
+              <span class="text-xs text-gray-400 uppercase tracking-wide font-medium">Ship To</span>
+              <p class="text-gray-800 font-semibold">${item.customer_name}</p>
+            </div>
+            <div>
+              <span class="text-xs text-gray-400 uppercase tracking-wide font-medium">Role</span>
+              <p class="text-gray-700">${item.role}</p>
+            </div>
+            <div>
+              <span class="text-xs text-gray-400 uppercase tracking-wide font-medium">Phone</span>
+              <p class="text-gray-700">${item.phone || '—'}</p>
+            </div>
+            <div>
+              <span class="text-xs text-gray-400 uppercase tracking-wide font-medium">Email</span>
+              <p class="text-gray-700">${item.email || '—'}</p>
+            </div>
+            <div>
+              <span class="text-xs text-gray-400 uppercase tracking-wide font-medium">Status</span>
+              <p class="text-green-700 font-semibold">Shipped</p>
+            </div>
+            <div>
+              <span class="text-xs text-gray-400 uppercase tracking-wide font-medium">Ship Date</span>
+              <p class="text-gray-700">${item.ship_date || '—'}</p>
+            </div>
+            <div>
+              <span class="text-xs text-gray-400 uppercase tracking-wide font-medium">Language</span>
+              <p class="text-gray-700">English</p>
+            </div>
+            <div>
+              <span class="text-xs text-gray-400 uppercase tracking-wide font-medium">Route</span>
+              <p class="text-gray-700">CHN → USA</p>
+            </div>
+            <div class="col-span-2">
+              <span class="text-xs text-gray-400 uppercase tracking-wide font-medium">Note</span>
+              <p class="text-gray-700">${item.note || '—'}</p>
+            </div>
+          </div>
+        </div>
+      `).join('');
+
+    } catch (e) {
+      body.innerHTML = '';
+      errBox.textContent = '✗ Network error: ' + e.message;
+      errBox.classList.remove('hidden');
+      confirmBtn.disabled = true;
+    }
+  }
+
+  function closeAftershipModal() {
+    document.getElementById('aftership-modal').classList.add('hidden');
+  }
+
+  async function copyAftershipSummary() {
+    if (!_aftershipItems.length) return;
+    const lines = _aftershipItems.map(item => [
+      `${item.market} Order #${item.order_num}`,
+      `Tracking #: ${item.tracking_number}`,
+      `Order #:    ${item.order_id}`,
+      `Gear:       ${(item.gear_types || []).join(', ') || '—'}`,
+      `Status:     Shipped`,
+      `Ship Date:  ${item.ship_date || '—'}`,
+      `Ship To:    ${item.customer_name}`,
+      `Role:       ${item.role}`,
+      `Phone:      ${item.phone || '—'}`,
+      `Email:      ${item.email || '—'}`,
+      `Note:       ${item.note || '—'}`,
+    ].join('\n')).join('\n\n');
+
+    await navigator.clipboard.writeText(lines);
+    const btn  = document.getElementById('copy-summary-btn');
+    const icon = document.getElementById('copy-summary-icon');
+    icon.textContent = '✓';
+    btn.classList.add('bg-green-100', 'text-green-700');
+    btn.classList.remove('bg-gray-100', 'text-gray-600');
+    setTimeout(() => {
+      icon.textContent = '📋';
+      btn.classList.remove('bg-green-100', 'text-green-700');
+      btn.classList.add('bg-gray-100', 'text-gray-600');
+    }, 2000);
+  }
+
+  function csvCell(v) {
+    const s = (v == null ? '' : String(v));
+    // Always quote digit-only strings (tracking numbers) so Excel doesn't convert to scientific notation
+    if (/^\d+$/.test(s)) return '"' + s + '"';
+    return s.includes(',') || s.includes('"') || s.includes('\n')
+      ? '"' + s.replace(/"/g, '""') + '"'
+      : s;
+  }
+
+  function confirmAftershipPush() {
+    if (!_aftershipItems.length) return;
+
+    const HEADERS = [
+      'courier','tracking_number','order_id','title','order_path',
+      'origin_country','destination_country','custom_1','custom_2',
+      'tracking_postal_code','tracking_ship_date','tracking_account_number',
+      'tracking_key','tracking_destination_country','order_date','order_number',
+      'language','shipment_type','order_promised_delivery_date','shipment_tags',
+      'courier_connection_id','origin_state','origin_city','origin_postal_code',
+      'origin_address','destination_state','destination_city','destination_postal_code',
+      'destination_address','customer_name_1','customer_email_1','customer_role_1',
+      'customer_phone_number_1','customer_language_1','customer_name_2','customer_email_2',
+      'customer_role_2','customer_phone_number_2','customer_language_2','customer_name_3',
+      'customer_email_3','customer_role_3','customer_phone_number_3','customer_language_3',
+    ];
+
+    const dataRows = _aftershipItems.map(i => [
+      i.slug,                  // courier
+      i.tracking_number,       // tracking_number
+      i.order_id,              // order_id
+      i.order_id,              // title (same as order #)
+      '',                      // order_path
+      'CHN',                   // origin_country
+      'USA',                   // destination_country
+      i.note,                  // custom_1 (box + gear summary)
+      '',                      // custom_2
+      '',                      // tracking_postal_code
+      '',                      // tracking_ship_date
+      '',                      // tracking_account_number
+      '',                      // tracking_key
+      '',                      // tracking_destination_country
+      i.order_date ? i.order_date + 'T00:00:00+00:00' : '', // order_date (ISO 8601)
+      i.order_id,              // order_number
+      'en',                    // language
+      'FedEx International Connect Plus', // shipment_type
+      '',                      // order_promised_delivery_date
+      '',                      // shipment_tags
+      '',                      // courier_connection_id
+      'Shandong',              // origin_state
+      'Qingdao',               // origin_city
+      '',                      // origin_postal_code
+      '',                      // origin_address
+      i.dest_state,            // destination_state
+      i.dest_city,             // destination_city
+      i.dest_zip,              // destination_postal_code
+      i.dest_address,          // destination_address
+      i.customer_name,         // customer_name_1
+      i.email,                 // customer_email_1
+      i.role,                  // customer_role_1
+      i.phone,                 // customer_phone_number_1
+      'en',                    // customer_language_1
+      '','','','','',          // customer 2 (blank)
+      '','','','','',          // customer 3 (blank)
+    ].map(csvCell).join(','));
+
+    const csv = [HEADERS.join(','), ...dataRows].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    const filename = _aftershipItems[0]
+      ? `aftership_${_aftershipItems[0].market.replace(/\s+/g,'_')}_${_aftershipItems[0].order_num}.csv`
+      : 'aftership_trackings.csv';
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+    closeAftershipModal();
+  }
+
+  // Close modal on backdrop click
+  document.getElementById('aftership-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeAftershipModal();
+  });
+</script>
+{% endblock %}

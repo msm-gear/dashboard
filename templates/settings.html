@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}Settings — MSM Shipment Tracker{% endblock %}
+
+{% block content %}
+
+<div class="mb-6">
+  <h1 class="text-2xl font-bold text-gray-900">Settings</h1>
+  <p class="text-gray-500 text-sm mt-1">Configure your API keys for ClickUp, Slack, and email notifications.</p>
+</div>
+
+{% if saved %}
+<div class="bg-green-50 border border-green-200 rounded-lg px-5 py-3 mb-6 text-sm text-green-700">
+  ✓ Settings saved successfully.
+</div>
+{% endif %}
+
+<form method="post" action="/settings" class="space-y-5">
+
+  <!-- ClickUp -->
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="text-2xl">📋</span>
+      <div>
+        <h2 class="font-bold text-gray-800">ClickUp</h2>
+        <p class="text-xs text-gray-400">Creates gear-type tasks with box subtasks in your list.</p>
+      </div>
+    </div>
+
+    <div class="space-y-4">
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">API Token</label>
+        <input type="password" name="CLICKUP_TOKEN"
+               value="{{ settings.clickup_token }}"
+               placeholder="pk_xxxxxxxxxxxxxxxx"
+               class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300">
+        <p class="text-xs text-gray-400 mt-1">
+          Find at: <strong>ClickUp → Settings → Apps → API Token</strong>
+        </p>
+      </div>
+
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">List ID</label>
+        <input type="text" name="CLICKUP_LIST_ID"
+               value="{{ settings.clickup_list_id }}"
+               placeholder="901234567890"
+               class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300">
+        <p class="text-xs text-gray-400 mt-1">
+          Open your ClickUp list → the URL shows <code class="bg-gray-100 px-1 rounded">/list/XXXXXXX</code> — copy that number.
+        </p>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- Slack -->
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="text-2xl">💬</span>
+      <div>
+        <h2 class="font-bold text-gray-800">Slack</h2>
+        <p class="text-xs text-gray-400">Sends shipment status updates to a Slack channel when you click "Save &amp; Notify".</p>
+      </div>
+    </div>
+    <div>
+      <label class="block text-sm font-medium text-gray-700 mb-1">Incoming Webhook URL</label>
+      <input type="password" name="SLACK_WEBHOOK_URL"
+             value="{{ settings.slack_webhook_url }}"
+             placeholder="https://hooks.slack.com/services/…"
+             class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300">
+      <p class="text-xs text-gray-400 mt-1">
+        Find at: <strong>Slack → Your App → Incoming Webhooks</strong>
+      </p>
+    </div>
+  </div>
+
+  <!-- 17track -->
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="text-2xl">📦</span>
+      <div>
+        <h2 class="font-bold text-gray-800">Auto-Tracking (17track)</h2>
+        <p class="text-xs text-gray-400">Automatically checks all shipment statuses every 4 hours and notifies you when something moves.</p>
+      </div>
+    </div>
+    <div>
+      <label class="block text-sm font-medium text-gray-700 mb-1">17track API Key</label>
+      <input type="password" name="TRACK17_API_KEY"
+             value="{{ settings.track17_api_key }}"
+             placeholder="Your 17track API key"
+             class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300">
+      <p class="text-xs text-gray-400 mt-1">
+        Free at <strong>17track.net/en/api</strong> — sign up with email only, no credit card.
+        After logging in, go to <strong>API → API Key</strong> and copy your key here.
+      </p>
+    </div>
+  </div>
+
+  <!-- Email -->
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="text-2xl">✉️</span>
+      <div>
+        <h2 class="font-bold text-gray-800">Email Notifications</h2>
+        <p class="text-xs text-gray-400">Sends a shipment update email to gear@middleschoolmatchup.com when you click "Save &amp; Notify".</p>
+      </div>
+    </div>
+    <div>
+      <label class="block text-sm font-medium text-gray-700 mb-1">Gmail App Password</label>
+      <input type="password" name="EMAIL_APP_PASSWORD"
+             value="{{ settings.email_app_password }}"
+             placeholder="xxxx xxxx xxxx xxxx"
+             class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300">
+      <p class="text-xs text-gray-400 mt-1">
+        Get at: <strong>myaccount.google.com/security → App passwords</strong> (requires 2-Step Verification on)
+      </p>
+    </div>
+  </div>
+
+<div class="flex justify-end">
+    <button type="submit"
+            class="px-8 py-3 bg-gray-900 hover:bg-gray-700 text-white font-semibold rounded-xl shadow-sm transition-all text-sm">
+      Save Settings
+    </button>
+  </div>
+
+</form>
+{% endblock %}

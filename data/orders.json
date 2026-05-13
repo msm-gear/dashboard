@@ -1,0 +1,205 @@
+[
+  {
+    "id": "dd37ce9d-def2-4496-beb5-ee918c7825a1",
+    "market": "Dallas",
+    "sport": "BSBL",
+    "season": "Summer",
+    "order_num": "1",
+    "order_date": "2026-04-24",
+    "delivery_date": "2026-05-15",
+    "order_sheet_url": "https://docs.google.com/spreadsheets/d/1canuXg77tRGi3LPaqX68y5UtqGa0MQlBePVrQTr7kBM/edit?usp=sharing",
+    "gear_tasks": {
+      "Jersey": "868jkf86n",
+      "Hoodie": "868jkf86q",
+      "Tee": "868jkf86t",
+      "Cap": "868jkf86u",
+      "Cage Jacket": "868jkf86w",
+      "Ring": "868jkf86x",
+      "Hypechain": "868jkf86y",
+      "Park Banner": "868jkf86z",
+      "Name Banner": "868jkf870"
+    },
+    "created_at": "2026-05-12T15:24:26.603084",
+    "eta_to_zees": "2026-05-26",
+    "packing_list": [
+      {
+        "box_num": 1,
+        "carrier": "fedex",
+        "contents": "see attached",
+        "declared_value": "22$",
+        "gear_type": "Hoodie",
+        "id": "0f752c1e-5a06-46de-8a83-5b284c2d6a40",
+        "market": "Dallas",
+        "order_num": "1",
+        "tracking_number": "871625460402",
+        "weight": "21.9KG"
+      },
+      {
+        "box_num": 2,
+        "carrier": "fedex",
+        "contents": "see attached",
+        "declared_value": "20$",
+        "gear_type": "Hoodie",
+        "id": "7107db8e-f732-41af-8edd-3ef46d159dc1",
+        "market": "Dalls",
+        "order_num": "1",
+        "tracking_number": "871636013859",
+        "weight": "19.8KG"
+      },
+      {
+        "box_num": 3,
+        "carrier": "fedex",
+        "contents": "see attached",
+        "declared_value": "184",
+        "gear_type": "Hoodie",
+        "id": "c04a50e3-d3d9-464c-9397-b6ae95f7bca3",
+        "market": "Dalls",
+        "order_num": "1",
+        "tracking_number": "871636013859",
+        "weight": "17.35KG"
+      },
+      {
+        "box_num": 1,
+        "carrier": "fedex",
+        "contents": "see attached",
+        "declared_value": "22$",
+        "gear_type": "Jersey",
+        "id": "17733607-eaca-4daf-a283-71cd39299e69",
+        "market": "Dallas",
+        "order_num": "1",
+        "tracking_number": "871623767928",
+        "weight": "21.12KG"
+      },
+      {
+        "box_num": 2,
+        "carrier": "fedex",
+        "contents": "see attached",
+        "declared_value": "24$",
+        "gear_type": "Jersey",
+        "id": "29ebdd49-5bc6-4a33-9f5b-113a3ad4d4d5",
+        "market": "Dallas",
+        "order_num": "1",
+        "tracking_number": "871623767928",
+        "weight": "23.86KG"
+      },
+      {
+        "box_num": 3,
+        "carrier": "fedex",
+        "contents": "see attached",
+        "declared_value": "22$",
+        "gear_type": "Jersey",
+        "id": "81706d50-0f27-43f8-95cc-30e5cd510825",
+        "market": "Dallas",
+        "order_num": "1",
+        "tracking_number": "871623767928",
+        "weight": "21.3KG"
+      },
+      {
+        "box_num": 4,
+        "carrier": "fedex",
+        "contents": "see attached",
+        "declared_value": "21$",
+        "gear_type": "Jersey",
+        "id": "79b00e17-285e-498c-9d7b-cfc35389ec1a",
+        "market": "Dallas",
+        "order_num": "1",
+        "tracking_number": "871636013859",
+        "weight": "21.15KG"
+      },
+      {
+        "box_num": 5,
+        "carrier": "fedex",
+        "contents": "see attached",
+        "declared_value": "6$",
+        "gear_type": "Jersey",
+        "id": "344ba5bd-21c9-478c-806b-383cdf6bb3b2",
+        "market": "Dallas",
+        "order_num": "1",
+        "tracking_number": "871636013859",
+        "weight": "5.8KG"
+      },
+      {
+        "box_num": 1,
+        "carrier": "fedex",
+        "contents": "YL-81 YXL-112",
+        "declared_value": "22$",
+        "gear_type": "Tee",
+        "id": "f435f3a9-e541-40d0-8d15-497ad470b50d",
+        "market": "Dallas",
+        "order_num": "1",
+        "tracking_number": "871507330118",
+        "weight": "21.7KG"
+      },
+      {
+        "box_num": 2,
+        "carrier": "fedex",
+        "contents": "YXL-56 YM-79 AM-56",
+        "declared_value": "22$",
+        "gear_type": "Tee",
+        "id": "233f8b5e-dd41-4ae3-b98b-e2ea52f0b1a4",
+        "market": "Dallas",
+        "order_num": "1",
+        "tracking_number": "871507330118",
+        "weight": "21.8KG"
+      },
+      {
+        "box_num": 3,
+        "carrier": "fedex",
+        "contents": "YL-177 AS-10 AL-16",
+        "declared_value": "22$",
+        "gear_type": "Tee",
+        "id": "07c85349-da06-4cb7-9ddf-7abc95dbadae",
+        "market": "Dallas",
+        "order_num": "1",
+        "tracking_number": "871623767928",
+        "weight": "21.12KG"
+      },
+      {
+        "box_num": 4,
+        "carrier": "fedex",
+        "contents": "AS-114 AXL-3",
+        "declared_value": "16$",
+        "gear_type": "Tee",
+        "id": "ec6278ff-0ad0-41c4-a8a4-52f86b8b70cc",
+        "market": "Dallas",
+        "order_num": "1",
+        "tracking_number": "871625460402",
+        "weight": "16.12KG"
+      }
+    ],
+    "packing_meta": {
+      "sport": "BSBL",
+      "season": "Summer",
+      "order_date": "2026-04-24",
+      "ship_date": "2026-05-12",
+      "order_sheet_url": "https://docs.google.com/spreadsheets/d/1canuXg77tRGi3LPaqX68y5UtqGa0MQlBePVrQTr7kBM/edit?usp=sharing"
+    },
+    "shipped_at": "2026-05-12T21:55:07.542358",
+    "tracking_statuses": {
+      "871625460402": {
+        "tag": "InTransitIntl",
+        "label": "In Transit \u2014 International",
+        "notes": "On the way (SENNAN-SHI, JP)",
+        "updated_at": "2026-05-14T05:19:35.251392"
+      },
+      "871636013859": {
+        "tag": "InTransitIntl",
+        "label": "In Transit \u2014 International",
+        "notes": "On the way (SENNAN-SHI, JP)",
+        "updated_at": "2026-05-14T05:19:22.735054"
+      },
+      "871623767928": {
+        "tag": "Delivered",
+        "label": "Delivered",
+        "notes": "Delivered (confirmed manually)",
+        "updated_at": "2026-05-14T05:19:28.382600"
+      },
+      "871507330118": {
+        "tag": "Delivered",
+        "label": "Delivered",
+        "notes": "Delivered (FRISCO, TX, US)",
+        "updated_at": "2026-05-14T05:18:45.962232"
+      }
+    }
+  }
+]

@@ -1,0 +1,433 @@
+{% extends "base.html" %}
+{% block title %}Shipment Tracking — MSM Shipment Tracker{% endblock %}
+
+{% block content %}
+
+<div class="flex items-center justify-between mb-6">
+  <div>
+    <h1 class="text-2xl font-bold text-gray-900">Shipment Tracking</h1>
+    <p class="text-gray-500 text-sm mt-1">Check FedEx, update the status, then hit Save &amp; Notify.</p>
+  </div>
+  <div class="flex items-center gap-3">
+    <span id="lastCheckLabel" class="text-xs text-gray-400 hidden">
+      Auto-checked: <span id="lastCheckTime"></span>
+    </span>
+    <button id="checkNowBtn" onclick="checkNow()"
+            class="inline-flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-lg text-sm shadow-sm transition-all hidden">
+      <svg id="checkIcon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+      </svg>
+      Check FedEx Now
+    </button>
+    <button onclick="loadOrders()"
+            class="inline-flex items-center gap-2 px-4 py-2 bg-white border border-gray-200 hover:bg-gray-50 text-gray-700 font-semibold rounded-lg text-sm shadow-sm transition-all">
+      <svg id="refreshIcon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+      </svg>
+      Reload
+    </button>
+  </div>
+</div>
+
+<div id="content">
+  <div class="flex items-center justify-center py-20 text-gray-400 gap-3">
+    <svg class="w-5 h-5 spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+    </svg>
+    Loading…
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast" class="fixed bottom-6 right-6 hidden z-50">
+  <div id="toastMsg" class="px-5 py-3 rounded-xl shadow-lg text-sm font-medium text-white bg-gray-900"></div>
+</div>
+
+<script>
+// ── Data ──────────────────────────────────────────────────────────────────────
+let ALL_STATUSES = [];
+let toastTimer;
+
+// Ordered steps (excludes Exception which is off the normal path)
+const STEP_TAGS = [
+  'Pending','LabelCreated','PickedUp','InTransitIntl',
+  'AtCustoms','ClearedCustoms','InTransitDom','OutForDelivery','Delivered'
+];
+const STEP_LABELS = [
+  'Pending','Label\nCreated','Picked\nUp','Intl\nTransit',
+  'At\nCustoms','Customs\nCleared','US\nTransit','Out for\nDelivery','Delivered'
+];
+const STEP_ICONS = ['⏳','🏷️','📬','✈️','🛃','✅','🚛','🚚','📦'];
+
+const STATUS_COLORS = {
+  green:  { bg: 'bg-green-100',  text: 'text-green-800',  dot: 'bg-green-500'  },
+  cyan:   { bg: 'bg-cyan-100',   text: 'text-cyan-800',   dot: 'bg-cyan-500'   },
+  blue:   { bg: 'bg-blue-100',   text: 'text-blue-800',   dot: 'bg-blue-500'   },
+  purple: { bg: 'bg-purple-100', text: 'text-purple-800', dot: 'bg-purple-500' },
+  yellow: { bg: 'bg-yellow-100', text: 'text-yellow-800', dot: 'bg-yellow-400' },
+  red:    { bg: 'bg-red-100',    text: 'text-red-800',    dot: 'bg-red-500'    },
+  gray:   { bg: 'bg-gray-100',   text: 'text-gray-600',   dot: 'bg-gray-400'   },
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function showToast(msg, ok = true) {
+  const el = document.getElementById('toast');
+  const tx = document.getElementById('toastMsg');
+  tx.textContent = msg;
+  tx.className = `px-5 py-3 rounded-xl shadow-lg text-sm font-medium text-white ${ok ? 'bg-gray-900' : 'bg-red-600'}`;
+  el.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), 3500);
+}
+
+function badge(label, color) {
+  const c = STATUS_COLORS[color] || STATUS_COLORS.gray;
+  return `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${c.bg} ${c.text}">
+    <span class="w-1.5 h-1.5 rounded-full ${c.dot} flex-shrink-0"></span>${label}</span>`;
+}
+
+function fmtDate(iso) {
+  if (!iso) return '';
+  try { return new Date(iso).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }); }
+  catch { return iso; }
+}
+
+function fmtRelative(iso) {
+  if (!iso) return 'never';
+  try {
+    const diff = Date.now() - new Date(iso);
+    const m = Math.floor(diff / 60000);
+    if (m < 1) return 'just now';
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
+  } catch { return ''; }
+}
+
+function carrierUrl(tn, carrier) {
+  const m = {
+    fedex: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${tn}`,
+    ups:   `https://www.ups.com/track?tracknum=${tn}`,
+    usps:  `https://tools.usps.com/go/TrackConfirmAction?tLabels=${tn}`,
+    dhl:   `https://www.dhl.com/us-en/home/tracking/tracking-express.html?submit=1&tracking-id=${tn}`,
+  };
+  return m[carrier] || m.fedex;
+}
+
+// ── Stuck detection ──────────────────────────────────────────────────────────
+const TWO_DAYS_MS = 2 * 24 * 60 * 60 * 1000;
+
+function stuckInfo(s, order) {
+  if (s.tag === 'Delivered' || s.tag === 'Pending') return null;
+
+  const ref = s.updated_at || order.shipped_at;
+  if (!ref) return null;
+
+  const elapsed = Date.now() - new Date(ref);
+  if (elapsed < TWO_DAYS_MS) return null;
+
+  const days = Math.floor(elapsed / 86400000);
+  return days;
+}
+
+// ── Progress stepper ──────────────────────────────────────────────────────────
+function renderStepper(currentTag) {
+  const isException = currentTag === 'Exception';
+  const currentStep = STEP_TAGS.indexOf(currentTag);   // -1 if exception
+
+  const steps = STEP_TAGS.map((tag, i) => {
+    const done    = !isException && i < currentStep;
+    const active  = !isException && i === currentStep;
+    const future  = isException || i > currentStep;
+
+    const circleClass = done   ? 'bg-gray-800 text-white border-gray-800'
+                      : active ? 'bg-blue-600 text-white border-blue-600 ring-4 ring-blue-100'
+                      :          'bg-white text-gray-400 border-gray-300';
+
+    const lineClass = done ? 'bg-gray-800' : 'bg-gray-200';
+    const labelClass = active ? 'text-gray-900 font-semibold' : done ? 'text-gray-600' : 'text-gray-400';
+    const icon  = STEP_ICONS[i];
+    const label = STEP_LABELS[i].replace('\n', ' ');
+
+    const line = i < STEP_TAGS.length - 1
+      ? `<div class="flex-1 h-0.5 ${lineClass} mt-4 mx-0.5"></div>` : '';
+
+    return `
+      <div class="flex flex-col items-center" style="min-width:52px">
+        <div class="w-8 h-8 rounded-full border-2 flex items-center justify-center text-sm ${circleClass} transition-all">
+          ${active || done ? icon : `<span class="text-xs">${i + 1}</span>`}
+        </div>
+        <span class="text-center mt-1 leading-tight ${labelClass}" style="font-size:10px;width:52px">${label}</span>
+      </div>
+      ${line}`;
+  });
+
+  const exceptionBadge = isException
+    ? `<div class="ml-3 flex-shrink-0">${badge('🚨 Exception / Delay', 'red')}</div>` : '';
+
+  return `<div class="flex items-start w-full overflow-x-auto pb-1">
+    <div class="flex items-start flex-1 min-w-0">${steps.join('')}</div>
+    ${exceptionBadge}
+  </div>`;
+}
+
+// ── Summary text builder ──────────────────────────────────────────────────────
+function buildSummaryText(s, order) {
+  const emojis = {
+    Pending:'⏳', LabelCreated:'🏷️', PickedUp:'📬', InTransitIntl:'✈️',
+    AtCustoms:'🛃', ClearedCustoms:'✅', InTransitDom:'🚛',
+    OutForDelivery:'🚚', Delivered:'📦', Exception:'🚨'
+  };
+  const emoji = emojis[s.tag] || '📦';
+  const info  = ALL_STATUSES.find(st => st.tag === s.tag) || { label: s.tag };
+  const lines = [
+    `${emoji} Shipment Update — ${order.market} ${order.season} ${order.sport}`,
+    `Order #${order.order_num}`,
+    '',
+    `Tracking: ${s.tracking_number} (${(s.carrier || 'FedEx').toUpperCase()})`,
+  ];
+  if (s.gear_summary && s.gear_summary.length) {
+    lines.push('Contents:');
+    s.gear_summary.forEach(g => lines.push(`  • ${g.gear} × ${g.boxes} box${g.boxes !== 1 ? 'es' : ''}`));
+  }
+  lines.push(`Status: ${emoji} ${info.label}`);
+  if (s.notes) lines.push(`Notes: ${s.notes}`);
+  lines.push('');
+  lines.push(`Updated ${new Date().toLocaleString('en-US', { month:'short', day:'numeric', year:'numeric', hour:'numeric', minute:'2-digit', timeZoneName:'short', timeZone:'America/Chicago' })}`);
+  return lines.join('\n');
+}
+
+async function copySummary(uid, s, order) {
+  const text = buildSummaryText(s, order);
+  try {
+    await navigator.clipboard.writeText(text);
+    const btn = document.getElementById(`copy-${uid}`);
+    btn.textContent = '✓ Copied';
+    btn.classList.replace('bg-gray-100', 'bg-green-100');
+    btn.classList.replace('text-gray-700', 'text-green-700');
+    setTimeout(() => {
+      btn.textContent = '📋 Copy';
+      btn.classList.replace('bg-green-100', 'bg-gray-100');
+      btn.classList.replace('text-green-700', 'text-gray-700');
+    }, 2000);
+  } catch { showToast('Could not copy to clipboard', false); }
+}
+
+// ── Shipment card ─────────────────────────────────────────────────────────────
+function renderShipment(s, order, idx) {
+  const orderId  = order.id;
+  const uid      = `${orderId.slice(0,8)}-${idx}`;
+  const selId    = `sel-${uid}`;
+  const notesId  = `notes-${uid}`;
+  const info     = ALL_STATUSES.find(st => st.tag === s.tag) || { label: s.status_label, color: 'gray' };
+  const stuck    = stuckInfo(s, order);
+
+  const gearTags = s.gear_summary.map(g =>
+    `<span class="inline-block bg-gray-100 text-gray-700 text-xs px-2.5 py-1 rounded-full font-medium">
+      ${g.gear} × ${g.boxes} box${g.boxes !== 1 ? 'es' : ''}</span>`
+  ).join(' ');
+
+  const statusOpts = ALL_STATUSES.map(st =>
+    `<option value="${st.tag}"${st.tag === s.tag ? ' selected' : ''}>${st.label}</option>`
+  ).join('');
+
+  const updatedStr = fmtRelative(s.updated_at);
+
+  const stuckBanner = stuck ? `
+    <div class="flex items-center gap-2 bg-orange-50 border border-orange-200 rounded-lg px-3 py-2 mb-3 text-sm text-orange-800">
+      <span class="text-base">⚠️</span>
+      <span>No update for <strong>${stuck} day${stuck !== 1 ? 's' : ''}</strong> — check FedEx tracking</span>
+      <a href="${carrierUrl(s.tracking_number, s.carrier)}" target="_blank"
+         class="ml-auto text-orange-700 font-semibold underline whitespace-nowrap">Check FedEx →</a>
+    </div>` : '';
+
+  const cardBorder = stuck ? 'border-orange-300 bg-orange-50/30' : 'border-gray-100 bg-white';
+
+  return `
+  <div class="border ${cardBorder} rounded-xl p-4 mb-3 hover:shadow-sm transition-shadow">
+
+    ${stuckBanner}
+
+    <!-- Top row: tracking # + gear -->
+    <div class="flex items-start justify-between gap-4 mb-4">
+      <div>
+        <a href="${carrierUrl(s.tracking_number, s.carrier)}" target="_blank" rel="noopener"
+           class="font-mono text-blue-600 hover:underline font-semibold text-base">${s.tracking_number}</a>
+        <span class="text-gray-400 text-xs ml-2">${s.carrier.toUpperCase()}</span>
+        <div class="flex flex-wrap gap-1.5 mt-2">${gearTags}</div>
+      </div>
+      <div class="text-right flex-shrink-0 flex flex-col items-end gap-1.5">
+        ${badge(info.label, info.color)}
+        <div class="text-xs text-gray-400">Updated ${updatedStr}</div>
+        <button id="copy-${uid}"
+                onclick='copySummary("${uid}", ${JSON.stringify(s).replace(/'/g,"&#39;")}, ${JSON.stringify({market:order.market,season:order.season,sport:order.sport,order_num:order.order_num})})'
+                class="px-2.5 py-1 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-medium rounded-lg transition-all">
+          📋 Copy
+        </button>
+      </div>
+    </div>
+
+    <!-- Progress stepper -->
+    <div class="mb-4 px-1">
+      ${renderStepper(s.tag)}
+    </div>
+
+    <!-- Update form -->
+    <div class="flex flex-wrap items-center gap-2 pt-3 border-t border-gray-100">
+      <select id="${selId}"
+              class="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300 bg-white">
+        ${statusOpts}
+      </select>
+      <input id="${notesId}" type="text" value="${(s.notes || '').replace(/"/g, '&quot;')}"
+             placeholder="Notes (e.g. cleared LA customs)"
+             class="flex-1 min-w-[180px] border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200">
+      <button id="btn-${uid}"
+              onclick="saveStatus('${orderId}','${s.tracking_number}','${selId}','${notesId}',false,'${uid}')"
+              class="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-white text-sm font-semibold rounded-lg transition-all whitespace-nowrap">
+        Save
+      </button>
+      <button id="notify-${uid}"
+              onclick="saveStatus('${orderId}','${s.tracking_number}','${selId}','${notesId}',true,'${uid}')"
+              class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold rounded-lg transition-all whitespace-nowrap">
+        📣 Save &amp; Notify
+      </button>
+    </div>
+  </div>`;
+}
+
+// ── Order block ───────────────────────────────────────────────────────────────
+function renderOrder(order) {
+  const deliveredCount = order.shipments.filter(s => s.tag === 'Delivered').length;
+  const total          = order.shipments.length;
+  const allDone        = total > 0 && deliveredCount === total;
+  const progressColor  = allDone ? 'text-green-600 font-semibold' : 'text-gray-500';
+
+  const stuckCount = order.shipments.filter(s => stuckInfo(s, order)).length;
+
+  const cards = order.shipments.length === 0
+    ? `<p class="text-gray-400 text-sm py-4">No tracking numbers on record for this order.</p>`
+    : order.shipments.map((s, i) => renderShipment(s, order, i)).join('');
+
+  return `
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm mb-6 overflow-hidden">
+    <div class="px-5 py-4 flex items-center justify-between bg-gray-50 border-b border-gray-100">
+      <div>
+        <span class="font-bold text-gray-900 text-lg">${order.market}</span>
+        <span class="text-gray-500 text-sm ml-2">${order.season} ${order.sport} · Order #${order.order_num}</span>
+        ${order.order_date ? `<span class="text-gray-400 text-xs ml-3">Ordered ${fmtDate(order.order_date)}</span>` : ''}
+      </div>
+      <div class="flex items-center gap-3">
+        ${stuckCount ? `<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-orange-100 text-orange-800">⚠️ ${stuckCount} stuck</span>` : ''}
+        <span class="text-sm ${progressColor}">${deliveredCount}/${total} delivered</span>
+      </div>
+    </div>
+    <div class="p-4">${cards}</div>
+  </div>`;
+}
+
+// ── Save ──────────────────────────────────────────────────────────────────────
+async function saveStatus(orderId, tn, selId, notesId, notify, uid) {
+  const tag   = document.getElementById(selId).value;
+  const notes = document.getElementById(notesId).value.trim();
+  const btn      = document.getElementById(`btn-${uid}`);
+  const notifyBtn = document.getElementById(`notify-${uid}`);
+  btn.disabled = notifyBtn.disabled = true;
+  btn.textContent = 'Saving…';
+
+  try {
+    const resp = await fetch('/api/update-tracking-status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order_id: orderId, tracking_number: tn, tag, notes, notify }),
+    });
+    const data = await resp.json();
+    showToast(data.message || (data.ok ? 'Saved.' : 'Error.'), data.ok);
+    if (data.ok) loadOrders();   // reload to update stepper + badge
+  } catch (e) {
+    showToast('Request failed: ' + e.message, false);
+    btn.disabled = notifyBtn.disabled = false;
+    btn.textContent = 'Save';
+    notifyBtn.textContent = '📣 Save & Notify';
+  }
+}
+
+// ── Check FedEx Now ───────────────────────────────────────────────────────────
+async function checkNow() {
+  const btn  = document.getElementById('checkNowBtn');
+  const icon = document.getElementById('checkIcon');
+  btn.disabled = true;
+  btn.innerHTML = `<svg class="w-4 h-4 spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+          d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+  </svg> Checking…`;
+  try {
+    const resp = await fetch('/api/check-tracking', { method: 'POST' });
+    const data = await resp.json();
+    if (!data.ok) {
+      showToast(data.error || 'FedEx check failed.', false);
+    } else {
+      const msg = data.updated > 0
+        ? `✓ ${data.updated} status${data.updated !== 1 ? 'es' : ''} updated — notifications sent.`
+        : '✓ All statuses are current.';
+      showToast(msg, true);
+      loadOrders();
+    }
+  } catch (e) {
+    showToast('Check failed: ' + e.message, false);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+    </svg> Check FedEx Now`;
+  }
+}
+
+// ── Load ──────────────────────────────────────────────────────────────────────
+async function loadOrders() {
+  document.getElementById('refreshIcon').classList.add('spin');
+  try {
+    const resp = await fetch('/api/tracking-status');
+    const data = await resp.json();
+    ALL_STATUSES = data.statuses || [];
+
+    if (!data.orders || data.orders.length === 0) {
+      document.getElementById('content').innerHTML = `
+        <div class="bg-white rounded-2xl border border-gray-200 p-12 text-center text-gray-400">
+          <p class="text-lg mb-2">No orders yet.</p>
+          <a href="/" class="text-blue-600 text-sm hover:underline">Upload a packing list →</a>
+        </div>`;
+      return;
+    }
+    const totalStuck = data.orders.reduce((n, o) =>
+      n + o.shipments.filter(s => stuckInfo(s, o)).length, 0);
+
+    const topAlert = totalStuck > 0
+      ? `<div class="bg-orange-50 border border-orange-200 rounded-xl px-5 py-3 mb-5 flex items-center gap-3 text-sm text-orange-800">
+           <span class="text-lg">⚠️</span>
+           <span><strong>${totalStuck} shipment${totalStuck !== 1 ? 's' : ''}</strong> with no status update for 2+ days.</span>
+         </div>` : '';
+
+    // Show/hide FedEx controls
+    if (data.has_fedex) {
+      document.getElementById('checkNowBtn').classList.remove('hidden');
+      document.getElementById('lastCheckLabel').classList.remove('hidden');
+      document.getElementById('lastCheckTime').textContent = data.last_auto_check || 'not yet';
+    }
+
+    document.getElementById('content').innerHTML = topAlert + data.orders.map(renderOrder).join('');
+  } catch (e) {
+    document.getElementById('content').innerHTML =
+      `<div class="bg-red-50 border border-red-200 rounded-lg p-5 text-red-700 text-sm">Failed to load: ${e.message}</div>`;
+  } finally {
+    document.getElementById('refreshIcon').classList.remove('spin');
+  }
+}
+
+loadOrders();
+</script>
+{% endblock %}

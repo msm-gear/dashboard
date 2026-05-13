@@ -1,0 +1,333 @@
+{% extends "base.html" %}
+{% block title %}New Order — MSM Shipment Tracker{% endblock %}
+
+{% block content %}
+
+<div class="flex items-start justify-between mb-6">
+  <div>
+    <h1 class="text-2xl font-bold text-gray-900">New Order (No Packing List Yet)</h1>
+    <p class="text-gray-500 text-sm mt-1">Creates ClickUp tasks with <strong>Submitted</strong> status from an order sheet link.</p>
+  </div>
+  <a href="/" class="text-sm text-gray-500 hover:text-gray-700">← Back</a>
+</div>
+
+{% if not has_settings %}
+<div class="bg-amber-50 border border-amber-200 rounded-lg px-5 py-3 mb-6 text-sm text-amber-800 flex items-center justify-between">
+  <span>⚠️ ClickUp not configured yet.</span>
+  <a href="/settings" class="font-semibold underline ml-4">Settings →</a>
+</div>
+{% endif %}
+
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-6 space-y-5">
+
+  <!-- Market / Sport / Season / Order # -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div>
+      <label class="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wide">Market</label>
+      <select id="market" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300">
+        <option value="">— select —</option>
+        {% for m in markets %}
+        <option value="{{ m }}">{{ m }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wide">Sport</label>
+      <select id="sport" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300">
+        {% for code, label in sports %}
+        <option value="{{ code }}">{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wide">Season</label>
+      <select id="season" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300">
+        {% for s in seasons %}
+        <option value="{{ s }}">{{ s }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wide">Order #</label>
+      <input type="number" id="orderNum" value="1" min="1"
+             class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300">
+    </div>
+  </div>
+
+  <!-- Order Date / ETA to Zees -->
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <div>
+      <label class="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wide">Order Date</label>
+      <input type="date" id="orderDate" value="{{ today }}"
+             class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300">
+    </div>
+    <div>
+      <label class="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wide">ETA Provided to Zees</label>
+      <input type="date" id="etaToZees" required
+             class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300">
+    </div>
+  </div>
+
+  <!-- Order Sheet URL -->
+  <div>
+    <label class="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wide">
+      Order Sheet Link
+      <span id="sheetStatus" class="ml-2 font-normal normal-case text-gray-400 hidden"></span>
+    </label>
+    <input type="url" id="orderSheetUrl" placeholder="https://docs.google.com/spreadsheets/d/..."
+           class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
+           oninput="onSheetUrlInput(this.value)">
+  </div>
+
+  <!-- Column selector (shown only when sheet has multiple order columns) -->
+  <div id="columnSelectorWrap" class="hidden">
+    <label class="block text-xs font-medium text-gray-500 mb-2 uppercase tracking-wide">Select Order Column(s)</label>
+    <p class="text-xs text-gray-400 mb-2">Pick the column(s) that belong to this order. Select multiple to combine into one order.</p>
+    <div id="columnBtns" class="flex flex-wrap gap-2"></div>
+  </div>
+
+  <!-- Gear Types -->
+  <div>
+    <label class="block text-xs font-medium text-gray-500 mb-2 uppercase tracking-wide">Gear Included in This Order</label>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
+      {% for gear in gear_types %}
+      <label class="flex items-center gap-2 cursor-pointer p-2 rounded-lg border border-gray-200 hover:border-purple-300 hover:bg-purple-50 transition-colors has-[:checked]:border-purple-500 has-[:checked]:bg-purple-50">
+        <input type="checkbox" name="gear" value="{{ gear }}" class="accent-purple-600 w-4 h-4">
+        <span class="text-sm text-gray-700">{{ gear }}{% if gear == 'Awards' %} <span class="text-xs text-gray-400">(Rings + Hype Chains)</span>{% endif %}</span>
+      </label>
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- Result -->
+  <div id="result" class="hidden px-4 py-3 rounded-lg text-sm"></div>
+
+  <!-- Submit -->
+  <div class="flex justify-end pt-2">
+    <button onclick="submitOrder()" id="submitBtn"
+            class="px-8 py-3 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-xl shadow-sm transition-all text-sm flex items-center gap-2">
+      <span id="submitIcon">📋</span> Create in ClickUp
+    </button>
+  </div>
+
+</div>
+
+<!-- Task name preview -->
+<div class="mt-5 bg-gray-50 border border-gray-200 rounded-xl px-5 py-4">
+  <p class="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">Task Name Preview</p>
+  <p id="taskPreview" class="text-sm font-mono text-gray-700">— fill in fields above —</p>
+  <p class="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2 mt-3">Order Code Preview</p>
+  <p id="codePreview" class="text-sm font-mono text-gray-700">—</p>
+</div>
+
+<script>
+  const MARKET_CODES = {
+    'austin': 'AUS', 'dallas': 'DAL', 'dfw': 'DFW', 'houston': 'HOU',
+    'kansas city': 'KCY', 'las vegas': 'LVG', 'ohio': 'OHI', 'orlando': 'ORL',
+    'san antonio': 'SAT', 'south florida': 'SFL', 'south jersey': 'SJY',
+    'tampa': 'TPA', 'west texas': 'WTX', 'midland': 'WTX', 'hq': 'HQ',
+  };
+  const SPORT_CODES = { 'Baseball':'BSBL','Softball':'SBL','Soccer':'SOC','Golf':'GLF','7V7 Football':'7V7','Freshmen':'FSH','Bowling':'BWL' };
+  const GEAR_CODES = {
+    'Jersey': 'JRS', 'Hoodie': 'HOD', 'Tee': 'TEE', 'Cap': 'CAP',
+    'Cage Jacket': 'CAG', 'Windbreaker': 'WNB', 'Ring': 'RNG',
+    'Hypechain': 'HYC', 'Awards': 'AWD',
+    'Park Banner': 'BAN', 'Name Banner': 'NBN', 'Hybrid Pullover': 'HYP',
+  };
+
+  function getMktCode(m) {
+    return MARKET_CODES[m.toLowerCase().trim()] || m.slice(0, 3).toUpperCase();
+  }
+  function dateToMMDDYY(d) {
+    if (!d) return new Date().toLocaleDateString('en-US', {month:'2-digit',day:'2-digit',year:'2-digit'}).replace(/\//g,'');
+    const [y, mo, da] = d.split('-');
+    return mo + da + y.slice(2);
+  }
+
+  function updatePreview() {
+    const market   = document.getElementById('market').value.trim();
+    const sport    = document.getElementById('sport').value;
+    const season   = document.getElementById('season').value;
+    const orderNum = document.getElementById('orderNum').value;
+    const orderDate = document.getElementById('orderDate').value;
+
+    if (!market) { document.getElementById('taskPreview').textContent = '— enter market —'; return; }
+    document.getElementById('taskPreview').textContent = `${market} ${season} ${sport} [Gear] ${orderNum}`;
+    const mkt  = getMktCode(market);
+    const date = dateToMMDDYY(orderDate);
+    document.getElementById('codePreview').textContent = `${mkt}-${sport}-[GEAR]-${date}-${orderNum}`;
+  }
+
+  let _sheetTimer = null;
+  let _sheetColumns = []; // [{header, gear_types}]
+  let _selectedCols = new Set();
+
+  function onSheetUrlInput(val) {
+    clearTimeout(_sheetTimer);
+    const status = document.getElementById('sheetStatus');
+    if (!val.includes('/spreadsheets/d/')) {
+      status.classList.add('hidden');
+      hideColumnSelector();
+      return;
+    }
+    status.textContent = 'Detecting gear…';
+    status.className = 'ml-2 font-normal normal-case text-blue-500';
+    status.classList.remove('hidden');
+    _sheetTimer = setTimeout(() => fetchGearFromSheet(val), 700);
+  }
+
+  function hideColumnSelector() {
+    _sheetColumns = [];
+    _selectedCols.clear();
+    document.getElementById('columnSelectorWrap').classList.add('hidden');
+    document.getElementById('columnBtns').innerHTML = '';
+  }
+
+  function applySelectedColumns() {
+    // Build union of gear from selected columns
+    const gear = new Set();
+    _sheetColumns.forEach(col => {
+      if (_selectedCols.has(col.header)) {
+        col.gear_types.forEach(g => gear.add(g));
+      }
+    });
+    document.querySelectorAll('input[name="gear"]').forEach(cb => {
+      cb.checked = gear.has(cb.value);
+    });
+    // Update status label
+    const status = document.getElementById('sheetStatus');
+    if (gear.size) {
+      status.textContent = `✓ ${[...gear].join(', ')}`;
+      status.className = 'ml-2 font-normal normal-case text-green-600';
+    } else if (_selectedCols.size) {
+      status.textContent = 'No gear found in selected column(s).';
+      status.className = 'ml-2 font-normal normal-case text-amber-600';
+    }
+  }
+
+  function renderColumnSelector(columns) {
+    _sheetColumns = columns;
+    _selectedCols.clear();
+    const wrap = document.getElementById('columnSelectorWrap');
+    const btns = document.getElementById('columnBtns');
+    btns.innerHTML = '';
+
+    columns.forEach(col => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = col.header;
+      btn.dataset.header = col.header;
+      btn.className = 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-gray-300 text-gray-600 bg-white hover:border-blue-400 hover:text-blue-600';
+      btn.addEventListener('click', () => {
+        if (_selectedCols.has(col.header)) {
+          _selectedCols.delete(col.header);
+          btn.className = 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-gray-300 text-gray-600 bg-white hover:border-blue-400 hover:text-blue-600';
+        } else {
+          _selectedCols.add(col.header);
+          btn.className = 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-blue-500 text-blue-700 bg-blue-50';
+        }
+        applySelectedColumns();
+      });
+      btns.appendChild(btn);
+    });
+
+    wrap.classList.remove('hidden');
+  }
+
+  async function fetchGearFromSheet(url) {
+    const status = document.getElementById('sheetStatus');
+    hideColumnSelector();
+    try {
+      const resp = await fetch('/fetch-order-sheet', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      const data = await resp.json();
+      if (!data.ok) {
+        status.textContent = data.error || 'Could not detect gear.';
+        status.className = 'ml-2 font-normal normal-case text-amber-600';
+        return;
+      }
+      if (data.columns && data.columns.length) {
+        // Per-column mode — show selector
+        renderColumnSelector(data.columns);
+        status.textContent = `✓ ${data.columns.length} order column(s) found — select below`;
+        status.className = 'ml-2 font-normal normal-case text-green-600';
+        // Uncheck all gear until user picks a column
+        document.querySelectorAll('input[name="gear"]').forEach(cb => { cb.checked = false; });
+      } else if (data.gear_types && data.gear_types.length) {
+        // Fallback: single aggregated list
+        document.querySelectorAll('input[name="gear"]').forEach(cb => { cb.checked = false; });
+        data.gear_types.forEach(gear => {
+          const cb = document.querySelector(`input[name="gear"][value="${gear}"]`);
+          if (cb) cb.checked = true;
+        });
+        status.textContent = `✓ Detected: ${data.gear_types.join(', ')}`;
+        status.className = 'ml-2 font-normal normal-case text-green-600';
+      } else {
+        status.textContent = 'No gear detected.';
+        status.className = 'ml-2 font-normal normal-case text-amber-600';
+      }
+    } catch (e) {
+      status.textContent = 'Network error.';
+      status.className = 'ml-2 font-normal normal-case text-red-500';
+    }
+  }
+
+  ['market','sport','season','orderNum','orderDate'].forEach(id => {
+    document.getElementById(id).addEventListener('input', updatePreview);
+    document.getElementById(id).addEventListener('change', updatePreview);
+  });
+  updatePreview();
+
+  async function submitOrder() {
+    const market   = document.getElementById('market').value.trim();
+    const sport    = document.getElementById('sport').value;
+    const season   = document.getElementById('season').value;
+    const orderNum = document.getElementById('orderNum').value;
+    const orderDate = document.getElementById('orderDate').value;
+    const etaToZees = document.getElementById('etaToZees').value;
+    const orderSheet = document.getElementById('orderSheetUrl').value;
+    const gearChecks = document.querySelectorAll('input[name="gear"]:checked');
+    const gearTypes  = Array.from(gearChecks).map(c => c.value);
+
+    if (!market) { alert('Select a market.'); return; }
+    if (!etaToZees) { alert('ETA Provided to Zees is required.'); return; }
+    if (!gearTypes.length) { alert('Select at least one gear type.'); return; }
+
+    const btn  = document.getElementById('submitBtn');
+    const icon = document.getElementById('submitIcon');
+    const res  = document.getElementById('result');
+
+    btn.disabled = true;
+    icon.innerHTML = '<svg class="spin w-4 h-4 inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>';
+
+    try {
+      const resp = await fetch('/push/clickup-order-only', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ market, sport, season, order_num: orderNum,
+                               order_date: orderDate, eta_to_zees: etaToZees,
+                               order_sheet_url: orderSheet, gear_types: gearTypes }),
+      });
+      const data = await resp.json();
+      res.classList.remove('hidden');
+      if (data.ok) {
+        res.className = 'mt-0 px-4 py-3 rounded-lg text-sm bg-green-50 border border-green-200 text-green-700';
+        res.textContent = '✓ ' + data.message;
+      } else {
+        res.className = 'mt-0 px-4 py-3 rounded-lg text-sm bg-red-50 border border-red-200 text-red-700';
+        res.textContent = '✗ ' + (data.error || data.message);
+      }
+    } catch (e) {
+      res.classList.remove('hidden');
+      res.className = 'mt-0 px-4 py-3 rounded-lg text-sm bg-red-50 border border-red-200 text-red-700';
+      res.textContent = '✗ Network error: ' + e.message;
+    } finally {
+      btn.disabled = false;
+      icon.innerHTML = '📋';
+    }
+  }
+</script>
+{% endblock %}
