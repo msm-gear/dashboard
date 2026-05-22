@@ -1,0 +1,112 @@
+{% extends "public_base.html" %}
+{% block title %}Contents — MSM Shipment Tracker{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-6">
+  <div>
+    <h1 class="text-2xl font-bold text-gray-900">Contents Lookup</h1>
+    <p class="text-sm text-gray-400 mt-1">Find which tracking number and box any item is in</p>
+  </div>
+  <span class="text-sm text-gray-400">{{ rows|length }} entries</span>
+</div>
+
+<!-- Search -->
+<div class="mb-4">
+  <input type="text" id="search"
+         placeholder="Search gear, market, tracking number, contents…"
+         oninput="filterRows()"
+         class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white shadow-sm">
+</div>
+
+<!-- Table -->
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm" id="contents-table">
+      <thead>
+        <tr class="bg-gray-50 text-gray-500 text-xs font-semibold uppercase tracking-wide">
+          <th class="px-5 py-3 text-left">Gear</th>
+          <th class="px-4 py-3 text-left">Order</th>
+          <th class="px-4 py-3 text-left">Tracking #</th>
+          <th class="px-4 py-3 text-center">Box</th>
+          <th class="px-4 py-3 text-left">Contents / Notes</th>
+          <th class="px-4 py-3 text-center">Weight</th>
+          <th class="px-4 py-3 text-left">Status</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-100" id="contents-body">
+        {% for r in rows %}
+        <tr class="hover:bg-gray-50 contents-row"
+            data-search="{{ [r.gear, r.order_label, r.tracking, r.contents, r.market, r.sport] | join(' ') | lower }}">
+          <td class="px-5 py-3 font-semibold text-gray-800">{{ r.gear }}</td>
+          <td class="px-4 py-3 text-gray-600 whitespace-nowrap">{{ r.order_label }}</td>
+          <td class="px-4 py-3 font-mono text-xs text-blue-600 whitespace-nowrap">{{ r.tracking }}</td>
+          <td class="px-4 py-3 text-center">
+            {% if r.source == 'packing_list' %}
+            <span class="inline-block bg-purple-100 text-purple-700 text-xs font-bold px-2 py-0.5 rounded-full">Box {{ r.box_num }}</span>
+            {% else %}
+            <span class="text-xs text-gray-500">{{ r.box_num }}</span>
+            {% endif %}
+          </td>
+          <td class="px-4 py-3 text-xs text-gray-500 max-w-xs">
+            {% if r.contents and r.contents.lower() not in ('see attached', '—', '') %}
+              {% set teams = r.contents.split(', ') %}
+              {% if teams | length > 6 %}
+                <span class="contents-short">{{ teams[:6] | join(', ') }}&hellip;
+                  <button onclick="this.closest('td').querySelector('.contents-short').classList.add('hidden');this.closest('td').querySelector('.contents-full').classList.remove('hidden')"
+                          class="text-blue-500 hover:underline ml-1">+{{ teams | length - 6 }} more</button>
+                </span>
+                <span class="contents-full hidden">{{ r.contents }}
+                  <button onclick="this.closest('td').querySelector('.contents-full').classList.add('hidden');this.closest('td').querySelector('.contents-short').classList.remove('hidden')"
+                          class="text-blue-500 hover:underline ml-1">less</button>
+                </span>
+              {% else %}
+                {{ r.contents }}
+              {% endif %}
+            {% else %}
+              <span class="text-gray-300">—</span>
+            {% endif %}
+          </td>
+          <td class="px-4 py-3 text-center text-xs text-gray-500">{{ r.weight or '—' }}</td>
+          <td class="px-4 py-3 whitespace-nowrap">
+            {% set tag = r.status_tag %}
+            {% if tag == 'Delivered' %}
+              <span class="text-xs font-semibold text-green-600">✓ Delivered</span>
+            {% elif tag in ('InTransit', 'InTransitIntl') %}
+              <span class="text-xs font-semibold text-blue-500">✈ In Transit</span>
+            {% elif tag == 'OutForDelivery' %}
+              <span class="text-xs font-semibold text-orange-500">🚚 Out for Delivery</span>
+            {% elif tag == 'LabelCreated' %}
+              <span class="text-xs text-gray-400">🏷 Label Created</span>
+            {% else %}
+              <span class="text-xs text-gray-400">{{ r.status }}</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <div id="no-results" class="hidden px-6 py-8 text-center text-gray-400 text-sm">No matching items.</div>
+  </div>
+</div>
+
+<script>
+  function filterRows() {
+    const q = document.getElementById('search').value.toLowerCase().trim();
+    let visible = 0;
+    document.querySelectorAll('.contents-row').forEach(tr => {
+      const match = !q || tr.dataset.search.includes(q);
+      tr.classList.toggle('hidden', !match);
+      if (match) visible++;
+    });
+    document.getElementById('no-results').classList.toggle('hidden', visible > 0);
+  }
+
+  document.getElementById('search').focus();
+
+  const urlQ = new URLSearchParams(location.search).get('q');
+  if (urlQ) {
+    document.getElementById('search').value = urlQ;
+    filterRows();
+  }
+</script>
+{% endblock %}

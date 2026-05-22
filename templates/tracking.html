@@ -296,6 +296,26 @@ function renderShipment(s, order, idx) {
         📣 Save &amp; Notify
       </button>
     </div>
+
+    <!-- Sync delivered to ClickUp -->
+    <div class="flex flex-wrap items-center gap-2 pt-2.5 mt-1 border-t border-dashed border-gray-200">
+      <span class="text-xs text-gray-400 font-medium">Sync → ClickUp:</span>
+      <span class="text-xs text-gray-400">Delivery date</span>
+      <input type="date" id="del-date-${uid}"
+             value="${s.delivered_at || new Date().toISOString().slice(0,10)}"
+             class="border border-gray-200 rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-green-200">
+      <button id="fetch-date-${uid}"
+              onclick="fetchDeliveryDate('${orderId}','${s.tracking_number}','del-date-${uid}','${uid}')"
+              title="Fetch actual delivery date from carrier"
+              class="px-2 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-600 text-xs font-semibold rounded-lg transition-all whitespace-nowrap">
+        ↻ Fetch
+      </button>
+      <button onclick="syncDelivered('${orderId}','${s.tracking_number}','del-date-${uid}','${uid}')"
+              class="px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white text-xs font-semibold rounded-lg transition-all whitespace-nowrap">
+        📦 Sync Delivered
+      </button>
+      <span id="sync-result-${uid}" class="text-xs hidden"></span>
+    </div>
   </div>`;
 }
 
@@ -384,6 +404,72 @@ async function checkNow() {
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
             d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
     </svg> Check FedEx Now`;
+  }
+}
+
+// ── Fetch delivery date from carrier ─────────────────────────────────────────
+async function fetchDeliveryDate(orderId, tn, dateInputId, uid) {
+  const btn      = document.getElementById(`fetch-date-${uid}`);
+  const resultEl = document.getElementById(`sync-result-${uid}`);
+  btn.disabled   = true;
+  btn.textContent = '…';
+  resultEl.classList.remove('hidden');
+  resultEl.textContent = 'Fetching from carrier…';
+  resultEl.className = 'text-xs text-blue-500';
+
+  try {
+    const resp = await fetch('/api/fetch-delivery-date', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({order_id: orderId, tracking_number: tn}),
+    });
+    const data = await resp.json();
+    if (data.ok && data.delivered_at) {
+      document.getElementById(dateInputId).value = data.delivered_at;
+      resultEl.textContent = `✓ Date from carrier: ${data.delivered_at}`;
+      resultEl.className = 'text-xs text-green-600';
+    } else if (data.ok) {
+      resultEl.textContent = 'Carrier has no delivery date yet.';
+      resultEl.className = 'text-xs text-amber-600';
+    } else {
+      resultEl.textContent = '✗ ' + (data.error || 'Failed');
+      resultEl.className = 'text-xs text-red-600';
+    }
+  } catch (e) {
+    resultEl.textContent = '✗ Network error';
+    resultEl.className = 'text-xs text-red-600';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '↻ Fetch';
+  }
+}
+
+// ── Sync Delivered → ClickUp ──────────────────────────────────────────────────
+async function syncDelivered(orderId, tn, dateInputId, uid) {
+  const deliveryDate = document.getElementById(dateInputId).value;
+  const resultEl = document.getElementById(`sync-result-${uid}`);
+  resultEl.classList.remove('hidden');
+  resultEl.textContent = 'Syncing…';
+  resultEl.className = 'text-xs text-blue-500';
+
+  try {
+    const resp = await fetch('/api/sync-delivered', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({order_id: orderId, tracking_number: tn, delivery_date: deliveryDate}),
+    });
+    const data = await resp.json();
+    resultEl.classList.remove('hidden');
+    if (data.ok) {
+      resultEl.textContent = '✓ ' + data.message;
+      resultEl.className = 'text-xs text-green-600';
+    } else {
+      resultEl.textContent = '✗ ' + (data.error || 'Failed');
+      resultEl.className = 'text-xs text-red-600';
+    }
+  } catch (e) {
+    resultEl.textContent = '✗ Network error';
+    resultEl.className = 'text-xs text-red-600';
   }
 }
 

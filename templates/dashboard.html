@@ -1,0 +1,558 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — MSM Shipment Tracker{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-6">
+  <div>
+    <h1 class="text-2xl font-bold text-gray-900">Performance Dashboard</h1>
+    <p class="text-sm text-gray-400 mt-1" id="last-loaded">Loading…</p>
+  </div>
+  <button onclick="loadData()" id="refresh-btn"
+          class="px-4 py-2 bg-white border border-gray-300 rounded-xl text-sm font-semibold text-gray-600 hover:border-purple-400 hover:text-purple-700 transition-all flex items-center gap-2">
+    <span id="refresh-icon">↻</span> Refresh
+  </button>
+</div>
+
+<!-- Reminders -->
+<div id="reminders-section" class="mb-6 hidden">
+  <div class="flex items-center justify-between mb-2">
+    <p class="text-sm font-semibold text-gray-700">🔔 Upcoming Deadlines</p>
+    <button onclick="toggleReminders()"
+            class="text-xs text-gray-400 hover:text-gray-600 underline" id="reminders-toggle">Hide</button>
+  </div>
+  <div id="reminders-body"></div>
+</div>
+
+<!-- Filters -->
+<div class="flex flex-wrap items-center gap-4 mb-6">
+
+  <!-- Year toggle (built dynamically) -->
+  <div id="year-toggle" class="flex rounded-xl border border-gray-200 overflow-hidden text-sm font-semibold">
+    <button id="year-All" onclick="setYear('All')" class="px-4 py-2 bg-purple-600 text-white font-semibold text-sm">All</button>
+  </div>
+
+  <!-- Season toggle -->
+  <div class="flex rounded-xl border border-gray-200 overflow-hidden text-sm font-semibold">
+    <button onclick="setSeason('All')"   id="season-All"    class="px-4 py-2 bg-purple-600 text-white">All</button>
+    <button onclick="setSeason('Summer')" id="season-Summer" class="px-4 py-2 bg-white text-gray-600 hover:bg-gray-50">Summer</button>
+    <button onclick="setSeason('Fall')"   id="season-Fall"   class="px-4 py-2 bg-white text-gray-600 hover:bg-gray-50">Fall</button>
+  </div>
+
+  <!-- Sport toggle (built dynamically) -->
+  <div id="sport-toggle" class="flex rounded-xl border border-gray-200 overflow-hidden text-sm font-semibold">
+    <button id="sport-All" onclick="setSport('All')" class="px-4 py-2 bg-purple-600 text-white font-semibold text-sm">All</button>
+  </div>
+
+  <!-- Exclude orders dropdown -->
+  <div class="relative" id="exclude-wrap">
+    <button onclick="toggleExclude()" id="exclude-btn"
+            class="flex items-center gap-2 px-4 py-2 bg-white border border-gray-200 rounded-xl text-sm font-semibold text-gray-600 hover:border-purple-400 transition-all">
+      <span id="exclude-label">Exclude orders</span>
+      <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+    </button>
+    <div id="exclude-menu" class="hidden absolute z-10 mt-1 left-0 bg-white border border-gray-200 rounded-xl shadow-lg py-1 min-w-64 max-h-64 overflow-y-auto">
+      <div id="exclude-list" class="px-1"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Summary cards -->
+<div class="grid grid-cols-2 md:grid-cols-3 gap-4 mb-4">
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">Order → Proofs</p>
+    <p class="text-2xl font-bold text-gray-900" id="card-proofs">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">avg working days</p>
+  </div>
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">Order → Ship</p>
+    <p class="text-2xl font-bold text-gray-900" id="card-ship">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">avg working days</p>
+  </div>
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">Order → Delivery</p>
+    <p class="text-2xl font-bold text-gray-900" id="card-delivery">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">avg working days</p>
+  </div>
+</div>
+<div class="grid grid-cols-2 gap-4 mb-4">
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">% Delayed</p>
+    <p class="text-2xl font-bold" id="card-delay">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">orders that missed estimated dates</p>
+  </div>
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">% Error</p>
+    <p class="text-2xl font-bold" id="card-error">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">gear items received incorrectly</p>
+  </div>
+</div>
+
+<!-- Order Status Breakdown -->
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden mb-8">
+  <div class="px-6 py-4 border-b border-gray-100">
+    <h2 class="font-bold text-gray-800 text-base">Order Status</h2>
+  </div>
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="bg-gray-50 text-gray-500 text-xs font-semibold uppercase tracking-wide">
+          <th class="px-6 py-3 text-left"></th>
+          <th class="px-4 py-3 text-center">Total</th>
+          <th class="px-4 py-3 text-center text-red-600">Behind</th>
+          <th class="px-4 py-3 text-center text-green-600">Ahead</th>
+          <th class="px-4 py-3 text-center text-blue-600">On Schedule</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-100">
+        <tr class="hover:bg-gray-50">
+          <td class="px-6 py-3 font-semibold text-gray-700">Ongoing</td>
+          <td class="px-4 py-3 text-center text-gray-600 font-semibold" id="st-ongoing-total">—</td>
+          <td class="px-4 py-3 text-center font-bold text-red-600" id="st-ongoing-behind">—</td>
+          <td class="px-4 py-3 text-center font-bold text-green-600" id="st-ongoing-ahead">—</td>
+          <td class="px-4 py-3 text-center font-bold text-blue-600" id="st-ongoing-onschedule">—</td>
+        </tr>
+        <tr class="hover:bg-gray-50">
+          <td class="px-6 py-3 font-semibold text-gray-700">Delivered</td>
+          <td class="px-4 py-3 text-center text-gray-600 font-semibold" id="st-delivered-total">—</td>
+          <td class="px-4 py-3 text-center font-bold text-red-600" id="st-delivered-behind">—</td>
+          <td class="px-4 py-3 text-center font-bold text-green-600" id="st-delivered-ahead">—</td>
+          <td class="px-4 py-3 text-center font-bold text-blue-600" id="st-delivered-onschedule">—</td>
+        </tr>
+        <tr class="bg-gray-50 hover:bg-gray-100">
+          <td class="px-6 py-3 font-bold text-gray-800">Total</td>
+          <td class="px-4 py-3 text-center text-gray-800 font-bold" id="st-total-total">—</td>
+          <td class="px-4 py-3 text-center font-bold text-red-600" id="st-total-behind">—</td>
+          <td class="px-4 py-3 text-center font-bold text-green-600" id="st-total-ahead">—</td>
+          <td class="px-4 py-3 text-center font-bold text-blue-600" id="st-total-onschedule">—</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Per-market table -->
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
+  <div class="px-6 py-4 border-b border-gray-100">
+    <h2 class="font-bold text-gray-800 text-base">Per Market</h2>
+  </div>
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="bg-gray-50 text-gray-500 text-xs font-semibold uppercase tracking-wide">
+          <th class="px-6 py-3 text-left">Market</th>
+          <th class="px-4 py-3 text-center">Orders</th>
+          <th class="px-4 py-3 text-center">→ Proofs</th>
+          <th class="px-4 py-3 text-center">→ Ship</th>
+          <th class="px-4 py-3 text-center">→ Delivery</th>
+          <th class="px-4 py-3 text-center">% Delayed</th>
+          <th class="px-4 py-3 text-center">% Error</th>
+        </tr>
+      </thead>
+      <tbody id="market-table" class="divide-y divide-gray-100">
+        <tr><td colspan="7" class="px-6 py-8 text-center text-gray-400 text-sm">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  let _allOrders  = [];
+  let _season     = 'All';
+  let _year       = 'All';
+  let _sport      = 'All';
+  let _excluded   = new Set();
+
+  // Close exclude dropdown when clicking outside
+  document.addEventListener('click', e => {
+    if (!document.getElementById('exclude-wrap').contains(e.target)) {
+      document.getElementById('exclude-menu').classList.add('hidden');
+    }
+  });
+
+  function toggleExclude() {
+    document.getElementById('exclude-menu').classList.toggle('hidden');
+  }
+
+  function setSeason(s) {
+    _season = s;
+    ['All','Summer','Fall'].forEach(k => {
+      const btn = document.getElementById('season-' + k);
+      btn.className = k === s
+        ? 'px-4 py-2 bg-purple-600 text-white font-semibold text-sm'
+        : 'px-4 py-2 bg-white text-gray-600 hover:bg-gray-50 font-semibold text-sm';
+    });
+    render();
+  }
+
+  function buildSportToggle() {
+    const sports = [...new Set(_allOrders.map(o => o.sport))].sort();
+    const wrap = document.getElementById('sport-toggle');
+    wrap.innerHTML = '';
+
+    const allBtn = document.createElement('button');
+    allBtn.id = 'sport-All';
+    allBtn.onclick = () => setSport('All');
+    allBtn.textContent = 'All';
+    allBtn.className = 'px-4 py-2 bg-purple-600 text-white font-semibold text-sm';
+    wrap.appendChild(allBtn);
+
+    sports.forEach(s => {
+      const btn = document.createElement('button');
+      btn.id = 'sport-' + s;
+      btn.onclick = () => setSport(s);
+      btn.textContent = s;
+      btn.className = 'px-4 py-2 bg-white text-gray-600 hover:bg-gray-50 font-semibold text-sm';
+      wrap.appendChild(btn);
+    });
+  }
+
+  function setSport(s) {
+    _sport = s;
+    const wrap = document.getElementById('sport-toggle');
+    wrap.querySelectorAll('button').forEach(btn => {
+      const key = btn.id.replace('sport-', '');
+      btn.className = key === s
+        ? 'px-4 py-2 bg-purple-600 text-white font-semibold text-sm'
+        : 'px-4 py-2 bg-white text-gray-600 hover:bg-gray-50 font-semibold text-sm';
+    });
+    render();
+  }
+
+  function buildYearToggle() {
+    const years = [...new Set(_allOrders.map(o => o.year))].sort();
+    const wrap = document.getElementById('year-toggle');
+    wrap.innerHTML = '';
+
+    const allBtn = document.createElement('button');
+    allBtn.id = 'year-All';
+    allBtn.onclick = () => setYear('All');
+    allBtn.textContent = 'All';
+    allBtn.className = 'px-4 py-2 bg-purple-600 text-white font-semibold text-sm';
+    wrap.appendChild(allBtn);
+
+    years.forEach(y => {
+      const btn = document.createElement('button');
+      btn.id = 'year-' + y;
+      btn.onclick = () => setYear(y);
+      btn.textContent = y;
+      btn.className = 'px-4 py-2 bg-white text-gray-600 hover:bg-gray-50 font-semibold text-sm';
+      wrap.appendChild(btn);
+    });
+  }
+
+  function setYear(y) {
+    _year = y;
+    const wrap = document.getElementById('year-toggle');
+    wrap.querySelectorAll('button').forEach(btn => {
+      const key = btn.id.replace('year-', '');
+      btn.className = key === String(y)
+        ? 'px-4 py-2 bg-purple-600 text-white font-semibold text-sm'
+        : 'px-4 py-2 bg-white text-gray-600 hover:bg-gray-50 font-semibold text-sm';
+    });
+    render();
+  }
+
+  function buildExcludeList() {
+    const el = document.getElementById('exclude-list');
+    el.innerHTML = '';
+    _allOrders.forEach(o => {
+      const row = document.createElement('label');
+      row.className = 'flex items-center gap-2 px-3 py-1.5 hover:bg-gray-50 cursor-pointer rounded-lg text-sm text-gray-700';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.className = 'rounded';
+      cb.checked = _excluded.has(o.id);
+      cb.onchange = () => {
+        if (cb.checked) _excluded.add(o.id); else _excluded.delete(o.id);
+        updateExcludeLabel();
+        render();
+      };
+      row.appendChild(cb);
+      row.appendChild(document.createTextNode(o.label));
+      el.appendChild(row);
+    });
+  }
+
+  function updateExcludeLabel() {
+    const n = _excluded.size;
+    document.getElementById('exclude-label').textContent =
+      n === 0 ? 'Exclude orders' : `Excluding ${n} order${n > 1 ? 's' : ''}`;
+  }
+
+  function filtered() {
+    return _allOrders.filter(o =>
+      !_excluded.has(o.id) &&
+      (_season === 'All' || o.season === _season) &&
+      (_year   === 'All' || o.year  === _year) &&
+      (_sport  === 'All' || o.sport === _sport)
+    );
+  }
+
+  function avg(arr, key) {
+    const vals = arr.map(o => o[key]).filter(v => v !== null && v !== undefined);
+    return vals.length ? (vals.reduce((a, b) => a + b, 0) / vals.length) : null;
+  }
+
+  function pctDelayed(arr) {
+    const withData = arr.filter(o => o.is_delayed !== null && o.is_delayed !== undefined);
+    if (!withData.length) return null;
+    return withData.filter(o => o.is_delayed).length / withData.length * 100;
+  }
+
+  function pctError(arr) {
+    const total = arr.reduce((s, o) => s + (o.received_count || 0), 0);
+    if (!total) return null;
+    const errors = arr.reduce((s, o) => s + (o.error_count || 0), 0);
+    return errors / total * 100;
+  }
+
+  function fmtDays(v) {
+    return v !== null && v !== undefined ? v.toFixed(1) + ' d' : '—';
+  }
+
+  function fmtPct(v) {
+    if (v === null || v === undefined) return '—';
+    return v.toFixed(0) + '%';
+  }
+
+  function delayClass(v) {
+    if (v === null || v === undefined) return 'text-gray-400';
+    if (v > 0) return 'text-red-600 font-semibold';
+    return 'text-green-600 font-semibold';
+  }
+
+  function errorClass(v) {
+    if (v === null || v === undefined) return 'text-gray-400';
+    if (v > 0) return 'text-red-600 font-semibold';
+    return 'text-green-600 font-semibold';
+  }
+
+  // ── Tooltip ──────────────────────────────────────────────────────────────────
+  const _tip = (() => {
+    const el = document.createElement('div');
+    el.id = 'st-tooltip';
+    el.style.cssText = 'position:fixed;z-index:9999;pointer-events:none;display:none';
+    el.className = 'bg-gray-900 text-white text-xs rounded-xl shadow-xl px-3 py-2.5 max-w-xs';
+    document.body.appendChild(el);
+    return el;
+  })();
+
+  function showTip(e, orders) {
+    if (!orders.length) return;
+    _tip.innerHTML = orders.map(l => `<div class="py-0.5 leading-snug">${l}</div>`).join('');
+    _tip.style.display = 'block';
+    moveTip(e);
+  }
+
+  function moveTip(e) {
+    const pad = 12;
+    const tw = _tip.offsetWidth, th = _tip.offsetHeight;
+    let x = e.clientX + pad, y = e.clientY + pad;
+    if (x + tw > window.innerWidth  - pad) x = e.clientX - tw - pad;
+    if (y + th > window.innerHeight - pad) y = e.clientY - th - pad;
+    _tip.style.left = x + 'px';
+    _tip.style.top  = y + 'px';
+  }
+
+  function hideTip() { _tip.style.display = 'none'; }
+
+  function statusGroups(arr) {
+    const g = { total: arr, ahead: [], onschedule: [], behind: [] };
+    arr.forEach(o => {
+      if      (o.order_status === 0) g.ahead.push(o.label);
+      else if (o.order_status === 1) g.onschedule.push(o.label);
+      else if (o.order_status === 2) g.behind.push(o.label);
+    });
+    return g;
+  }
+
+  function setStatusCell(id, orders) {
+    const el = document.getElementById(id);
+    const n  = Array.isArray(orders) ? orders.length : orders;
+    const labels = Array.isArray(orders) ? orders.map(o => typeof o === 'string' ? o : o.label) : [];
+    el.textContent = n === 0 ? '0' : (n || '—');
+    if (labels.length) {
+      el.style.cursor = 'default';
+      el.onmouseenter = e => showTip(e, labels);
+      el.onmousemove  = e => moveTip(e);
+      el.onmouseleave = hideTip;
+    } else {
+      el.style.cursor = '';
+      el.onmouseenter = el.onmousemove = el.onmouseleave = null;
+    }
+  }
+
+  function renderStatusBreakdown(data) {
+    const ongoing   = data.filter(o => (o.current_phase ?? -1) < 4);
+    const delivered = data.filter(o => (o.current_phase ?? -1) >= 4);
+
+    const og = statusGroups(ongoing);
+    const dl = statusGroups(delivered);
+    const tt = statusGroups(data);
+
+    setStatusCell('st-ongoing-total',      og.total);
+    setStatusCell('st-ongoing-behind',     og.behind);
+    setStatusCell('st-ongoing-ahead',      og.ahead);
+    setStatusCell('st-ongoing-onschedule', og.onschedule);
+
+    setStatusCell('st-delivered-total',      dl.total);
+    setStatusCell('st-delivered-behind',     dl.behind);
+    setStatusCell('st-delivered-ahead',      dl.ahead);
+    setStatusCell('st-delivered-onschedule', dl.onschedule);
+
+    setStatusCell('st-total-total',      tt.total);
+    setStatusCell('st-total-behind',     tt.behind);
+    setStatusCell('st-total-ahead',      tt.ahead);
+    setStatusCell('st-total-onschedule', tt.onschedule);
+  }
+
+  function render() {
+    const data = filtered();
+
+    // Summary cards
+    const avgProofs   = avg(data, 'days_to_proofs');
+    const avgShip     = avg(data, 'days_to_ship');
+    const avgDelivery = avg(data, 'days_to_delivery');
+    const delayPct    = pctDelayed(data);
+    const errorPct    = pctError(data);
+
+    document.getElementById('card-proofs').textContent   = fmtDays(avgProofs);
+    document.getElementById('card-ship').textContent     = fmtDays(avgShip);
+    document.getElementById('card-delivery').textContent = fmtDays(avgDelivery);
+
+    const delayEl = document.getElementById('card-delay');
+    delayEl.textContent = fmtPct(delayPct);
+    delayEl.className   = 'text-2xl font-bold ' + delayClass(delayPct);
+
+    const errorEl = document.getElementById('card-error');
+    errorEl.textContent = fmtPct(errorPct);
+    errorEl.className   = 'text-2xl font-bold ' + errorClass(errorPct);
+
+    renderStatusBreakdown(data);
+
+    // Per-market table
+    const markets = {};
+    data.forEach(o => {
+      if (!markets[o.market]) markets[o.market] = [];
+      markets[o.market].push(o);
+    });
+
+    const tbody = document.getElementById('market-table');
+    if (Object.keys(markets).length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="px-6 py-8 text-center text-gray-400 text-sm">No data for selected filters.</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = Object.entries(markets)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([market, rows]) => {
+        const mp  = avg(rows, 'days_to_proofs');
+        const ms  = avg(rows, 'days_to_ship');
+        const md  = avg(rows, 'days_to_delivery');
+        const dp  = pctDelayed(rows);
+        const ep  = pctError(rows);
+        return `<tr class="hover:bg-gray-50">
+          <td class="px-6 py-3 font-semibold text-gray-800">${market}</td>
+          <td class="px-4 py-3 text-center text-gray-500">${rows.length}</td>
+          <td class="px-4 py-3 text-center text-gray-700">${fmtDays(mp)}</td>
+          <td class="px-4 py-3 text-center text-gray-700">${fmtDays(ms)}</td>
+          <td class="px-4 py-3 text-center text-gray-700">${fmtDays(md)}</td>
+          <td class="px-4 py-3 text-center ${delayClass(dp)}">${fmtPct(dp)}</td>
+          <td class="px-4 py-3 text-center ${errorClass(ep)}">${fmtPct(ep)}</td>
+        </tr>`;
+      }).join('');
+  }
+
+  let _remindersCollapsed = false;
+
+  function toggleReminders() {
+    _remindersCollapsed = !_remindersCollapsed;
+    document.getElementById('reminders-body').classList.toggle('hidden', _remindersCollapsed);
+    document.getElementById('reminders-toggle').textContent = _remindersCollapsed ? 'Show' : 'Hide';
+  }
+
+  function urgencyStyle(days) {
+    if (days < 0) return { bg: 'bg-red-50 border-red-200', badge: 'bg-red-600 text-white', text: `${Math.abs(days)}d overdue` };
+    return              { bg: 'bg-orange-50 border-orange-200', badge: 'bg-orange-100 text-orange-700', text: 'Due today' };
+  }
+
+  function milestoneIcon(m) {
+    if (m === 'Proofs Ready')    return '🎨';
+    if (m === 'Proofs Approved') return '✅';
+    if (m === 'Ship Date')       return '🚚';
+    if (m === 'Delivery Date')   return '📦';
+    return '📅';
+  }
+
+  function renderReminders(reminders) {
+    const section = document.getElementById('reminders-section');
+    const body    = document.getElementById('reminders-body');
+
+    if (!reminders.length) {
+      section.classList.remove('hidden');
+      body.innerHTML = `<div class="bg-green-50 border border-green-200 rounded-xl px-4 py-3 text-sm text-green-700 font-medium">✓ All clear — nothing due today</div>`;
+      return;
+    }
+
+    section.classList.remove('hidden');
+    body.innerHTML = `<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+      ${reminders.map(r => {
+        const s = urgencyStyle(r.days_diff);
+        const dateStr = new Date(r.date + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        return `<div class="flex items-start gap-3 border rounded-xl px-3 py-2.5 ${s.bg}">
+          <span class="text-base mt-0.5">${milestoneIcon(r.milestone)}</span>
+          <div class="flex-1 min-w-0">
+            <p class="text-sm font-semibold text-gray-800 truncate">${r.gear_type} — ${r.milestone}</p>
+            <p class="text-xs text-gray-500 truncate">${r.order_label}</p>
+            <div class="flex items-center gap-1.5 mt-1">
+              <span class="text-xs font-medium text-gray-600">${dateStr}</span>
+              <span class="text-xs font-semibold px-1.5 py-0.5 rounded-full ${s.badge}">${s.text}</span>
+            </div>
+          </div>
+        </div>`;
+      }).join('')}
+    </div>`;
+  }
+
+  async function loadReminders() {
+    try {
+      const resp = await fetch('/api/dashboard-reminders');
+      const data = await resp.json();
+      if (data.ok) renderReminders(data.reminders);
+    } catch {}
+  }
+
+  async function loadData() {
+    const btn  = document.getElementById('refresh-btn');
+    const icon = document.getElementById('refresh-icon');
+    btn.disabled = true;
+    icon.innerHTML = '<svg class="spin w-4 h-4 inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>';
+
+    try {
+      const [resp] = await Promise.all([
+        fetch('/api/dashboard-data'),
+        loadReminders(),
+      ]);
+      const data = await resp.json();
+      if (data.ok) {
+        _allOrders = data.orders;
+        buildYearToggle();
+        buildSportToggle();
+        buildExcludeList();
+        render();
+        document.getElementById('last-loaded').textContent =
+          `Last loaded ${new Date().toLocaleTimeString()}`;
+      }
+    } catch (e) {
+      document.getElementById('last-loaded').textContent = 'Failed to load data.';
+    } finally {
+      btn.disabled = false;
+      icon.textContent = '↻';
+    }
+  }
+
+  loadData();
+  loadReminders();
+</script>
+{% endblock %}

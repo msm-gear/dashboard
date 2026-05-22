@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}MSM Shipment Tracker{% endblock %}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  {% block head_extra %}{% endblock %}
+  <style>
+    body { font-family: 'Inter', system-ui, sans-serif; }
+    .spin { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+
+  <nav class="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-2 text-gray-900 font-bold text-lg">
+      <span class="text-2xl">📦</span>
+      <span>MSM Shipment Tracker</span>
+      <span class="ml-2 text-xs font-medium bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full">View Only</span>
+    </div>
+    <div class="flex items-center gap-5">
+      <a href="/public/orders" class="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
+        🗂 Orders
+      </a>
+      <a href="/public/tracking" class="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
+        🚚 Tracking
+      </a>
+      <a href="/public/contents" class="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
+        🔍 Contents
+      </a>
+      <a href="/public/dashboard" class="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
+        📊 Dashboard
+      </a>
+      <a href="/public/calendar" class="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
+        📅 Calendar
+      </a>
+    </div>
+  </nav>
+
+  {% block full_width %}{% endblock %}
+  <main class="max-w-5xl mx-auto px-6 py-8">
+    {% block content %}{% endblock %}
+  </main>
+
+</body>
+</html>

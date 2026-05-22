@@ -1,0 +1,884 @@
+{% extends "base.html" %}
+{% block title %}Orders — MSM Shipment Tracker{% endblock %}
+
+{% block content %}
+
+<div class="flex items-center justify-between mb-6">
+  <div>
+    <h1 class="text-2xl font-bold text-gray-900">Saved Orders</h1>
+    <p class="text-gray-500 text-sm mt-1">{{ orders|length }} order(s) on file</p>
+  </div>
+</div>
+
+{% if manual_tns %}
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden mb-6">
+  <div class="px-6 py-3 border-b border-gray-100 flex items-center justify-between">
+    <p class="font-semibold text-gray-800 text-sm">↓ AfterShip CSV Export</p>
+    <div class="flex items-center gap-3">
+      <button type="button" onclick="selectAllTns(true)"
+              class="text-xs text-blue-600 hover:underline">Select All</button>
+      <span class="text-gray-300 text-xs">|</span>
+      <button type="button" onclick="selectAllTns(false)"
+              class="text-xs text-gray-400 hover:underline">Deselect All</button>
+    </div>
+  </div>
+  <div class="px-6 py-4">
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 mb-4">
+      {% for item in manual_tns %}
+      <label class="flex items-start gap-2.5 cursor-pointer group p-2 rounded-lg hover:bg-gray-50 transition-colors">
+        <input type="checkbox" value="{{ item.order_id }}|{{ item.tn }}"
+               class="aftership-tn-cb mt-0.5 rounded" checked>
+        <div>
+          <p class="font-mono text-sm text-gray-800 leading-tight">{{ item.tn }}</p>
+          <p class="text-xs text-gray-400 mt-0.5">
+            {% if item.gears %}{{ item.gears }} · {% endif %}{{ item.order_label }}
+          </p>
+        </div>
+      </label>
+      {% endfor %}
+    </div>
+    <button onclick="downloadAftershipCsv()"
+            class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl text-sm transition-all">
+      ↓ Download AfterShip CSV
+    </button>
+  </div>
+</div>
+{% endif %}
+
+{% if not orders %}
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-6 py-12 text-center text-gray-400 text-sm">
+  No orders saved yet. Create one from the order form.
+</div>
+{% endif %}
+
+{# Macro: per-gear update form #}
+{% macro gear_form(order_id, gear, tn) %}
+
+  <!-- Ship section -->
+  <div class="bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 mb-4">
+    <p class="text-xs font-semibold text-blue-700 uppercase tracking-wide mb-2">🚚 Mark as Shipped</p>
+    <div class="flex flex-wrap items-end gap-3">
+      <div class="flex-1 min-w-40">
+        <label class="text-xs text-blue-600 font-medium block mb-1">Tracking #</label>
+        <input type="text" id="ship-tn-{{ order_id }}-{{ gear }}"
+               placeholder="e.g. 123456789012"
+               value="{{ tn }}"
+               class="w-full border border-blue-300 rounded-lg px-3 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400">
+      </div>
+      <div>
+        <label class="text-xs text-blue-600 font-medium block mb-1">Ship Date</label>
+        <div class="flex items-center gap-2">
+          <input type="date" id="ship-date-{{ order_id }}-{{ gear }}"
+                 class="border border-blue-300 rounded-lg px-3 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400">
+          <label class="flex items-center gap-1.5 text-sm text-blue-700 cursor-pointer select-none whitespace-nowrap">
+            <input type="checkbox" id="ship-today-{{ order_id }}-{{ gear }}"
+                   onchange="setShipToday('{{ order_id }}', '{{ gear }}')"
+                   class="rounded">
+            Today
+          </label>
+        </div>
+      </div>
+    </div>
+    <div class="flex flex-wrap gap-3 mt-3">
+      <div class="w-24">
+        <label class="text-xs text-blue-600 font-medium block mb-1"># Boxes</label>
+        <input type="number" id="ship-boxes-{{ order_id }}-{{ gear }}"
+               min="1" value="1"
+               class="w-full border border-blue-300 rounded-lg px-3 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400">
+      </div>
+      <div class="flex-1 min-w-32">
+        <label class="text-xs text-blue-600 font-medium block mb-1">Declared Value ($)</label>
+        <input type="text" id="ship-declared-{{ order_id }}-{{ gear }}"
+               placeholder="e.g. 500.00"
+               class="w-full border border-blue-300 rounded-lg px-3 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400">
+      </div>
+      <div class="flex-1 min-w-48">
+        <label class="text-xs text-blue-600 font-medium block mb-1">Notes (posted as comment)</label>
+        <textarea id="ship-notes-{{ order_id }}-{{ gear }}"
+                  rows="1" placeholder="e.g. FedEx ground…"
+                  class="w-full border border-blue-300 rounded-lg px-3 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none"></textarea>
+      </div>
+    </div>
+    <div class="flex items-center gap-3 mt-3">
+      <button onclick="pushShipped('{{ order_id }}', '{{ gear }}')"
+              id="ship-btn-{{ order_id }}-{{ gear }}"
+              class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl text-sm transition-all flex items-center gap-2">
+        <span id="ship-icon-{{ order_id }}-{{ gear }}">🚚</span> Push Shipped
+      </button>
+      <span id="ship-result-{{ order_id }}-{{ gear }}" class="text-sm hidden"></span>
+    </div>
+  </div>
+
+  <!-- Phase section -->
+  <div class="flex flex-wrap gap-2 mb-3">
+    {% for idx, label in [(1,'Proofs'),(2,'Production'),(5,'Counted')] %}
+    <button type="button"
+            onclick="selectPhase('{{ order_id }}', '{{ gear }}', {{ idx }})"
+            id="phase-{{ order_id }}-{{ gear }}-{{ idx }}"
+            class="px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-gray-300 text-gray-600 bg-white hover:border-purple-400 hover:text-purple-600">
+      {{ idx }} — {{ label }}
+    </button>
+    {% endfor %}
+  </div>
+
+  <div id="proofs-sec-{{ order_id }}-{{ gear }}" class="hidden bg-white border border-purple-200 rounded-xl px-4 py-3 mb-3">
+    <p class="text-xs font-semibold text-purple-700 uppercase tracking-wide mb-2">Proofs Approved [Actual]</p>
+    <div class="flex flex-wrap items-center gap-3">
+      <input type="date" id="proofs-date-{{ order_id }}-{{ gear }}"
+             class="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400">
+      <label class="flex items-center gap-1.5 text-sm text-gray-600 cursor-pointer select-none">
+        <input type="checkbox" id="proofs-today-{{ order_id }}-{{ gear }}"
+               onchange="setProofsToday('{{ order_id }}', '{{ gear }}')"
+               class="rounded">
+        Today
+      </label>
+    </div>
+  </div>
+
+  <div id="rcv-sec-{{ order_id }}-{{ gear }}" class="hidden bg-white border border-gray-200 rounded-xl px-4 py-3 mb-3">
+    <p class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Receiving Condition</p>
+    <div class="flex flex-wrap gap-2 mb-2">
+      {% for idx, label, color in [(0,'Incorrect','border-purple-500 text-purple-700 bg-purple-50'),(1,'Missing','border-red-500 text-red-700 bg-red-50'),(2,'Off Colors','border-orange-500 text-orange-700 bg-orange-50'),(3,'Accurate','border-green-500 text-green-700 bg-green-50')] %}
+      <button type="button"
+              onclick="selectRcv('{{ order_id }}', '{{ gear }}', {{ idx }})"
+              id="rcv-{{ order_id }}-{{ gear }}-{{ idx }}"
+              class="px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-gray-300 text-gray-600 bg-white hover:border-purple-400 hover:text-purple-600">
+        {{ label }}
+      </button>
+      {% endfor %}
+    </div>
+    <input type="text"
+           id="rcv-qty-{{ order_id }}-{{ gear }}"
+           placeholder="Qty note (e.g. 3 jerseys missing)"
+           class="w-full border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400">
+  </div>
+
+  <div class="flex items-center gap-3">
+    <button onclick="pushPhase('{{ order_id }}', '{{ gear }}', '{{ tn }}')"
+            id="push-btn-{{ order_id }}-{{ gear }}"
+            class="px-5 py-2 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-xl text-sm transition-all flex items-center gap-2">
+      <span id="push-icon-{{ order_id }}-{{ gear }}">📋</span> Push to ClickUp
+    </button>
+    <span id="push-result-{{ order_id }}-{{ gear }}" class="text-sm hidden"></span>
+  </div>
+{% endmacro %}
+
+<div class="space-y-4">
+{% for order in orders %}
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
+
+  <!-- Order header -->
+  <div class="px-6 py-4 flex items-center justify-between gap-4">
+    <div class="flex-1 min-w-0">
+      <p class="font-bold text-gray-900 text-base truncate">
+        {{ order.market }} {{ order.season }} {{ order.sport }} — Order #{{ order.get('num_for_code', order.order_num) }}
+      </p>
+      <p class="text-xs text-gray-400 mt-0.5">
+        Created {{ order.get('created_at', '')[:10] }}
+        {% if order.get('shipped_at') %} · Shipped {{ order.shipped_at[:10] }}{% endif %}
+      </p>
+      <div class="flex flex-wrap gap-1.5 mt-2">
+        {% for gear in order.gear_tasks.keys() %}
+        <span class="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{{ gear }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="flex items-center gap-2 shrink-0">
+      <button onclick="toggleUpdate('{{ order.id }}')"
+              class="px-4 py-2 rounded-xl border border-gray-300 text-sm font-semibold text-gray-600 hover:border-purple-400 hover:text-purple-700 transition-all">
+        Update Status
+      </button>
+    </div>
+  </div>
+
+  <!-- Update panel -->
+  <div id="panel-{{ order.id }}" class="hidden border-t border-gray-100 bg-gray-50">
+
+    {% if order.shipments %}
+
+      {% for s in order.shipments %}
+      <div class="border-b border-gray-100 last:border-b-0">
+
+        <!-- Tracking header -->
+        <div class="px-6 py-2 bg-gray-100 border-b border-gray-200 flex items-center gap-3">
+          <span class="font-mono text-xs font-bold text-gray-700">{{ s.tracking_number }}</span>
+          <span class="text-xs text-gray-400 uppercase">{{ s.carrier }}</span>
+          {% for label in s.gear_groups %}
+          <span class="text-xs bg-purple-50 text-purple-700 px-2 py-0.5 rounded-full">{{ label }}</span>
+          {% endfor %}
+          <button type="button"
+                  data-order-id="{{ order.id }}"
+                  data-tracking="{{ s.tracking_number }}"
+                  data-gear-summary='{{ s.gear_summary | tojson }}'
+                  data-packing-boxes='{{ s.packing_boxes | tojson }}'
+                  data-sheet-url="{{ order.order_sheet_url or '' }}"
+                  onclick="openBoxContents(this)"
+                  class="ml-auto text-xs {% if s.packing_boxes %}text-green-700 border-green-200 hover:border-green-400{% else %}text-blue-600 border-blue-200 hover:border-blue-400{% endif %} border rounded-full px-2.5 py-0.5 transition-colors">
+            📋 {% if s.packing_boxes %}{{ s.packing_boxes | length }} Boxes{% else %}Box Contents{% endif %}
+          </button>
+        </div>
+
+        <!-- Per-gear clickable rows -->
+        {% for g in s.gear_summary %}
+          {% if order.gear_tasks.get(g.gear) %}
+          <div class="border-b border-gray-100 last:border-b-0">
+            <button type="button"
+                    onclick="toggleGear('{{ order.id }}', '{{ g.gear }}')"
+                    class="w-full flex items-center justify-between px-6 py-3 hover:bg-white transition-colors text-left">
+              <div class="flex items-center gap-2">
+                <span class="text-sm font-semibold text-gray-800">{{ g.gear }}</span>
+                <span class="text-xs text-gray-400">× {{ g.boxes }}</span>
+                <span id="cur-phase-{{ order.id }}-{{ g.gear }}"
+                      class="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full"></span>
+              </div>
+              <svg id="gear-chevron-{{ order.id }}-{{ g.gear }}" class="w-4 h-4 text-gray-400 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+              </svg>
+            </button>
+            <div id="gear-panel-{{ order.id }}-{{ g.gear }}" class="hidden bg-white border-t border-gray-100 px-6 py-4">
+              {{ gear_form(order.id, g.gear, s.tracking_number) }}
+            </div>
+          </div>
+          {% endif %}
+        {% endfor %}
+
+      </div>
+      {% endfor %}
+
+      <!-- Gear items not yet in any shipment -->
+      {% for gear in order.unshipped_gears %}
+      <div class="border-b border-gray-100 last:border-b-0">
+        <button type="button"
+                onclick="toggleGear('{{ order.id }}', '{{ gear }}')"
+                class="w-full flex items-center justify-between px-6 py-3 hover:bg-white transition-colors text-left">
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-semibold text-gray-800">{{ gear }}</span>
+            <span class="text-xs text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full">Not shipped</span>
+            <span id="cur-phase-{{ order.id }}-{{ gear }}"
+                  class="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full"></span>
+          </div>
+          <svg id="gear-chevron-{{ order.id }}-{{ gear }}" class="w-4 h-4 text-gray-400 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+          </svg>
+        </button>
+        <div id="gear-panel-{{ order.id }}-{{ gear }}" class="hidden bg-white border-t border-gray-100 px-6 py-4">
+          {{ gear_form(order.id, gear, '') }}
+        </div>
+      </div>
+      {% endfor %}
+
+    {% else %}
+
+      <!-- No shipments — list all gear tasks -->
+      {% for gear in order.gear_tasks.keys() %}
+      <div class="border-b border-gray-100 last:border-b-0">
+        <button type="button"
+                onclick="toggleGear('{{ order.id }}', '{{ gear }}')"
+                class="w-full flex items-center justify-between px-6 py-3 hover:bg-white transition-colors text-left">
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-semibold text-gray-800">{{ gear }}</span>
+            <span id="cur-phase-{{ order.id }}-{{ gear }}"
+                  class="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full"></span>
+          </div>
+          <svg id="gear-chevron-{{ order.id }}-{{ gear }}" class="w-4 h-4 text-gray-400 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+          </svg>
+        </button>
+        <div id="gear-panel-{{ order.id }}-{{ gear }}" class="hidden bg-white border-t border-gray-100 px-6 py-4">
+          {{ gear_form(order.id, gear, '') }}
+        </div>
+      </div>
+      {% endfor %}
+
+    {% endif %}
+
+  </div>
+
+</div>
+{% endfor %}
+</div>
+
+<script>
+  const _phase    = {};
+  const _rcv      = {};
+  const TODAY     = new Date().toISOString().slice(0, 10);
+  const SPINNER   = '<svg class="spin w-4 h-4 inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>';
+
+  const RCV_OPTS = [
+    'border-purple-500 text-purple-700 bg-purple-50',
+    'border-red-500 text-red-700 bg-red-50',
+    'border-orange-500 text-orange-700 bg-orange-50',
+    'border-green-500 text-green-700 bg-green-50',
+  ];
+  const BTN_BASE   = 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-gray-300 text-gray-600 bg-white hover:border-purple-400 hover:text-purple-600';
+  const BTN_ACTIVE = 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-purple-500 text-purple-700 bg-purple-50';
+
+  const _phasesFetched = new Set();
+
+  function selectAllTns(checked) {
+    document.querySelectorAll('.aftership-tn-cb').forEach(cb => cb.checked = checked);
+  }
+
+  function downloadAftershipCsv() {
+    const cbs = [...document.querySelectorAll('.aftership-tn-cb:checked')];
+    if (!cbs.length) { alert('Select at least one tracking number.'); return; }
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = '/api/aftership-csv';
+    cbs.forEach(cb => {
+      const inp = document.createElement('input');
+      inp.type  = 'hidden';
+      inp.name  = 'items';
+      inp.value = cb.value;
+      form.appendChild(inp);
+    });
+    document.body.appendChild(form);
+    form.submit();
+    document.body.removeChild(form);
+  }
+
+  async function toggleUpdate(orderId) {
+    const panel = document.getElementById('panel-' + orderId);
+    const wasHidden = panel.classList.contains('hidden');
+    panel.classList.toggle('hidden');
+
+    if (wasHidden && !_phasesFetched.has(orderId)) {
+      _phasesFetched.add(orderId);
+      try {
+        const resp = await fetch(`/api/order-phases/${orderId}`);
+        const data = await resp.json();
+        if (data.ok) {
+          for (const [gear, phaseIdx] of Object.entries(data.phases)) {
+            const el = document.getElementById(`cur-phase-${orderId}-${gear}`);
+            if (el && phaseIdx !== null) {
+              el.textContent = data.labels[phaseIdx] || `Phase ${phaseIdx}`;
+            }
+          }
+        }
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  function toggleGear(orderId, gear) {
+    const panel   = document.getElementById(`gear-panel-${orderId}-${gear}`);
+    const chevron = document.getElementById(`gear-chevron-${orderId}-${gear}`);
+    const isOpen  = !panel.classList.toggle('hidden');
+    if (chevron) chevron.style.transform = isOpen ? 'rotate(180deg)' : '';
+  }
+
+  function selectPhase(orderId, gear, phase) {
+    const key = orderId + ':' + gear;
+    _phase[key] = phase;
+
+    [1, 2, 5].forEach(idx => {
+      const btn = document.getElementById(`phase-${orderId}-${gear}-${idx}`);
+      if (btn) btn.className = idx === phase ? BTN_ACTIVE : BTN_BASE;
+    });
+
+    const proofsEl = document.getElementById(`proofs-sec-${orderId}-${gear}`);
+    if (proofsEl) proofsEl.classList.toggle('hidden', phase !== 1);
+
+    const rcvEl = document.getElementById(`rcv-sec-${orderId}-${gear}`);
+    if (rcvEl) rcvEl.classList.toggle('hidden', phase !== 5);
+  }
+
+  function setProofsToday(orderId, gear) {
+    const cb  = document.getElementById(`proofs-today-${orderId}-${gear}`);
+    const inp = document.getElementById(`proofs-date-${orderId}-${gear}`);
+    inp.value    = cb.checked ? TODAY : '';
+    inp.disabled = cb.checked;
+  }
+
+  function setShipToday(orderId, gear) {
+    const cb  = document.getElementById(`ship-today-${orderId}-${gear}`);
+    const inp = document.getElementById(`ship-date-${orderId}-${gear}`);
+    inp.value    = cb.checked ? TODAY : '';
+    inp.disabled = cb.checked;
+  }
+
+  async function pushShipped(orderId, gear) {
+    const tn      = document.getElementById(`ship-tn-${orderId}-${gear}`)?.value.trim();
+    const dateCb  = document.getElementById(`ship-today-${orderId}-${gear}`);
+    const dateInp = document.getElementById(`ship-date-${orderId}-${gear}`);
+    const shipDate = dateCb?.checked ? TODAY : (dateInp?.value || '');
+    const notes        = document.getElementById(`ship-notes-${orderId}-${gear}`)?.value.trim() || '';
+    const declaredValue = document.getElementById(`ship-declared-${orderId}-${gear}`)?.value.trim() || '';
+    const boxCount     = parseInt(document.getElementById(`ship-boxes-${orderId}-${gear}`)?.value || '1', 10) || 1;
+
+    if (!tn) { alert('Enter a tracking number.'); return; }
+
+    const btn    = document.getElementById(`ship-btn-${orderId}-${gear}`);
+    const icon   = document.getElementById(`ship-icon-${orderId}-${gear}`);
+    const result = document.getElementById(`ship-result-${orderId}-${gear}`);
+
+    btn.disabled = true;
+    icon.innerHTML = SPINNER;
+    result.classList.add('hidden');
+
+    try {
+      const resp = await fetch('/push/update-ship', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order_id: orderId, gear_type: gear, tracking_number: tn, ship_date: shipDate, notes, declared_value: declaredValue, box_count: boxCount }),
+      });
+      const data = await resp.json();
+      result.classList.remove('hidden');
+      result.textContent = data.ok ? ('✓ ' + data.message) : ('✗ ' + (data.error || 'Failed.'));
+      result.className = 'text-sm ' + (data.ok ? 'text-green-700' : 'text-red-600');
+
+      if (data.ok) {
+        const el = document.getElementById(`cur-phase-${orderId}-${gear}`);
+        if (el) el.textContent = 'Shipped';
+      }
+    } catch (e) {
+      result.classList.remove('hidden');
+      result.textContent = '✗ Network error.';
+      result.className = 'text-sm text-red-600';
+    } finally {
+      btn.disabled = false;
+      icon.textContent = '🚚';
+    }
+  }
+
+  function selectRcv(orderId, gear, idx) {
+    const key = orderId + ':' + gear;
+    _rcv[key] = idx;
+    for (let i = 0; i < 4; i++) {
+      const btn = document.getElementById(`rcv-${orderId}-${gear}-${i}`);
+      if (!btn) continue;
+      btn.className = i === idx
+        ? `px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors ${RCV_OPTS[i]}`
+        : BTN_BASE;
+    }
+  }
+
+  async function pushPhase(orderId, gear, tn) {
+    const key   = orderId + ':' + gear;
+    const phase = _phase[key];
+    if (phase === undefined) { alert('Select a phase first.'); return; }
+
+    const btn    = document.getElementById(`push-btn-${orderId}-${gear}`);
+    const icon   = document.getElementById(`push-icon-${orderId}-${gear}`);
+    const result = document.getElementById(`push-result-${orderId}-${gear}`);
+
+    const payload = { order_id: orderId, gear_type: gear, tracking_number: tn, phase };
+
+    if (phase === 1) {
+      const cb  = document.getElementById(`proofs-today-${orderId}-${gear}`);
+      const inp = document.getElementById(`proofs-date-${orderId}-${gear}`);
+      const dateVal = (cb && cb.checked) ? TODAY : (inp ? inp.value : '');
+      if (!dateVal) { alert('Select a Proofs Approved date.'); return; }
+      payload.proofs_actual = dateVal;
+    }
+
+    if (phase === 5) {
+      const rcvIdx = _rcv[key];
+      if (rcvIdx === undefined) { alert('Select a receiving condition.'); return; }
+      payload.receiving_orderindex = rcvIdx;
+      const qtyEl = document.getElementById(`rcv-qty-${orderId}-${gear}`);
+      if (qtyEl) payload.qty_note = qtyEl.value.trim();
+    }
+
+    btn.disabled = true;
+    icon.innerHTML = SPINNER;
+    result.classList.add('hidden');
+
+    try {
+      const resp = await fetch('/push/update-phase', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      result.classList.remove('hidden');
+      result.textContent = data.ok ? ('✓ ' + data.message) : ('✗ ' + (data.error || 'Failed.'));
+      result.className = 'text-sm ' + (data.ok ? 'text-green-700' : 'text-red-600');
+
+      if (data.ok) {
+        const el = document.getElementById(`cur-phase-${orderId}-${gear}`);
+        const labels = {1:'Proofs',2:'Production',3:'Shipped',4:'Delivered',5:'Counted'};
+        if (el) el.textContent = labels[phase] || `Phase ${phase}`;
+      }
+    } catch (e) {
+      result.classList.remove('hidden');
+      result.textContent = '✗ Network error.';
+      result.className = 'text-sm text-red-600';
+    } finally {
+      btn.disabled = false;
+      icon.textContent = '📋';
+    }
+  }
+</script>
+
+<!-- ── Box Contents Modal ───────────────────────────────────────────── -->
+<div id="bc-modal" style="display:none" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl flex flex-col max-h-[90vh]">
+
+    <!-- Header -->
+    <div class="px-6 py-4 border-b border-gray-100 flex items-center justify-between flex-shrink-0">
+      <div>
+        <h2 class="font-bold text-gray-900 text-base">Box Contents</h2>
+        <p class="text-xs text-gray-400 mt-0.5 font-mono" id="bc-tn"></p>
+      </div>
+      <button onclick="closeBcModal()" class="text-gray-400 hover:text-gray-700 text-lg leading-none">✕</button>
+    </div>
+
+    <!-- Tabs (only shown when no existing boxes) -->
+    <div id="bc-tabs" class="flex border-b border-gray-100 flex-shrink-0">
+      <button id="bc-tab-upload" onclick="bcShowTab('upload')"
+              class="px-5 py-2.5 text-sm font-semibold text-blue-600 border-b-2 border-blue-500">
+        Upload Packing List
+      </button>
+      <button id="bc-tab-manual" onclick="bcShowTab('manual')"
+              class="px-5 py-2.5 text-sm text-gray-500 hover:text-gray-700 border-b-2 border-transparent">
+        Build Manually
+      </button>
+    </div>
+
+    <!-- Existing boxes view -->
+    <div id="bc-content-existing" class="hidden flex-1 overflow-y-auto p-6">
+      <div class="overflow-x-auto rounded-xl border border-gray-200">
+        <table class="w-full text-sm">
+          <thead class="bg-gray-50 text-gray-500 text-xs uppercase">
+            <tr>
+              <th class="px-4 py-2 text-left">Box</th>
+              <th class="px-4 py-2 text-left">Gear</th>
+              <th class="px-4 py-2 text-left">Contents</th>
+              <th class="px-4 py-2 text-left">Weight</th>
+            </tr>
+          </thead>
+          <tbody id="bc-existing-rows" class="divide-y divide-gray-100"></tbody>
+        </table>
+      </div>
+      <button onclick="bcShowEntryForm()"
+              class="mt-4 text-xs text-gray-400 hover:text-gray-600 underline">
+        Replace with new upload or manual entry →
+      </button>
+    </div>
+
+    <!-- Upload tab -->
+    <div id="bc-content-upload" class="hidden flex-1 overflow-y-auto p-6">
+      <p class="text-sm text-gray-500 mb-4">
+        Upload the supplier's packing list Excel. Rows matching tracking number
+        <span class="font-mono bg-gray-100 px-1 rounded text-xs" id="bc-tn-upload"></span> will be imported.
+      </p>
+      <div class="flex items-center gap-3 mb-4">
+        <input type="file" id="bc-file" accept=".xlsx,.xls"
+               class="block text-sm text-gray-500 border border-gray-300 rounded-lg px-3 py-2 flex-1">
+        <button onclick="bcParsePL()"
+                class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold rounded-lg transition-colors whitespace-nowrap">
+          Parse & Preview
+        </button>
+      </div>
+      <div id="bc-pl-status" class="text-sm text-gray-500 hidden"></div>
+      <div id="bc-pl-preview" class="hidden mt-4">
+        <p class="text-xs text-gray-400 mb-2" id="bc-pl-count"></p>
+        <div class="overflow-x-auto rounded-xl border border-gray-200">
+          <table class="w-full text-xs">
+            <thead class="bg-gray-50 text-gray-500 uppercase">
+              <tr>
+                <th class="px-3 py-2 text-left">Box</th>
+                <th class="px-3 py-2 text-left">Gear</th>
+                <th class="px-3 py-2 text-left">Contents</th>
+                <th class="px-3 py-2 text-left">Weight</th>
+              </tr>
+            </thead>
+            <tbody id="bc-pl-rows" class="divide-y divide-gray-100"></tbody>
+          </table>
+        </div>
+        <button onclick="bcSavePL()"
+                class="mt-4 px-4 py-2 bg-green-600 hover:bg-green-700 text-white text-sm font-semibold rounded-lg transition-colors">
+          Save to Records
+        </button>
+        <span id="bc-pl-save-status" class="ml-3 text-sm hidden"></span>
+      </div>
+    </div>
+
+    <!-- Manual tab -->
+    <div id="bc-content-manual" class="hidden flex-1 overflow-y-auto p-6">
+      <p class="text-sm text-gray-500 mb-4">
+        Select teams from the order sheet or type sizes (e.g. YL-15 YXL-20). All boxes for a gear get the same teams unless you edit individually.
+      </p>
+      <div id="bc-manual-gears" class="space-y-5"></div>
+      <button onclick="bcSaveManual()"
+              class="mt-6 px-4 py-2 bg-green-600 hover:bg-green-700 text-white text-sm font-semibold rounded-lg transition-colors">
+        Save Box Contents
+      </button>
+      <span id="bc-manual-save-status" class="ml-3 text-sm hidden"></span>
+    </div>
+
+  </div>
+</div>
+
+<script>
+  // ── Box Contents Modal State ───────────────────────────────────────
+  let bcOrderId = '', bcTracking = '', bcGearSummary = [], bcSheetUrl = '';
+  let bcParsedRows = [], bcPackingBoxes = [];
+
+  function openBoxContents(btn) {
+    bcOrderId     = btn.dataset.orderId;
+    bcTracking    = btn.dataset.tracking;
+    bcGearSummary = JSON.parse(btn.dataset.gearSummary);
+    bcSheetUrl    = btn.dataset.sheetUrl || '';
+    bcPackingBoxes = JSON.parse(btn.dataset.packingBoxes || '[]');
+
+    document.getElementById('bc-tn').textContent = bcTracking;
+    document.getElementById('bc-tn-upload').textContent = bcTracking;
+    document.getElementById('bc-modal').style.display = 'flex';
+
+    // Reset state
+    bcParsedRows = [];
+    document.getElementById('bc-file').value = '';
+    document.getElementById('bc-pl-status').classList.add('hidden');
+    document.getElementById('bc-pl-preview').classList.add('hidden');
+    document.getElementById('bc-pl-save-status').classList.add('hidden');
+    document.getElementById('bc-manual-save-status').classList.add('hidden');
+
+    if (bcPackingBoxes.length) {
+      bcShowExisting();
+    } else {
+      bcShowEntryForm();
+      bcBuildManualForm();
+    }
+  }
+
+  function bcShowExisting() {
+    document.getElementById('bc-tabs').style.display = 'none';
+    ['upload', 'manual'].forEach(t => document.getElementById(`bc-content-${t}`).classList.add('hidden'));
+    const el = document.getElementById('bc-content-existing');
+    el.classList.remove('hidden');
+    document.getElementById('bc-existing-rows').innerHTML = bcPackingBoxes.map(b => `
+      <tr class="hover:bg-gray-50">
+        <td class="px-4 py-2 text-gray-500">Box ${b.box_num}</td>
+        <td class="px-4 py-2 font-semibold text-gray-800">${b.gear}</td>
+        <td class="px-4 py-2 text-gray-600">${b.contents || '—'}</td>
+        <td class="px-4 py-2 text-gray-400">${b.weight || '—'}</td>
+      </tr>`).join('');
+  }
+
+  function bcShowEntryForm() {
+    document.getElementById('bc-tabs').style.display = 'flex';
+    document.getElementById('bc-content-existing').classList.add('hidden');
+    bcShowTab('upload');
+    bcBuildManualForm();
+  }
+
+  function closeBcModal() {
+    document.getElementById('bc-modal').style.display = 'none';
+  }
+
+  function bcShowTab(tab) {
+    ['upload', 'manual'].forEach(t => {
+      document.getElementById(`bc-content-${t}`).classList.toggle('hidden', t !== tab);
+      const btn = document.getElementById(`bc-tab-${t}`);
+      btn.className = t === tab
+        ? 'px-5 py-2.5 text-sm font-semibold text-blue-600 border-b-2 border-blue-500'
+        : 'px-5 py-2.5 text-sm text-gray-500 hover:text-gray-700 border-b-2 border-transparent';
+    });
+  }
+
+  // ── Upload Packing List ────────────────────────────────────────────
+  async function bcParsePL() {
+    const file = document.getElementById('bc-file').files[0];
+    const status = document.getElementById('bc-pl-status');
+    if (!file) { alert('Choose an Excel file first.'); return; }
+
+    status.textContent = 'Parsing…';
+    status.classList.remove('hidden');
+    document.getElementById('bc-pl-preview').classList.add('hidden');
+
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('tracking_number', bcTracking);
+
+    try {
+      const resp = await fetch('/api/parse-packing-for-tn', { method: 'POST', body: fd });
+      const data = await resp.json();
+      if (!data.ok) { status.textContent = '✗ ' + data.error; return; }
+
+      bcParsedRows = data.rows;
+      if (!bcParsedRows.length) {
+        status.textContent = `No rows found for tracking number ${bcTracking}. Check the file or tracking number.`;
+        return;
+      }
+
+      status.classList.add('hidden');
+      document.getElementById('bc-pl-count').textContent =
+        `Found ${bcParsedRows.length} box${bcParsedRows.length !== 1 ? 'es' : ''} for this tracking number`;
+
+      const tbody = document.getElementById('bc-pl-rows');
+      tbody.innerHTML = bcParsedRows.map(r => `
+        <tr class="hover:bg-gray-50">
+          <td class="px-3 py-2 font-semibold">Box ${r.box_num}</td>
+          <td class="px-3 py-2 text-gray-700">${r.gear_type}</td>
+          <td class="px-3 py-2 text-gray-500">${r.contents || '—'}</td>
+          <td class="px-3 py-2 text-gray-400">${r.weight || '—'}</td>
+        </tr>`).join('');
+
+      document.getElementById('bc-pl-preview').classList.remove('hidden');
+      document.getElementById('bc-pl-save-status').classList.add('hidden');
+    } catch (e) {
+      status.textContent = '✗ Network error.';
+    }
+  }
+
+  async function bcSavePL() {
+    if (!bcParsedRows.length) return;
+    const saveStatus = document.getElementById('bc-pl-save-status');
+    saveStatus.textContent = 'Saving…';
+    saveStatus.className = 'ml-3 text-sm text-gray-500';
+    saveStatus.classList.remove('hidden');
+
+    try {
+      const resp = await fetch('/api/save-shipment-boxes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          order_id: bcOrderId,
+          tracking_number: bcTracking,
+          boxes: bcParsedRows.map(r => ({
+            gear_type: r.gear_type,
+            box_num: r.box_num,
+            contents: r.contents,
+            weight: r.weight,
+            declared_value: r.declared_value || '',
+          })),
+        }),
+      });
+      const data = await resp.json();
+      saveStatus.textContent = data.ok ? `✓ Saved ${data.saved} box${data.saved !== 1 ? 'es' : ''}` : '✗ ' + data.error;
+      saveStatus.className = 'ml-3 text-sm ' + (data.ok ? 'text-green-700' : 'text-red-600');
+    } catch (e) {
+      saveStatus.textContent = '✗ Network error.';
+      saveStatus.className = 'ml-3 text-sm text-red-600';
+    }
+  }
+
+  // ── Build Manually ─────────────────────────────────────────────────
+  function bcBuildManualForm() {
+    const container = document.getElementById('bc-manual-gears');
+    container.innerHTML = bcGearSummary.map(g => {
+      const safeId = g.gear.replace(/\s+/g, '-');
+      const boxCount = g.boxes || 1;
+      const boxInputs = Array.from({ length: boxCount }, (_, i) => `
+        <div class="flex items-start gap-2 mb-1.5">
+          <span class="text-xs text-gray-400 w-10 pt-1.5 flex-shrink-0">Box ${i + 1}</span>
+          <textarea data-gear="${g.gear}" data-box="${i + 1}" rows="1"
+                    placeholder="Team names or size breakdown"
+                    class="flex-1 text-xs border border-gray-200 rounded-lg px-2.5 py-1.5 resize-none focus:outline-none focus:ring-2 focus:ring-blue-300 bc-box-input"
+                    oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
+        </div>`).join('');
+
+      return `
+        <div class="border border-gray-200 rounded-xl p-4">
+          <div class="flex items-center justify-between mb-2">
+            <span class="font-semibold text-sm text-gray-800">${g.gear}
+              <span class="text-gray-400 font-normal">× ${boxCount} box${boxCount !== 1 ? 'es' : ''}</span>
+            </span>
+            <span class="text-xs text-gray-400" id="fetch-status-${safeId}">
+              ${bcSheetUrl ? 'Loading teams…' : 'No order sheet linked'}
+            </span>
+          </div>
+          <div id="team-checks-${safeId}" class="hidden mb-3">
+            <p class="text-xs text-gray-400 mb-2">Select teams in this shipment:</p>
+            <div class="flex flex-wrap gap-x-4 gap-y-1 bc-checks-list"></div>
+          </div>
+          ${boxInputs}
+        </div>`;
+    }).join('');
+
+    // Auto-fetch teams for all gears if sheet URL exists
+    if (bcSheetUrl) {
+      bcGearSummary.forEach(g => bcFetchTeams(g.gear));
+    }
+  }
+
+  async function bcFetchTeams(gearType) {
+    const safeId = gearType.replace(/\s+/g, '-');
+    const statusEl  = document.getElementById(`fetch-status-${safeId}`);
+    const checksDiv = document.getElementById(`team-checks-${safeId}`);
+
+    try {
+      const resp = await fetch(`/api/order-sheet-teams?order_id=${encodeURIComponent(bcOrderId)}&gear_type=${encodeURIComponent(gearType)}`);
+      const data = await resp.json();
+
+      if (!data.ok) {
+        if (statusEl) statusEl.textContent = '';
+        return;
+      }
+
+      if (statusEl) statusEl.textContent = `${data.teams.length} teams`;
+      checksDiv.classList.remove('hidden');
+      checksDiv.querySelector('.bc-checks-list').innerHTML = data.teams.map(t => {
+        const safe = t.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        return `
+          <label class="flex items-center gap-1.5 cursor-pointer select-none">
+            <input type="checkbox" class="bc-team-check rounded" data-gear="${gearType}" value="${safe}"
+                   onchange="bcSyncChecksToBoxes('${gearType}')">
+            <span class="text-xs text-gray-700">${t}</span>
+          </label>`;
+      }).join('');
+    } catch (e) {
+      if (statusEl) statusEl.textContent = '';
+    }
+  }
+
+  function bcSyncChecksToBoxes(gearType) {
+    const checked = [...document.querySelectorAll(`.bc-team-check[data-gear="${gearType}"]:checked`)]
+      .map(cb => cb.value);
+    const teamStr = checked.join(', ');
+    document.querySelectorAll(`.bc-box-input[data-gear="${gearType}"]`).forEach(inp => {
+      inp.value = teamStr;
+      inp.style.height = 'auto';
+      inp.style.height = inp.scrollHeight + 'px';
+    });
+  }
+
+  async function bcSaveManual() {
+    const inputs = document.querySelectorAll('.bc-box-input');
+    const boxes = [];
+    inputs.forEach(inp => {
+      const contents = inp.value.trim();
+      if (contents) {
+        boxes.push({
+          gear_type: inp.dataset.gear,
+          box_num: parseInt(inp.dataset.box),
+          contents,
+          weight: '',
+          declared_value: '',
+        });
+      }
+    });
+
+    if (!boxes.length) { alert('Enter contents for at least one box.'); return; }
+
+    const saveStatus = document.getElementById('bc-manual-save-status');
+    saveStatus.textContent = 'Saving…';
+    saveStatus.className = 'ml-3 text-sm text-gray-500';
+    saveStatus.classList.remove('hidden');
+
+    try {
+      const resp = await fetch('/api/save-shipment-boxes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          order_id: bcOrderId,
+          tracking_number: bcTracking,
+          boxes,
+        }),
+      });
+      const data = await resp.json();
+      saveStatus.textContent = data.ok ? `✓ Saved ${data.saved} box${data.saved !== 1 ? 'es' : ''}` : '✗ ' + data.error;
+      saveStatus.className = 'ml-3 text-sm ' + (data.ok ? 'text-green-700' : 'text-red-600');
+    } catch (e) {
+      saveStatus.textContent = '✗ Network error.';
+      saveStatus.className = 'ml-3 text-sm text-red-600';
+    }
+  }
+
+  // Close on backdrop click
+  document.getElementById('bc-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeBcModal();
+  });
+</script>
+{% endblock %}

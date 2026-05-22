@@ -1,0 +1,437 @@
+{% extends "public_base.html" %}
+{% block title %}Calendar — MSM Shipment Tracker{% endblock %}
+
+{% block head_extra %}
+<link href="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.11/index.global.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.11/index.global.min.js"></script>
+<style>
+  .fc .fc-toolbar-title { font-size: 1.05rem; font-weight: 700; }
+  .fc .fc-button {
+    background: #f1f5f9 !important; border: 1px solid #e2e8f0 !important;
+    color: #1e293b !important; font-weight: 600 !important;
+    font-size: 0.72rem !important; padding: 4px 9px !important;
+    border-radius: 6px !important; box-shadow: none !important;
+    text-transform: capitalize !important;
+  }
+  .fc .fc-button:hover { background: #e2e8f0 !important; }
+  .fc .fc-button-active,
+  .fc .fc-button.fc-button-primary:not(:disabled).fc-button-active {
+    background: #1e293b !important; color: #fff !important; border-color: #1e293b !important;
+  }
+  .fc .fc-daygrid-event { border-radius: 4px; font-size: 0.68rem; padding: 1px 4px; }
+  .fc .fc-list-event-title { font-size: 0.78rem; }
+  .fc .fc-list-day-cushion { background: #f8fafc; }
+  .fc .fc-list-event:hover td { background: #f1f5f9; }
+  .fc-event-title { font-weight: 500; }
+
+  .week-day-header {
+    font-size: 0.65rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.05em; color: #94a3b8; padding: 8px 12px 4px;
+    border-top: 1px solid #f1f5f9;
+  }
+  .week-day-header:first-child { border-top: none; }
+  .week-item { display: flex; align-items: flex-start; gap: 8px; padding: 5px 12px; transition: background 0.1s; }
+  .week-item:hover { background: #f8fafc; }
+  .week-dot { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; margin-top: 4px; }
+  .week-task { font-size: 0.75rem; font-weight: 500; color: #1e293b; line-height: 1.3; }
+  .week-badge {
+    font-size: 0.6rem; font-weight: 600; padding: 1px 5px;
+    border-radius: 9999px; white-space: nowrap; flex-shrink: 0;
+  }
+  .week-empty { font-size: 0.78rem; color: #94a3b8; text-align: center; padding: 24px 12px; }
+  .today-marker { background: #eff6ff; }
+
+  #cal-tooltip { position: fixed; z-index: 9999; pointer-events: none; max-width: 270px; }
+</style>
+{% endblock %}
+
+{% block full_width %}
+<div class="flex" style="height: calc(100vh - 57px);">
+
+  <!-- Filter sidebar -->
+  <aside class="w-52 bg-white border-r border-gray-200 flex flex-col overflow-y-auto flex-shrink-0">
+    <div class="p-4">
+
+      <!-- Source quick-filter -->
+      <div class="mb-4">
+        <p class="text-xs font-bold text-gray-500 uppercase tracking-wide mb-2">Show</p>
+        <div class="flex rounded-lg border border-gray-200 overflow-hidden text-xs font-semibold">
+          <button id="src-all"        onclick="setSource('all')"
+            class="flex-1 py-1.5 bg-gray-900 text-white transition-colors">All</button>
+          <button id="src-tournament" onclick="setSource('tournament')"
+            class="flex-1 py-1.5 bg-white text-gray-500 hover:bg-gray-50 border-l border-gray-200 transition-colors">Tourneys</button>
+          <button id="src-orders"     onclick="setSource('orders')"
+            class="flex-1 py-1.5 bg-white text-gray-500 hover:bg-gray-50 border-l border-gray-200 transition-colors">Orders</button>
+        </div>
+      </div>
+
+      <!-- Per-type toggles -->
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-xs font-bold text-gray-500 uppercase tracking-wide">Date types</span>
+        <div class="flex gap-2">
+          <button onclick="toggleAll(true)"  class="text-xs text-blue-600 hover:underline">All</button>
+          <span class="text-gray-300 text-xs">|</span>
+          <button onclick="toggleAll(false)" class="text-xs text-gray-400 hover:underline">None</button>
+        </div>
+      </div>
+
+      <!-- Tournament group -->
+      <div class="mb-4" data-group="tournament">
+        <p class="text-xs font-bold text-gray-400 uppercase tracking-wide mb-2">Tournament</p>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="tournament">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Registration Open" data-source="tournament" checked>
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#16a34a"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Registration Open</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="tournament">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Registration Closed" data-source="tournament" checked>
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#dc2626"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Registration Closed</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="tournament">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Gear Ordering Date" data-source="tournament" checked>
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#2563eb"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Gear Ordering Date</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="tournament">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Gear Delivery Date" data-source="tournament" checked>
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#f97316"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Gear Delivery Date</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="tournament">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Tournament Date" data-source="tournament" checked>
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#7c3aed"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Tournament Date</span>
+        </label>
+      </div>
+
+      <!-- Orders group -->
+      <div class="mb-4" data-group="orders">
+        <p class="text-xs font-bold text-gray-400 uppercase tracking-wide mb-2">Orders</p>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="orders">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Order Date" data-source="orders">
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#0891b2"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Order Date</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="orders">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Proofs Ready" data-source="orders">
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#ca8a04"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Proofs Ready</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="orders">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Proofs Ready [Actual]" data-source="orders">
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#a16207"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Proofs Ready [Actual]</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="orders">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Proofs Approved" data-source="orders">
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#65a30d"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Proofs Approved</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="orders">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Proofs Approved [Actual]" data-source="orders">
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#3f6212"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Proofs Approved [Actual]</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="orders">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Production Complete" data-source="orders">
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#9333ea"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Production Complete</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="orders">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Ship Date" data-source="orders">
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#1e40af"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Ship Date</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="orders">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Ship Date [Actual]" data-source="orders">
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#0284c7"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Ship Date [Actual]</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="orders">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Delivery Date" data-source="orders">
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#ea580c"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Delivery Date</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="orders">
+          <input type="checkbox" class="filter-cb sr-only" data-type="Delivery Date [Actual]" data-source="orders">
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#b45309"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">Delivery Date [Actual]</span>
+        </label>
+        <label class="flex items-center gap-2 py-0.5 cursor-pointer group" data-source="orders">
+          <input type="checkbox" class="filter-cb sr-only" data-type="ETA Provided to Zees" data-source="orders">
+          <span class="w-3 h-3 rounded-sm flex-shrink-0" style="background:#0f766e"></span>
+          <span class="text-xs text-gray-700 group-hover:text-gray-900 leading-tight">ETA Provided to Zees</span>
+        </label>
+      </div>
+
+    </div>
+  </aside>
+
+  <!-- Calendar -->
+  <main class="flex-1 flex flex-col min-w-0 overflow-hidden relative">
+
+    <!-- Loading overlay -->
+    <div id="loading" class="absolute inset-0 bg-white/70 z-50 flex items-center justify-center">
+      <div class="flex flex-col items-center gap-3">
+        <svg class="spin w-8 h-8 text-blue-600" fill="none" viewBox="0 0 24 24">
+          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
+        </svg>
+        <p class="text-sm text-gray-500 font-medium">Loading from ClickUp…</p>
+      </div>
+    </div>
+
+    <div id="calendar" class="flex-1 p-4 overflow-auto"></div>
+  </main>
+
+  <!-- Weekly task list -->
+  <aside class="w-64 bg-white border-l border-gray-200 flex flex-col flex-shrink-0">
+    <div class="px-3 py-3 border-b border-gray-100 flex-shrink-0">
+      <div class="flex items-center justify-between">
+        <div>
+          <p class="text-xs font-bold text-gray-500 uppercase tracking-wide mb-0.5">This Week</p>
+          <p id="week-range" class="text-xs text-gray-400"></p>
+        </div>
+        <button onclick="refreshData()" id="refresh-btn"
+          class="flex items-center gap-1 bg-white border border-gray-200 text-gray-600 text-xs font-semibold px-2 py-1 rounded-lg hover:bg-gray-50 transition-all">
+          <svg id="refresh-icon" class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+          </svg>
+          Reload
+        </button>
+      </div>
+    </div>
+    <div id="week-list" class="flex-1 overflow-y-auto">
+      <p class="week-empty">Loading…</p>
+    </div>
+    <div class="px-3 py-2 border-t border-gray-100 flex-shrink-0">
+      <p id="week-count" class="text-xs text-gray-400"></p>
+    </div>
+  </aside>
+
+</div>
+
+<!-- Tooltip -->
+<div id="cal-tooltip" class="hidden bg-white rounded-xl shadow-xl border border-gray-100 p-3 text-sm">
+  <p id="tt-task" class="font-semibold text-gray-900 mb-1"></p>
+  <p id="tt-type" class="text-xs font-medium mb-0.5"></p>
+  <p id="tt-date" class="text-xs text-gray-500"></p>
+  <p id="tt-source" class="text-xs text-gray-400 mt-1"></p>
+</div>
+
+<script>
+  let allEvents = [];
+  let calendar;
+
+  function currentWeekBounds() {
+    const today = new Date(); today.setHours(0,0,0,0);
+    const day = today.getDay();
+    const diff = (day === 0) ? -6 : 1 - day;
+    const mon = new Date(today); mon.setDate(today.getDate() + diff);
+    const sun = new Date(mon);   sun.setDate(mon.getDate() + 7);
+    return { start: mon.toISOString().slice(0,10), end: sun.toISOString().slice(0,10) };
+  }
+  const { start: currentStart, end: currentEnd } = currentWeekBounds();
+
+  /* ── Filters ──────────────────────────────────────────── */
+  const visible = {};
+  document.querySelectorAll('.filter-cb').forEach(cb => {
+    visible[cb.dataset.type] = cb.checked;
+    if (!cb.checked) cb.nextElementSibling.style.opacity = '0.25';
+    cb.addEventListener('change', () => {
+      visible[cb.dataset.type] = cb.checked;
+      cb.nextElementSibling.style.opacity = cb.checked ? '1' : '0.25';
+      applyFilter();
+    });
+  });
+
+  function filtered() {
+    return allEvents.filter(e => visible[e.extendedProps.dateType]);
+  }
+
+  function applyFilter() {
+    calendar.removeAllEvents();
+    calendar.addEventSource(filtered());
+    renderWeekList();
+  }
+
+  function toggleAll(state) {
+    document.querySelectorAll('.filter-cb').forEach(cb => {
+      cb.checked = state;
+      visible[cb.dataset.type] = state;
+      cb.nextElementSibling.style.opacity = state ? '1' : '0.25';
+    });
+    applyFilter();
+  }
+
+  function setSource(src) {
+    ['all','tournament','orders'].forEach(s => {
+      const btn = document.getElementById('src-' + s);
+      const active = s === src;
+      btn.classList.toggle('bg-gray-900', active);
+      btn.classList.toggle('text-white',  active);
+      btn.classList.toggle('bg-white',    !active);
+      btn.classList.toggle('text-gray-500', !active);
+    });
+    document.querySelectorAll('.filter-cb').forEach(cb => {
+      const show = src === 'all' || cb.dataset.source === src;
+      cb.closest('label').style.display = show ? '' : 'none';
+      if (show) { cb.checked = true; visible[cb.dataset.type] = true; cb.nextElementSibling.style.opacity = '1'; }
+      else { visible[cb.dataset.type] = false; }
+    });
+    document.querySelectorAll('[data-group]').forEach(g => {
+      const grpSrc = g.dataset.group === 'tournament' ? 'tournament' : 'orders';
+      g.style.display = (src === 'all' || grpSrc === src) ? '' : 'none';
+    });
+    applyFilter();
+  }
+
+  /* ── Weekly list ──────────────────────────────────────── */
+  function renderWeekList() {
+    const today = new Date(); today.setHours(0,0,0,0);
+    const start = new Date(currentStart); start.setHours(0,0,0,0);
+    const end   = new Date(currentEnd);   end.setHours(0,0,0,0);
+    const fmt = d => d.toLocaleDateString([], {month:'short', day:'numeric'});
+    document.getElementById('week-range').textContent = fmt(start) + ' – ' + fmt(new Date(end - 1));
+
+    const inWindow = filtered().filter(e => {
+      const d = new Date(e.start + 'T00:00:00');
+      return d >= start && d < end;
+    });
+
+    const container = document.getElementById('week-list');
+    if (!inWindow.length) {
+      container.innerHTML = '<p class="week-empty">No events this week</p>';
+      document.getElementById('week-count').textContent = '';
+      return;
+    }
+
+    const byDay = {};
+    inWindow.forEach(e => { if (!byDay[e.start]) byDay[e.start] = []; byDay[e.start].push(e); });
+
+    const DAY_NAMES   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+    let html = '';
+    Object.keys(byDay).sort().forEach(dateStr => {
+      const d = new Date(dateStr + 'T00:00:00');
+      const isToday = d.getTime() === today.getTime();
+      const label = `${DAY_NAMES[d.getDay()]} ${MONTH_NAMES[d.getMonth()]} ${d.getDate()}`;
+      html += `<div class="week-day-header${isToday ? ' text-blue-500' : ''}">
+        ${label}${isToday ? ' <span class="text-blue-400 normal-case font-normal">today</span>' : ''}
+      </div>`;
+      byDay[dateStr].forEach(e => {
+        const ep = e.extendedProps, c = e.color;
+        html += `<div class="week-item${isToday ? ' today-marker' : ''}">
+          <span class="week-dot" style="background:${c}"></span>
+          <div class="flex-1 min-w-0">
+            <p class="week-task truncate" title="${ep.task}">${ep.task}</p>
+          </div>
+          <span class="week-badge" style="background:${c}22;color:${c};border:1px solid ${c}44">${ep.dateType}</span>
+        </div>`;
+      });
+    });
+
+    container.innerHTML = html;
+    const total = inWindow.length;
+    document.getElementById('week-count').textContent = `${total} event${total !== 1 ? 's' : ''}`;
+  }
+
+  /* ── Data loading ─────────────────────────────────────── */
+  async function loadEvents() {
+    document.getElementById('loading').style.display = 'flex';
+    try {
+      const r = await fetch('/api/calendar-events');
+      allEvents = await r.json();
+      applyFilter();
+    } catch(e) { console.error(e); }
+    finally { document.getElementById('loading').style.display = 'none'; }
+  }
+
+  async function refreshData() {
+    const icon = document.getElementById('refresh-icon');
+    icon.classList.add('spin');
+    document.getElementById('refresh-btn').disabled = true;
+    try {
+      allEvents = [];
+      calendar.removeAllEvents();
+      await loadEvents();
+    } finally {
+      icon.classList.remove('spin');
+      document.getElementById('refresh-btn').disabled = false;
+    }
+  }
+
+  /* ── Tooltip ──────────────────────────────────────────── */
+  const tooltip = document.getElementById('cal-tooltip');
+  function showTooltip(info) {
+    const ep = info.event.extendedProps;
+    document.getElementById('tt-task').textContent   = ep.task;
+    document.getElementById('tt-type').textContent   = ep.dateType;
+    document.getElementById('tt-type').style.color   = info.event.backgroundColor;
+    document.getElementById('tt-date').textContent   = info.event.startStr;
+    document.getElementById('tt-source').textContent =
+      ep.source === 'tournament' ? '📅 Tournament list' : '📦 Order tracker';
+    tooltip.classList.remove('hidden');
+    positionTooltip(info.jsEvent);
+  }
+  function positionTooltip(e) {
+    const pad = 14, tw = tooltip.offsetWidth || 270, th = tooltip.offsetHeight || 100;
+    let x = e.clientX + pad, y = e.clientY + pad;
+    if (x + tw > window.innerWidth)  x = e.clientX - tw - pad;
+    if (y + th > window.innerHeight) y = e.clientY - th - pad;
+    tooltip.style.left = x + 'px'; tooltip.style.top = y + 'px';
+  }
+  document.addEventListener('mousemove', e => { if (!tooltip.classList.contains('hidden')) positionTooltip(e); });
+  document.addEventListener('click', () => tooltip.classList.add('hidden'));
+
+  /* ── Calendar init ────────────────────────────────────── */
+  document.addEventListener('DOMContentLoaded', () => {
+    calendar = new FullCalendar.Calendar(document.getElementById('calendar'), {
+      initialView: 'dayGridMonth',
+      height: '100%',
+      headerToolbar: { left: 'prev,next today', center: 'title', right: 'dayGridMonth,timeGridWeek,listWeek' },
+      buttonText: { today: 'Today', month: 'Month', week: 'Week', listWeek: 'List' },
+      views: {
+        listWeek: {
+          listDayFormat: { weekday: 'long', month: 'short', day: 'numeric' },
+          listDaySideFormat: false,
+          noEventsText: 'No events this week',
+        },
+      },
+      eventMouseEnter: info => showTooltip(info),
+      eventMouseLeave: () => tooltip.classList.add('hidden'),
+      eventClick(info) { showTooltip(info); info.jsEvent.stopPropagation(); },
+      eventOrder: 'start',
+      firstDay: 1,
+      nowIndicator: true,
+      dayMaxEvents: true,
+      moreLinkClick: 'popover',
+      eventDidMount(info) {
+        if (info.view.type === 'listWeek') {
+          const el = info.el.querySelector('.fc-list-event-title');
+          if (el) {
+            const badge = document.createElement('span');
+            badge.style.cssText = `display:inline-block;margin-left:8px;background:${info.event.backgroundColor}22;color:${info.event.backgroundColor};border:1px solid ${info.event.backgroundColor}44;font-size:0.65rem;font-weight:600;padding:1px 6px;border-radius:9999px;vertical-align:middle;`;
+            badge.textContent = info.event.extendedProps.dateType;
+            el.appendChild(badge);
+          }
+        }
+      },
+    });
+    calendar.render();
+    loadEvents();
+    setInterval(async () => {
+      try {
+        const r = await fetch('/api/calendar-events');
+        const fresh = await r.json();
+        if (JSON.stringify(fresh) !== JSON.stringify(allEvents)) {
+          allEvents = fresh; applyFilter();
+        }
+      } catch(e) { /* silent */ }
+    }, 60000);
+  });
+</script>
+{% endblock %}

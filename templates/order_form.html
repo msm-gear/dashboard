@@ -49,7 +49,7 @@
     </div>
     <div>
       <label class="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wide">Order #</label>
-      <input type="number" id="orderNum" value="1" min="1"
+      <input type="text" id="orderNum" value="1" placeholder="1, Freshman…"
              class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300">
     </div>
   </div>
@@ -82,7 +82,7 @@
   <!-- Column selector (shown only when sheet has multiple order columns) -->
   <div id="columnSelectorWrap" class="hidden">
     <label class="block text-xs font-medium text-gray-500 mb-2 uppercase tracking-wide">Select Order Column(s)</label>
-    <p class="text-xs text-gray-400 mb-2">Pick the column(s) that belong to this order. Select multiple to combine into one order.</p>
+    <p class="text-xs text-gray-400 mb-2">Pick the column that belongs to this order.</p>
     <div id="columnBtns" class="flex flex-wrap gap-2"></div>
   </div>
 
@@ -144,18 +144,26 @@
     return mo + da + y.slice(2);
   }
 
+  function numericOrderNum(val) {
+    const s = (val || '').trim();
+    if (/^\d+$/.test(s)) return s;
+    const m = s.match(/(\d+)$/);
+    return m ? m[1] : '1';
+  }
+
   function updatePreview() {
-    const market   = document.getElementById('market').value.trim();
-    const sport    = document.getElementById('sport').value;
-    const season   = document.getElementById('season').value;
-    const orderNum = document.getElementById('orderNum').value;
+    const market    = document.getElementById('market').value.trim();
+    const sport     = document.getElementById('sport').value;
+    const season    = document.getElementById('season').value;
+    const orderNum  = document.getElementById('orderNum').value;
     const orderDate = document.getElementById('orderDate').value;
+    const numForCode = numericOrderNum(orderNum);
 
     if (!market) { document.getElementById('taskPreview').textContent = '— enter market —'; return; }
-    document.getElementById('taskPreview').textContent = `${market} ${season} ${sport} [Gear] ${orderNum}`;
+    document.getElementById('taskPreview').textContent = `${market} ${season} ${sport} [Gear] ${numForCode}`;
     const mkt  = getMktCode(market);
     const date = dateToMMDDYY(orderDate);
-    document.getElementById('codePreview').textContent = `${mkt}-${sport}-[GEAR]-${date}-${orderNum}`;
+    document.getElementById('codePreview').textContent = `${mkt}-${sport}-[GEAR]-${date}-${numForCode}`;
   }
 
   let _sheetTimer = null;
@@ -205,43 +213,67 @@
     }
   }
 
-  function renderColumnSelector(columns) {
+  function colMatchesOrderNum(header, orderNum) {
+    const num = (orderNum || '').trim();
+    if (!num) return false;
+    // Numeric: "BSBL 1" tokens include "1"
+    if (/^\d+$/.test(num)) {
+      return header.split(/\s+/).some(t => t === num);
+    }
+    // Text: strip trailing number ("FRESHMAN 2" → "FRESHMAN"), match against header
+    const textPart = num.replace(/\s*\d+$/, '').trim().toUpperCase();
+    return textPart && header.toUpperCase().includes(textPart);
+  }
+
+  function renderColumnSelector(columns, autoSelectNum) {
     _sheetColumns = columns;
     _selectedCols.clear();
     const wrap = document.getElementById('columnSelectorWrap');
     const btns = document.getElementById('columnBtns');
     btns.innerHTML = '';
 
+    // Pre-select first column matching the order number (single-select)
+    if (autoSelectNum) {
+      const firstMatch = columns.find(col => colMatchesOrderNum(col.header, autoSelectNum));
+      if (firstMatch) _selectedCols.add(firstMatch.header);
+    }
+
     columns.forEach(col => {
+      const selected = _selectedCols.has(col.header);
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.textContent = col.header;
       btn.dataset.header = col.header;
-      btn.className = 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-gray-300 text-gray-600 bg-white hover:border-blue-400 hover:text-blue-600';
+      btn.className = selected
+        ? 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-blue-500 text-blue-700 bg-blue-50'
+        : 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-gray-300 text-gray-600 bg-white hover:border-blue-400 hover:text-blue-600';
       btn.addEventListener('click', () => {
-        if (_selectedCols.has(col.header)) {
-          _selectedCols.delete(col.header);
-          btn.className = 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-gray-300 text-gray-600 bg-white hover:border-blue-400 hover:text-blue-600';
-        } else {
-          _selectedCols.add(col.header);
-          btn.className = 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-blue-500 text-blue-700 bg-blue-50';
-        }
+        // Single-select: deselect all others, select this one
+        _selectedCols.clear();
+        _selectedCols.add(col.header);
+        document.querySelectorAll('#columnBtns button').forEach(b => {
+          b.className = 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-gray-300 text-gray-600 bg-white hover:border-blue-400 hover:text-blue-600';
+        });
+        btn.className = 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-blue-500 text-blue-700 bg-blue-50';
         applySelectedColumns();
       });
       btns.appendChild(btn);
     });
 
     wrap.classList.remove('hidden');
+    if (_selectedCols.size) applySelectedColumns();
   }
 
   async function fetchGearFromSheet(url) {
     const status = document.getElementById('sheetStatus');
+    const orderNum = document.getElementById('orderNum').value;
+    const season   = document.getElementById('season').value;
     hideColumnSelector();
     try {
       const resp = await fetch('/fetch-order-sheet', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url, season }),
       });
       const data = await resp.json();
       if (!data.ok) {
@@ -249,13 +281,25 @@
         status.className = 'ml-2 font-normal normal-case text-amber-600';
         return;
       }
+      // Auto-fill order date if detected from sheet
+      if (data.order_date) {
+        document.getElementById('orderDate').value = data.order_date;
+        updatePreview();
+      }
+
       if (data.columns && data.columns.length) {
-        // Per-column mode — show selector
-        renderColumnSelector(data.columns);
-        status.textContent = `✓ ${data.columns.length} order column(s) found — select below`;
+        // Per-column mode — auto-select column matching the order number
+        renderColumnSelector(data.columns, orderNum);
+        const autoMatched = data.columns.filter(c => colMatchesOrderNum(c.header, orderNum));
+        const synthetic = data.columns.every(c => /^\d+$/.test(c.header));
+        if (autoMatched.length) {
+          status.textContent = `✓ Auto-selected: ${autoMatched.map(c => c.header).join(', ')}`;
+        } else if (synthetic) {
+          status.textContent = `✓ ${data.columns.length} order groups found — pick the column number below`;
+        } else {
+          status.textContent = `✓ ${data.columns.length} column(s) found — select below`;
+        }
         status.className = 'ml-2 font-normal normal-case text-green-600';
-        // Uncheck all gear until user picks a column
-        document.querySelectorAll('input[name="gear"]').forEach(cb => { cb.checked = false; });
       } else if (data.gear_types && data.gear_types.length) {
         // Fallback: single aggregated list
         document.querySelectorAll('input[name="gear"]').forEach(cb => { cb.checked = false; });
@@ -279,6 +323,49 @@
     document.getElementById(id).addEventListener('input', updatePreview);
     document.getElementById(id).addEventListener('change', updatePreview);
   });
+
+  // Re-fetch gear when season changes (jackets mapping differs by season)
+  document.getElementById('season').addEventListener('change', () => {
+    const url = document.getElementById('orderSheetUrl').value;
+    if (url.includes('/spreadsheets/d/')) fetchGearFromSheet(url);
+  });
+
+  // Re-apply column auto-selection when order number changes
+  ['input','change'].forEach(evt => {
+    document.getElementById('orderNum').addEventListener(evt, () => {
+      if (_sheetColumns.length) {
+        const orderNum = document.getElementById('orderNum').value;
+        const status = document.getElementById('sheetStatus');
+        _selectedCols.clear();
+        // Single-select: pick first matching column only
+        const firstMatch = _sheetColumns.find(col => colMatchesOrderNum(col.header, orderNum));
+        if (firstMatch) _selectedCols.add(firstMatch.header);
+        // Update button highlight states
+        document.querySelectorAll('#columnBtns button').forEach(btn => {
+          const selected = _selectedCols.has(btn.dataset.header);
+          btn.className = selected
+            ? 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-blue-500 text-blue-700 bg-blue-50'
+            : 'px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors border-gray-300 text-gray-600 bg-white hover:border-blue-400 hover:text-blue-600';
+        });
+        const synthetic = _sheetColumns.every(c => /^\d+$/.test(c.header));
+        if (_selectedCols.size) {
+          applySelectedColumns();
+          const matched = _sheetColumns.filter(c => _selectedCols.has(c.header));
+          status.textContent = `✓ Auto-selected: ${matched.map(c => c.header).join(', ')}`;
+          status.className = 'ml-2 font-normal normal-case text-green-600';
+        } else {
+          document.querySelectorAll('input[name="gear"]').forEach(cb => { cb.checked = false; });
+          if (synthetic) {
+            status.textContent = `${_sheetColumns.length} order groups found — pick the column number below`;
+          } else {
+            status.textContent = `No column matching "${orderNum}" — select manually below`;
+          }
+          status.className = 'ml-2 font-normal normal-case text-amber-600';
+        }
+      }
+    });
+  });
+
   updatePreview();
 
   async function submitOrder() {
