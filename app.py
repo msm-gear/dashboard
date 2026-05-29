@@ -1,5 +1,5 @@
 from __future__ import annotations
-from flask import Flask, render_template, request, session, jsonify, redirect, url_for
+from flask import Flask, render_template, request, session, jsonify, redirect, url_for, send_file
 import openpyxl
 import re
 import difflib
@@ -26,6 +26,61 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = 'msm-shipment-tracker-2026'
+
+PUBLIC_PASS = 'GearUp@MSM2026'
+
+ORDERS_PASSES = {'GearUp2Sell26!', 'GearUp@MSM2026'}  # Zee | MSM
+
+
+def pub_authed():
+    return session.get('pub_authed') is True
+
+
+def orders_authed():
+    return session.get('orders_authed') is True
+
+@app.before_request
+def block_external_admin():
+    # Cloudflare sets CF-Connecting-IP on all tunneled requests
+    if not request.headers.get('CF-Connecting-IP'):
+        return  # local access — allow everything
+    host = request.host.split(':')[0]
+    if host == 'admin.msm-hq.com':
+        return  # Cloudflare Access handles auth
+    # tracker.msm-hq.com — public mirror, all pages open
+    if host == 'tracker.msm-hq.com':
+        allowed = (
+            request.path.startswith('/public/') or
+            request.path == '/public/login' or
+            request.path == '/public/logout' or
+            request.path.startswith('/api/tracking-status') or
+            request.path.startswith('/api/order-sheet') or
+            request.path.startswith('/api/shipment-status') or
+            request.path.startswith('/api/dashboard-data') or
+            request.path.startswith('/api/calendar-events') or
+            request.path.startswith('/api/events') or
+            request.path.startswith('/api/inventory-data') or
+            request.path.startswith('/api/orders-summary') or
+            request.path.startswith('/static/')
+        )
+        if not allowed:
+            return 'Not found', 404
+        return
+    # orders.msm-hq.com — Order Sheet only for Zees
+    if host == 'orders.msm-hq.com':
+        if request.path == '/':
+            return redirect('/public/order-sheet')
+        allowed = (
+            request.path == '/public/order-sheet' or
+            request.path == '/public/orders-login' or
+            request.path == '/public/orders-logout' or
+            request.path.startswith('/api/order-sheet') or
+            request.path.startswith('/static/')
+        )
+        if not allowed:
+            return 'Not found', 404
+        return
+    return 'Not found', 404
 
 UPLOAD_FOLDER = Path(__file__).parent / 'uploads'
 DATA_FOLDER = Path(__file__).parent / 'data'
@@ -396,16 +451,52 @@ def normalize_gear(raw: str) -> str:
         'tee': 'Tee', 'tees': 'Tee',
         'hoodie': 'Hoodie', 'hoodies': 'Hoodie',
         'cap': 'Cap', 'caps': 'Cap',
-        'windbreaker': 'Windbreaker',
-        'jacket': 'Jacket', 'jackets': 'Jacket',
+        'windbreaker': 'Windbreaker', 'jacket': 'Windbreaker', 'jackets': 'Windbreaker',
         'cage jacket': 'Cage Jacket', 'cage': 'Cage Jacket',
         'ring': 'Ring', 'rings': 'Ring',
         'hypechain': 'Hypechain', 'hype chain': 'Hypechain', 'hypechainn': 'Hypechain',
+        'necklace': 'Hypechain', 'necklaces': 'Hypechain',
         'park banner': 'Park Banner', 'banner': 'Park Banner',
-        'name banner': 'Name Banner',
+        'parkbanner': 'Park Banner', 'parkbannner': 'Park Banner',
+        'name banner': 'Name Banner', 'namebanner': 'Name Banner',
         'hybrid': 'Hybrid Pullover', 'hybrid pullover': 'Hybrid Pullover',
     }
     return mapping.get(raw, raw.capitalize())
+
+
+# Gear keywords that can appear in box contents as "keyword-qty" (e.g. "namebanner-7")
+_CONTENT_GEAR_RE = re.compile(r'\b([a-z]+)-(\d+)\b', re.IGNORECASE)
+_CONTENT_GEAR_WORDS = {
+    'namebanner': 'Name Banner', 'parkbanner': 'Park Banner', 'parkbannner': 'Park Banner',
+    'necklace': 'Hypechain', 'necklaces': 'Hypechain',
+    'hypechain': 'Hypechain', 'ring': 'Ring', 'rings': 'Ring',
+}
+
+
+def _content_gear_rows(row: dict) -> list:
+    """Return synthetic rows for gear types mentioned inside a box's contents field."""
+    contents = row.get('contents', '')
+    if not contents:
+        return []
+    extra, seen = [], set()
+    for m in _CONTENT_GEAR_RE.finditer(contents):
+        word = m.group(1).lower()
+        gear_type = _CONTENT_GEAR_WORDS.get(word)
+        if gear_type and gear_type != row['gear_type'] and gear_type not in seen:
+            seen.add(gear_type)
+            extra.append({
+                'id':              str(uuid.uuid4()),
+                'market':          row['market'],
+                'order_num':       row['order_num'],
+                'gear_type':       gear_type,
+                'box_num':         1,
+                'contents':        m.group(0),
+                'weight':          row['weight'],
+                'declared_value':  row['declared_value'],
+                'tracking_number': row['tracking_number'],
+                'carrier':         row['carrier'],
+            })
+    return extra
 
 
 def _parse_item_cols(row, col_offset: int):
@@ -450,6 +541,76 @@ def _parse_item_cols(row, col_offset: int):
     }
 
 
+def _parse_item_cols_simple(row, col_offset: int, last_tracking: str):
+    """Fallback parser for simple MARKET gear[-N] format (e.g. DFW tee-1).
+    Returns (list_of_entries, last_tracking).  Handles '+' combined gear
+    (e.g. 'Freshman hoodie+jacket') by emitting one entry per gear type.
+    """
+    item = row[col_offset] if len(row) > col_offset else None
+    if not item:
+        return [], last_tracking
+    item_str = str(item).strip()
+    if not item_str or item_str.lower() in ('items', 'item'):
+        return [], last_tracking
+
+    parts = item_str.split(None, 1)  # split on first whitespace
+    if len(parts) < 2:
+        return [], last_tracking
+    market, rest = parts[0], parts[1]
+
+    # Split on '/' to drop secondary label (e.g. "tee/banner" → "tee")
+    rest = rest.split('/')[0].strip()
+
+    # Split on '+' to get all combined gear types (e.g. "hoodie+jacket" → ["hoodie", "jacket"])
+    gear_parts = [g.strip() for g in rest.split('+') if g.strip()]
+
+    def _col(offset):
+        idx = col_offset + offset
+        return row[idx] if len(row) > idx else None
+
+    tracking_raw = _col(4)
+    tracking = last_tracking
+    if tracking_raw:
+        t = str(tracking_raw).strip()
+        if t.endswith('.0'):
+            t = t[:-2]
+        if t and t.lower() not in ('none', 'nan', ''):
+            tracking = t
+
+    contents      = str(_col(1)).strip() if _col(1) else ''
+    weight        = str(_col(2)).strip() if _col(2) else ''
+    declared_val  = str(_col(3)).strip() if _col(3) else ''
+
+    entries = []
+    for gear_part in gear_parts:
+        # Extract trailing box number: "-N" (e.g. "jersey-1") or " N" (e.g. "Jersey 1")
+        box_num = 1
+        box_m = re.search(r'[- ](\d+)$', gear_part)
+        if box_m:
+            box_num  = int(box_m.group(1))
+            gear_raw = gear_part[:box_m.start()].strip()
+        else:
+            gear_raw = gear_part
+
+        if not gear_raw:
+            continue
+
+        entries.append({
+            'id':              str(uuid.uuid4()),
+            'market':          market,
+            'order_num':       '1',
+            'gear_type':       normalize_gear(gear_raw),
+            'box_num':         box_num,
+            'contents':        contents,
+            'weight':          weight,
+            'declared_value':  declared_val,
+            'tracking_number': tracking,
+            'carrier':         'fedex',
+        })
+
+    return entries, tracking
+
+
 def parse_packing_list(filepath: str) -> list:
     wb = openpyxl.load_workbook(filepath)
     ws = wb.active
@@ -464,11 +625,26 @@ def parse_packing_list(filepath: str) -> list:
                 cell.value = top_val
 
     raw = []
+    last_tn = ''
     for row in ws.iter_rows(min_row=2, values_only=True):
+        found = False
         for col_offset in (0, 6):          # primary cols A-E, secondary cols G-K
             entry = _parse_item_cols(row, col_offset)
             if entry:
+                if entry['tracking_number']:
+                    last_tn = entry['tracking_number']
                 raw.append(entry)
+                found = True
+        # For rows the regular parser skips (no '#'), try the simple fallback
+        if not found:
+            new_entries, last_tn = _parse_item_cols_simple(row, 0, last_tn)
+            raw.extend(new_entries)
+
+    # Scan each row's contents for inline gear mentions (e.g. "namebanner-7", "necklace-30")
+    content_extras = []
+    for r in raw:
+        content_extras.extend(_content_gear_rows(r))
+    raw.extend(content_extras)
 
     # Aggregate rows with the same (market, order_num, gear_type, box_num):
     # contents column has one team name per row — join them all.
@@ -839,6 +1015,7 @@ def check_all_fedex_statuses(notify_changes: bool = False) -> dict:
                 'tag':        new_tag,
                 'label':      _tag_info(new_tag)[0],
                 'notes':      note,
+                'location':   new.get('location', ''),
                 'updated_at': _now_cst().isoformat(),
                 'auto':       True,
             }
@@ -935,25 +1112,10 @@ def _build_mac_message(order: dict, tn: str, tag: str, notes: str) -> str:
         f"Tracking: {tn} ({carrier})",
     ]
 
-    if ship and ship['gear_summary']:
+    if ship and ship.get('gear_groups'):
         lines.append("Contents:")
-        # Group gear types by their notes (same notes = same physical box).
-        # Gear with no notes falls back to grouping by box count.
-        noted:   dict = {}   # notes_text → [gear, ...]
-        unnoted: dict = {}   # box_count  → [gear, ...]
-        for g in ship['gear_summary']:
-            n = g.get('notes', '').strip()
-            if n:
-                noted.setdefault(n, {'gears': [], 'boxes': g['boxes']})['gears'].append(g['gear'])
-            else:
-                unnoted.setdefault(g['boxes'], []).append(g['gear'])
-        # Emit noted groups in insertion order, then unnoted groups by count
-        for group in noted.values():
-            bw = 'box' if group['boxes'] == 1 else 'boxes'
-            lines.append(f"  • {', '.join(sorted(group['gears']))} × {group['boxes']} {bw}")
-        for count, gears in sorted(unnoted.items()):
-            bw = 'box' if count == 1 else 'boxes'
-            lines.append(f"  • {', '.join(sorted(gears))} × {count} {bw}")
+        for group in ship['gear_groups']:
+            lines.append(f"  • {group}")
 
     lines.append(f"Status: {emoji} {label}")
     if notes:
@@ -1161,6 +1323,19 @@ def _get_clickup_task(task_id: str):
     return resp.json() if resp.status_code == 200 else None
 
 
+def _next_subtask_letter(subtasks: list) -> str:
+    """Return the next unused letter suffix (A, B, C…) for a new subtask."""
+    used = set()
+    for sub in subtasks:
+        name = sub.get('name', '')
+        if name and name[-1].isupper():
+            used.add(name[-1])
+    for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+        if c not in used:
+            return c
+    return 'A'
+
+
 def _get_clickup_subtasks(parent_task_id: str) -> list:
     list_id = get_settings().get('clickup_list_id', '')
     resp = requests.get(
@@ -1192,12 +1367,14 @@ def _delivery_order_status(estimated_ms, actual_ms) -> int:
     return 1       # On Schedule
 
 
-def _sync_delivered_to_clickup(order: dict, tn: str, actual_delivery_ms: int) -> list:
+def _sync_delivered_to_clickup(order: dict, tn: str, actual_delivery_ms: int,
+                               all_orders: list = None) -> list:
     """
     For all gears in this shipment:
       - Set CF_PHASE = 4 (Delivered), CF_DELIVERY_DATE_ACT, CF_ORDER_STATUS on parent task.
       - Find subtasks with CF_TRACKING == tn and apply same updates.
-      - If no matching subtask exists, create one under the parent.
+    When a gear has no task ID in this order (e.g. Remake order without Hoodie/Ring tasks),
+    falls back to searching all_orders for the task ID.
     Returns list of error strings (empty = all good).
     """
     errors = []
@@ -1212,8 +1389,18 @@ def _sync_delivered_to_clickup(order: dict, tn: str, actual_delivery_ms: int) ->
 
     gears = [s['gear'] for s in ship['gear_summary']]
 
+    # Build a cross-order task ID lookup for gears missing from this order
+    fallback_tasks: dict = {}
+    if all_orders:
+        for o in all_orders:
+            if o.get('id') == order.get('id'):
+                continue
+            for g, tid in o.get('gear_tasks', {}).items():
+                if g not in fallback_tasks:
+                    fallback_tasks[g] = tid
+
     for gear in gears:
-        task_id = gear_tasks.get(gear)
+        task_id = gear_tasks.get(gear) or fallback_tasks.get(gear)
         if not task_id:
             errors.append(f'{gear}: no task ID')
             continue
@@ -1259,6 +1446,40 @@ def _sync_delivered_to_clickup(order: dict, tn: str, actual_delivery_ms: int) ->
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
+def _pl_meta_for_tn(tn: str, orders_all: list) -> dict:
+    """Compute total weight and declared value for a TN from packing list rows across all orders.
+    Deduplicates physical boxes by (order_id, box_num) to avoid double-counting.
+    Returns {'weight': '12.5KG', 'declared_value': '13$'} or empty strings if not found.
+    """
+    def _parse_num(s):
+        if not s:
+            return 0.0
+        try:
+            return float(str(s).upper().replace('KG', '').replace('$', '').strip())
+        except (ValueError, AttributeError):
+            return 0.0
+
+    seen_boxes: dict = {}  # (order_id, box_num) -> row
+    for o in orders_all:
+        for row in o.get('packing_list', []):
+            if row.get('tracking_number', '').strip() != tn:
+                continue
+            key = (o['id'], str(row.get('box_num', '')))
+            if key not in seen_boxes:
+                seen_boxes[key] = row
+
+    if not seen_boxes:
+        return {'weight': '', 'declared_value': ''}
+
+    total_w  = sum(_parse_num(r.get('weight', ''))        for r in seen_boxes.values())
+    total_dv = sum(_parse_num(r.get('declared_value', '')) for r in seen_boxes.values())
+
+    return {
+        'weight':        f"{round(total_w, 2)}" if total_w else '',
+        'declared_value': f"{int(round(total_dv))}" if total_dv else '',
+    }
+
+
 @app.route('/')
 def index():
     settings = get_settings()
@@ -1266,6 +1487,39 @@ def index():
 
     # Collect all manual shipments for the packing list table
     orders_all = load_orders()
+    orders_dirty = False
+
+    # Pre-compute PL meta per TN (across all orders) once
+    _pl_cache: dict = {}
+
+    def _get_pl_meta(tn):
+        if tn not in _pl_cache:
+            _pl_cache[tn] = _pl_meta_for_tn(tn, orders_all)
+        return _pl_cache[tn]
+
+    # Pass 1: fill missing weight/declared on every manual_shipment entry
+    for o in orders_all:
+        for ms in o.get('manual_shipments', []):
+            tn = ms.get('tracking_number', '').strip()
+            if not tn:
+                continue
+            w  = ms.get('weight', '') or ''
+            dv = ms.get('declared_value', '') or ''
+            if w and dv:
+                continue  # already complete
+            pl = _get_pl_meta(tn)
+            if pl['weight'] and not w:
+                ms['weight'] = pl['weight']
+                orders_dirty = True
+            if pl['declared_value'] and not dv:
+                ms['declared_value'] = pl['declared_value']
+                orders_dirty = True
+
+    if orders_dirty:
+        for o in orders_all:
+            upsert_order(o)
+        orders_all = load_orders()  # reload with saved values
+
     manual_rows = []
     for o in sorted(orders_all, key=lambda x: x.get('created_at', ''), reverse=True):
         tns_map: dict = {}  # tn -> first matching manual entry (for metadata)
@@ -1276,37 +1530,85 @@ def index():
             if tn not in tns_map:
                 tns_map[tn] = m
             else:
-                # accumulate gear types
                 existing = tns_map[tn].get('gear_type', '')
                 new_gt = m.get('gear_type', '')
                 if new_gt and new_gt not in existing:
                     tns_map[tn] = dict(tns_map[tn])
                     tns_map[tn]['gear_type'] = ', '.join(filter(None, [existing, new_gt]))
+
         market = o.get('market', '')
         sport  = o.get('sport', '')
         onum   = o.get('num_for_code', o.get('order_num', ''))
+
         for tn, m in tns_map.items():
+            def _strip_units(v):
+                return str(v or '').upper().replace('KG', '').replace('$', '').strip()
+
             manual_rows.append({
-                'order_id':      o['id'],
-                'order_label':   f"{market} {sport} #{onum}",
-                'tn':            tn,
-                'gear_type':     m.get('gear_type', ''),
-                'notes':         m.get('notes', ''),
-                'weight':        m.get('weight', ''),
-                'declared_value': m.get('declared_value', ''),
+                'order_id':       o['id'],
+                'order_label':    f"{market} {sport} #{onum}",
+                'tn':             tn,
+                'gear_type':      m.get('gear_type', ''),
+                'notes':          m.get('notes', ''),
+                'weight':         _strip_units(m.get('weight', '')),
+                'declared_value': _strip_units(m.get('declared_value', '')),
+                'pl_only':        False,
             })
 
-    return render_template('index.html', missing_settings=missing, manual_rows=manual_rows)
+        # Also add packing-list-only TNs (no manual_shipment entry exists)
+        pl_tns_in_order: dict = {}  # tn -> {gear_types, weight, declared}
+        for row in o.get('packing_list', []):
+            tn = row.get('tracking_number', '').strip()
+            if not tn or tn in tns_map:
+                continue
+            if tn not in pl_tns_in_order:
+                pl_tns_in_order[tn] = {'gear_types': set(), 'key': (o['id'], tn)}
+            pl_tns_in_order[tn]['gear_types'].add(row.get('gear_type', ''))
+
+        for tn, info in pl_tns_in_order.items():
+            pl = _get_pl_meta(tn)
+            gear_str = ', '.join(sorted(g for g in info['gear_types'] if g))
+            manual_rows.append({
+                'order_id':       o['id'],
+                'order_label':    f"{market} {sport} #{onum}",
+                'tn':             tn,
+                'gear_type':      gear_str,
+                'notes':          '',
+                'weight':         pl.get('weight', ''),
+                'declared_value': pl.get('declared_value', ''),
+                'pl_only':        True,
+            })
+
+    # Collect all packing list rows for display (sorted by order then box)
+    all_pl_rows = []
+    for o in sorted(orders_all, key=lambda x: x.get('created_at', ''), reverse=True):
+        market = o.get('market', '')
+        sport  = o.get('sport', '')
+        onum   = o.get('num_for_code', o.get('order_num', ''))
+        label  = f"{market} {sport} #{onum}"
+        for row in o.get('packing_list', []):
+            def _su(v):
+                return str(v or '').upper().replace('KG', '').replace('$', '').strip()
+            all_pl_rows.append({
+                'item':     f"{label} {row.get('gear_type','')} box {row.get('box_num','')}",
+                'contents': row.get('contents', ''),
+                'weight':   _su(row.get('weight', '')),
+                'declared': _su(row.get('declared_value', '')),
+                'tn':       row.get('tracking_number', ''),
+            })
+
+    return render_template('index.html', missing_settings=missing, manual_rows=manual_rows, pl_rows=all_pl_rows)
 
 
 @app.route('/api/update-shipment-meta', methods=['POST'])
 def update_shipment_meta():
-    """Save weight and declared_value for a manual shipment entry."""
-    data    = request.get_json(force=True)
-    oid     = data.get('order_id', '').strip()
-    tn      = data.get('tracking_number', '').strip()
-    weight  = data.get('weight', '').strip()
+    """Save weight, declared_value, and notes for a manual shipment entry."""
+    data     = request.get_json(force=True)
+    oid      = data.get('order_id', '').strip()
+    tn       = data.get('tracking_number', '').strip()
+    weight   = data.get('weight', '').strip()
     declared = data.get('declared_value', '').strip()
+    notes    = data.get('notes', '')          # optional; None = don't touch
     if not oid or not tn:
         return jsonify({'error': 'order_id and tracking_number required'}), 400
 
@@ -1318,15 +1620,83 @@ def update_shipment_meta():
     updated = False
     for m in order.get('manual_shipments', []):
         if m.get('tracking_number', '').strip() == tn:
-            m['weight']        = weight
+            m['weight']         = weight
             m['declared_value'] = declared
+            if notes is not None:
+                m['notes'] = notes
             updated = True
 
     if not updated:
-        return jsonify({'error': 'Tracking number not found in order'}), 404
+        return jsonify({'ok': True, 'skipped': True})  # PL-only row, no manual_shipment to update
 
     upsert_order(order)
     return jsonify({'ok': True})
+
+
+_ck_notes_cache: dict = {}  # task_id -> {ts, comments}
+_CK_NOTES_TTL = 600  # 10 min
+
+
+@app.route('/api/fetch-shipment-notes')
+def api_fetch_shipment_notes():
+    """Fetch the Notes: line from the ClickUp shipping comment for a given order+TN."""
+    order_id = request.args.get('order_id', '').strip()
+    tn       = request.args.get('tn', '').strip()
+    if not order_id or not tn:
+        return jsonify({'ok': False, 'error': 'order_id and tn required'})
+
+    orders = load_orders()
+    order  = next((o for o in orders if o.get('id') == order_id), None)
+    if not order:
+        return jsonify({'ok': False, 'error': 'Order not found'})
+
+    gear_tasks = order.get('gear_tasks', {})
+    if not gear_tasks:
+        return jsonify({'ok': True, 'notes': ''})
+
+    cu_token = os.getenv('CLICKUP_TOKEN', '')
+    notes_found = ''
+
+    for task_id in gear_tasks.values():
+        # Check cache
+        cached = _ck_notes_cache.get(task_id)
+        if cached and (time.time() - cached['ts']) < _CK_NOTES_TTL:
+            comments = cached['comments']
+        else:
+            try:
+                r = requests.get(
+                    f'https://api.clickup.com/api/v2/task/{task_id}/comment',
+                    headers={'Authorization': cu_token}, timeout=10,
+                )
+                comments = r.json().get('comments', []) if r.status_code == 200 else []
+            except Exception:
+                comments = []
+            _ck_notes_cache[task_id] = {'ts': time.time(), 'comments': comments}
+
+        for c in comments:
+            text = c.get('comment_text', '')
+            if f'Tracking: {tn}' not in text:
+                continue
+            for line in text.splitlines():
+                if line.startswith('Notes:'):
+                    notes_found = line[len('Notes:'):].strip()
+                    break
+            if notes_found:
+                break
+        if notes_found:
+            break
+
+    # Persist back to manual_shipments if found and currently empty
+    if notes_found:
+        changed = False
+        for ms in order.get('manual_shipments', []):
+            if ms.get('tracking_number', '').strip() == tn and not (ms.get('notes') or ''):
+                ms['notes'] = notes_found
+                changed = True
+        if changed:
+            upsert_order(order)
+
+    return jsonify({'ok': True, 'notes': notes_found})
 
 
 @app.route('/upload', methods=['POST'])
@@ -1379,23 +1749,57 @@ def preview():
 
     all_orders = load_orders()
     auto_matched: list = []
+    first_tn_matched_order = None  # track canonical order found via TN match
     for o in all_orders:
         matched_tns = set()
         for m in o.get('manual_shipments', []):
             tn = m.get('tracking_number', '').strip()
-            if tn and tn in tn_to_rows and tn not in matched_tns:
-                matched_tns.add(tn)
-                o.setdefault('packing_list', [])
-                o['packing_list'] = [x for x in o['packing_list']
-                                     if x.get('tracking_number') != tn]
-                o['packing_list'].extend(tn_to_rows[tn])
-                auto_matched.append({
-                    'order': f"{o.get('market','')} {o.get('sport','')} #{o.get('num_for_code', o.get('order_num',''))}",
-                    'tn': tn,
-                    'boxes': len(tn_to_rows[tn]),
-                })
+            if not tn or tn not in tn_to_rows or tn in matched_tns:
+                continue
+            matched_tns.add(tn)
+
+            # Save per-box rows to packing_list (replace old rows for this TN)
+            o.setdefault('packing_list', [])
+            o['packing_list'] = [x for x in o['packing_list']
+                                 if x.get('tracking_number') != tn]
+            o['packing_list'].extend(tn_to_rows[tn])
+
+            # Fill missing weight / declared_value on manual_shipment entries from pl rows
+            pl_rows_for_tn = tn_to_rows[tn]
+            for ms in o.get('manual_shipments', []):
+                if ms.get('tracking_number', '').strip() != tn:
+                    continue
+                gear = ms.get('gear_type', '')
+                gear_rows = [r for r in pl_rows_for_tn if r.get('gear_type') == gear]
+                if not gear_rows:
+                    gear_rows = pl_rows_for_tn  # fallback: any row for this TN
+                if not ms.get('weight'):
+                    weight_val = next((r['weight'] for r in gear_rows if r.get('weight')), '')
+                    if weight_val:
+                        ms['weight'] = weight_val
+                if not ms.get('declared_value'):
+                    dv_val = next((r['declared_value'] for r in gear_rows if r.get('declared_value')), '')
+                    if dv_val:
+                        ms['declared_value'] = dv_val
+
+            if first_tn_matched_order is None:
+                first_tn_matched_order = o
+
+            auto_matched.append({
+                'order': f"{o.get('market','')} {o.get('sport','')} #{o.get('num_for_code', o.get('order_num',''))}",
+                'tn': tn,
+                'boxes': len(tn_to_rows[tn]),
+            })
     if auto_matched:
         save_orders(all_orders)
+        # If market/order_num from packing list didn't match any saved order directly,
+        # fill meta from the TN-matched order so the form pre-populates correctly
+        if not matched_order and first_tn_matched_order:
+            matched_order = first_tn_matched_order
+            for key in ('sport', 'season', 'order_date', 'order_sheet_url'):
+                if not meta.get(key) and first_tn_matched_order.get(key):
+                    meta[key] = first_tn_matched_order[key]
+            save_data(rows, meta)
 
     # Which gear types already have a ClickUp task saved
     matched_gear_tasks = matched_order.get('gear_tasks', {}) if matched_order else {}
@@ -1466,6 +1870,89 @@ def orders_list():
             })
 
     return render_template('orders.html', orders=orders_sorted, phase_labels=PHASE_LABELS, manual_tns=manual_tns)
+
+
+_orders_summary_cache: dict = {'ts': 0, 'data': None}
+_ORDERS_SUMMARY_TTL = 300  # 5 minutes
+
+
+@app.route('/api/orders-summary')
+def api_orders_summary():
+    """Return phase + dates for all orders (for the pending summary table)."""
+    global _orders_summary_cache
+    if _orders_summary_cache['data'] and (time.time() - _orders_summary_cache['ts']) < _ORDERS_SUMMARY_TTL:
+        return jsonify(_orders_summary_cache['data'])
+
+    def _ms_to_date(val):
+        if not val:
+            return None
+        try:
+            return datetime.fromtimestamp(int(val) / 1000).strftime('%Y-%m-%d')
+        except Exception:
+            return None
+
+    orders = load_orders()
+    result = []
+
+    for order in orders:
+        gear_tasks = order.get('gear_tasks', {})
+        if not gear_tasks:
+            continue
+
+        # Fetch first task for shared date fields
+        first_task = _get_clickup_task(next(iter(gear_tasks.values())))
+        if not first_task:
+            continue
+
+        def _cf(cf_id):
+            return _get_task_cf(first_task, cf_id)
+
+        proofs_ready_est    = _ms_to_date(_cf(CF_PROOFS_READY))
+        proofs_approved_est = _ms_to_date(_cf(CF_PROOFS_APPROVED))
+        ship_est            = _ms_to_date(_cf(CF_SHIP_DATE))
+        delivery_est        = _ms_to_date(_cf(CF_DELIVERY_DATE))
+        proofs_act          = _ms_to_date(_cf(CF_PROOFS_APPROVED_ACT))
+        ship_act            = _ms_to_date(_cf(CF_SHIP_DATE_ACT))
+        delivery_act        = _ms_to_date(_cf(CF_DELIVERY_DATE_ACT))
+
+        # Per-gear phases
+        gear_phases = {}
+        for gear, task_id in gear_tasks.items():
+            task = first_task if task_id == next(iter(gear_tasks.values())) else _get_clickup_task(task_id)
+            if task:
+                val = _get_task_cf(task, CF_PHASE)
+                try:
+                    gear_phases[gear] = int(val) if val is not None else None
+                except (TypeError, ValueError):
+                    gear_phases[gear] = None
+            else:
+                gear_phases[gear] = None
+
+        # Skip if all gears are delivered (phase ≥ 4)
+        phases = [p for p in gear_phases.values() if p is not None]
+        if phases and all(p >= 4 for p in phases):
+            continue
+
+        result.append({
+            'id':          order.get('id'),
+            'market':      order.get('market', ''),
+            'season':      order.get('season', ''),
+            'sport':       order.get('sport', ''),
+            'order_num':   order.get('num_for_code', order.get('order_num', '')),
+            'order_date':  order.get('order_date', ''),
+            'gear_phases': gear_phases,
+            'proofs_ready_est':    proofs_ready_est,
+            'proofs_approved_est': proofs_approved_est,
+            'ship_est':     ship_est,
+            'delivery_est': delivery_est,
+            'proofs_act':   proofs_act,
+            'ship_act':     ship_act,
+            'delivery_act': delivery_act,
+        })
+
+    payload = {'ok': True, 'orders': result, 'labels': PHASE_LABELS}
+    _orders_summary_cache = {'ts': time.time(), 'data': payload}
+    return jsonify(payload)
 
 
 @app.route('/api/order-phases/<order_id>')
@@ -1627,6 +2114,13 @@ def push_update_ship():
     if notes:
         comment_text += f"\nNotes: {notes}"
 
+    _FORMULA_FIELD_IDS = {
+        '08f6fefb-3605-48e4-bdbb-b5e1c765d87a',
+        '43acbd5f-e47a-4230-93fd-cc7f596a731d',
+        '0245e34f-f032-44c5-b016-792b4447c658',
+        '9e1380de-7dbf-4c77-afdb-7de496f61e2b',
+    }
+
     errors  = []
     updated = 0
     for gear, task_id in gear_tasks.items():
@@ -1634,21 +2128,22 @@ def push_update_ship():
         if r.status_code not in (200, 201):
             errors.append(f"{gear}: {r.status_code}"); continue
 
+        # Fetch parent BEFORE updating CF_TRACKING so we can detect the old TN for subtask split
+        parent_task     = _get_clickup_task(task_id)
+        old_parent_tn   = (_get_task_cf(parent_task, CF_TRACKING) if parent_task else None) or None
+
         set_clickup_field(task_id, CF_TRACKING, tracking_number)
         if ship_date_ms:
             set_clickup_field(task_id, CF_SHIP_DATE_ACT, ship_date_ms)
 
-        # Compare actual vs estimated ship date → set Order Status
         order_status_val = None
-        if ship_date_ms:
-            task_data = _get_clickup_task(task_id)
-            if task_data:
-                try:
-                    est_ms = int(_get_task_cf(task_data, CF_SHIP_DATE) or 0) or None
-                except (TypeError, ValueError):
-                    est_ms = None
-                order_status_val = _ship_order_status(ship_date_ms, est_ms)
-                set_clickup_field(task_id, CF_ORDER_STATUS, order_status_val)
+        if ship_date_ms and parent_task:
+            try:
+                est_ms = int(_get_task_cf(parent_task, CF_SHIP_DATE) or 0) or None
+            except (TypeError, ValueError):
+                est_ms = None
+            order_status_val = _ship_order_status(ship_date_ms, est_ms)
+            set_clickup_field(task_id, CF_ORDER_STATUS, order_status_val)
 
         requests.post(
             f"https://api.clickup.com/api/v2/task/{task_id}/comment",
@@ -1656,7 +2151,9 @@ def push_update_ship():
         )
         updated += 1
 
-        for sub in _get_clickup_subtasks(task_id):
+        subtasks = _get_clickup_subtasks(task_id)
+        matched_sub = False
+        for sub in subtasks:
             existing_tn = _get_task_cf(sub, CF_TRACKING)
             if existing_tn and existing_tn != tracking_number:
                 continue
@@ -1671,6 +2168,116 @@ def push_update_ship():
                 f"https://api.clickup.com/api/v2/task/{sub_id}/comment",
                 headers=clickup_headers(), json={"comment_text": comment_text}, timeout=10,
             )
+            matched_sub = True
+
+        # Existing subtasks present but none matched this TN → create a new subtask
+        if subtasks and not matched_sub:
+            letter      = _next_subtask_letter(subtasks)
+            parent_name = (parent_task or {}).get('name', '') or \
+                          f"{order.get('market','')} {order.get('season','')} {order.get('sport','')} {gear} {order.get('num_for_code', order.get('order_num',''))}"
+            parent_code = (_get_task_cf(parent_task, CF_ORDER_TEXT) if parent_task else '') or ''
+            sub_name    = f"{parent_name}{letter}"
+            sub_code    = f"{parent_code}{letter}" if parent_code else ''
+
+            sub_fields_map = {}
+            if parent_task:
+                for cf in parent_task.get('custom_fields', []):
+                    val = cf.get('value')
+                    if val is not None and cf['id'] not in _FORMULA_FIELD_IDS:
+                        sub_fields_map[cf['id']] = val
+            # Subtask-specific overrides
+            sub_fields_map[CF_TRACKING] = tracking_number
+            sub_fields_map[CF_PHASE]    = 3
+            if ship_date_ms:
+                sub_fields_map[CF_SHIP_DATE_ACT] = ship_date_ms
+            if order_status_val is not None:
+                sub_fields_map[CF_ORDER_STATUS] = order_status_val
+            if sub_code:
+                sub_fields_map[CF_ORDER_TEXT] = sub_code
+            sub_fields_map.pop(CF_RECEIVING, None)  # never set receiving on new subtask
+
+            desc = f"Gear: {gear}\nTracking: {tracking_number}"
+            if declared_value:
+                desc += f"\nDeclared Value: ${declared_value}"
+            if notes:
+                desc += f"\nNotes: {notes}"
+
+            sresp = create_clickup_task({
+                'name':         sub_name,
+                'parent':       task_id,
+                'description':  desc,
+                'custom_fields': [{'id': fid, 'value': val} for fid, val in sub_fields_map.items()],
+            })
+            if sresp.status_code in (200, 201):
+                new_sub_id = sresp.json().get('id', '')
+                if new_sub_id:
+                    requests.post(
+                        f"https://api.clickup.com/api/v2/task/{new_sub_id}/comment",
+                        headers=clickup_headers(), json={"comment_text": comment_text}, timeout=10,
+                    )
+            else:
+                errors.append(f"{gear} new subtask: {sresp.status_code}")
+
+        elif not subtasks:
+            # No subtasks yet — if parent had a different TN before this push, split into A + B
+            if old_parent_tn and old_parent_tn != tracking_number:
+                # Build comment for subtask A using the old shipment's stored data
+                old_ms = next((m for m in order.get('manual_shipments', [])
+                               if m.get('tracking_number') == old_parent_tn
+                               and m.get('gear_type') == gear), None)
+                old_comment = f"📦 Shipped\nTracking: {old_parent_tn}"
+                if old_ms:
+                    if old_ms.get('ship_date'):
+                        old_comment += f"\nShip Date: {old_ms['ship_date']}"
+                    if old_ms.get('declared_value'):
+                        old_comment += f"\nDeclared Value: ${old_ms['declared_value']}"
+                    if old_ms.get('notes'):
+                        old_comment += f"\nNotes: {old_ms['notes']}"
+
+                # Create subtask A (old TN, parent's existing ship fields)
+                # then subtask B (new TN, new ship fields)
+                for i, (sub_tn, override_ship_ms, override_status, sub_comment) in enumerate([
+                    (old_parent_tn,      None,         None,              old_comment),
+                    (tracking_number,   ship_date_ms,  order_status_val,  comment_text),
+                ]):
+                    letter      = chr(ord('A') + i)
+                    parent_name = (parent_task or {}).get('name', '') or \
+                                  f"{order.get('market','')} {order.get('season','')} {order.get('sport','')} {gear} {order.get('num_for_code', order.get('order_num',''))}"
+                    parent_code = (_get_task_cf(parent_task, CF_ORDER_TEXT) if parent_task else '') or ''
+                    sub_name    = f"{parent_name}{letter}"
+                    sub_code    = f"{parent_code}{letter}" if parent_code else ''
+
+                    sfm = {}
+                    if parent_task:
+                        for cf in parent_task.get('custom_fields', []):
+                            val = cf.get('value')
+                            if val is not None and cf['id'] not in _FORMULA_FIELD_IDS:
+                                sfm[cf['id']] = val
+                    sfm[CF_TRACKING] = sub_tn
+                    sfm[CF_PHASE]    = 3
+                    if override_ship_ms:
+                        sfm[CF_SHIP_DATE_ACT] = override_ship_ms
+                    if override_status is not None:
+                        sfm[CF_ORDER_STATUS] = override_status
+                    if sub_code:
+                        sfm[CF_ORDER_TEXT] = sub_code
+                    sfm.pop(CF_RECEIVING, None)
+
+                    sresp = create_clickup_task({
+                        'name':          sub_name,
+                        'parent':        task_id,
+                        'description':   f"Gear: {gear}\nTracking: {sub_tn}",
+                        'custom_fields': [{'id': fid, 'value': val} for fid, val in sfm.items()],
+                    })
+                    if sresp.status_code in (200, 201):
+                        new_sub_id = sresp.json().get('id', '')
+                        if new_sub_id:
+                            requests.post(
+                                f"https://api.clickup.com/api/v2/task/{new_sub_id}/comment",
+                                headers=clickup_headers(), json={"comment_text": sub_comment}, timeout=10,
+                            )
+                    else:
+                        errors.append(f"{gear} subtask {letter}: {sresp.status_code}")
 
     if not errors:
         # Save to order registry so shipment appears in the shipments view
@@ -1956,6 +2563,43 @@ def _get_estimated_ship_ms(gear_type: str, order_date: str):
     return None
 
 
+def _gear_ship_ms(gear_tns: list, tn_ship_date: dict, fallback_ms) -> int | None:
+    """Return the earliest manual ship date for any TN in gear_tns, or fallback_ms."""
+    dates = [tn_ship_date[tn] for tn in gear_tns if tn in tn_ship_date]
+    return min(dates) if dates else fallback_ms
+
+
+def _pick_canonical_market(rows: list) -> tuple:
+    """
+    Return (market, order_num) from the rows, preferring known markets with the
+    highest numeric order_num.  Handles simple-parser artifacts like "Dallas#2"
+    (market="Dallas", order_num="2") and exceptions like "Freshman" / "Remake"
+    which are not in MARKET_CODES and won't override a valid numeric candidate.
+    """
+    best_m, best_n, best_nval = None, '1', -1
+    for r in rows:
+        m, n = r['market'].strip(), r['order_num']
+        hm = re.match(r'^(.+?)#(\d+)$', m)
+        if hm:
+            m, n = hm.group(1).strip(), hm.group(2)
+        if m.lower() not in MARKET_CODES:
+            continue
+        try:
+            nval = int(n)
+        except ValueError:
+            nval = 0
+        if best_m is None or nval > best_nval:
+            best_m, best_n, best_nval = m, n, nval
+    if best_m:
+        return best_m, best_n
+    # Fallback: normalize first row's market (strip #N if present)
+    m0, n0 = rows[0]['market'].strip(), rows[0]['order_num']
+    hm0 = re.match(r'^(.+?)#(\d+)$', m0)
+    if hm0:
+        return hm0.group(1).strip(), hm0.group(2)
+    return m0, n0
+
+
 @app.route('/push/clickup', methods=['POST'])
 def push_clickup():
     settings = get_settings()
@@ -1970,12 +2614,10 @@ def push_clickup():
     for r in rows:
         by_gear[r['gear_type']].append(r)
 
-    sample = rows[0]
-    market    = sample['market']
-    order_num = sample['order_num']
+    market, order_num = _pick_canonical_market(rows)
 
     sport       = meta.get('sport', 'BSBL')
-    season      = meta.get('season', 'Fall')
+    season      = meta.get('season', '') or 'Summer'
     order_date  = meta.get('order_date', '')
     ship_date   = meta.get('ship_date', '')
     order_sheet = meta.get('order_sheet_url', '')
@@ -1983,10 +2625,41 @@ def push_clickup():
     order_date_ms    = to_ms(order_date)
     actual_ship_ms   = to_ms(ship_date)
 
-    saved_order      = find_order(market, order_num)
+    saved_order = find_order(market, order_num)
+    if saved_order is None:
+        # Fallback: find order by matching any TN from packing list rows to manual_shipments.
+        # Packing list market names (e.g. "SOCCER") may differ from the stored order market ("Houston").
+        row_tns = {r.get('tracking_number', '').strip() for r in rows if r.get('tracking_number')}
+        row_tns.discard('')
+        if row_tns:
+            for _o in load_orders():
+                if any(ms.get('tracking_number', '').strip() in row_tns
+                       for ms in _o.get('manual_shipments', [])):
+                    saved_order = _o
+                    market    = _o.get('market', market)
+                    order_num = _o.get('order_num', order_num)
+                    if not sport or sport == 'BSBL':
+                        sport = _o.get('sport', sport)
+                    if not season:
+                        season = _o.get('season', season) or 'Summer'
+                    if not order_date:
+                        order_date     = _o.get('order_date', '')
+                        order_date_ms  = to_ms(order_date)
+                    break
+
     saved_gear_tasks = saved_order.get('gear_tasks', {}) if saved_order else {}
     new_gear_tasks   = dict(saved_gear_tasks)
     eta_zees_ms      = to_ms(saved_order.get('eta_to_zees', '')) if saved_order else None
+
+    # Build TN → ship date ms from manually-entered shipments (authoritative over form value)
+    tn_ship_date = {}
+    for ms_entry in (saved_order.get('manual_shipments', []) if saved_order else []):
+        tn  = ms_entry.get('tracking_number', '').strip()
+        sd  = ms_entry.get('ship_date', '')
+        if tn and sd and tn not in tn_ship_date:
+            ms_val = to_ms(sd)
+            if ms_val:
+                tn_ship_date[tn] = ms_val
 
     # Resolve numeric suffix used in task names / order codes
     _nfc = saved_order.get('num_for_code', '') if saved_order else ''
@@ -1998,18 +2671,21 @@ def push_clickup():
     # Build global shipment map: tracking# → letter, primary gear, rows
     t2letter, t2primary, t2rows = build_shipment_map(rows)
 
-    results          = []
-    errors           = []
-    parent_task_ids  = {}   # gear_type → clickup task id
-    gear_task_names  = {}   # gear_type → task name string
-    gear_order_codes = {}   # gear_type → order code string
-    gear_order_status = {}  # gear_type → order status orderindex
+    results           = []
+    errors            = []
+    parent_task_ids   = {}   # gear_type → clickup task id
+    gear_task_names   = {}   # gear_type → task name string
+    gear_order_codes  = {}   # gear_type → order code string
+    gear_order_status = {}   # gear_type → order status orderindex
+    old_parent_tns    = {}   # gear_type → TN the parent had before this push
+    parent_subs_before = {}  # gear_type → existing subtasks before this push
 
     # ── PASS 1: create / update one parent task per gear type ────────────────
     for gear_type, boxes in sorted(by_gear.items()):
         gear_trackings = list({b['tracking_number'] for b in boxes if b['tracking_number']})
         tracking_str   = ', '.join(gear_trackings)
         has_tracking   = bool(gear_trackings)
+        owned_tns      = [tn for tn in gear_trackings if t2primary.get(tn) == gear_type]
 
         task_name  = build_task_name(market, season, sport, gear_type, num_for_code)
         order_code = build_order_code(market, sport, gear_type, order_date, num_for_code)
@@ -2024,10 +2700,18 @@ def push_clickup():
         existing_task_id = saved_gear_tasks.get(gear_type)
 
         if existing_task_id:
+            # Capture state BEFORE any writes so Pass 2 can detect TN changes
+            _par = _get_clickup_task(existing_task_id)
+            _old_tn_raw = (_get_task_cf(_par, CF_TRACKING) if _par else '') or ''
+            old_parent_tns[gear_type]    = _old_tn_raw.split(',')[0].strip()
+            parent_subs_before[gear_type] = _get_clickup_subtasks(existing_task_id)
+
             set_clickup_field(existing_task_id, CF_ORDER_STATUS,  order_status)
             set_clickup_field(existing_task_id, CF_TRACKING,      tracking_str)
-            if has_tracking and actual_ship_ms:
-                set_clickup_field(existing_task_id, CF_SHIP_DATE_ACT, actual_ship_ms)
+            gear_ship_ms = _gear_ship_ms(owned_tns or gear_trackings, tn_ship_date, actual_ship_ms)
+            if has_tracking and gear_ship_ms:
+                set_clickup_field(existing_task_id, CF_SHIP_DATE_ACT, gear_ship_ms)
+                set_clickup_field(existing_task_id, CF_PHASE,         3)
             parent_task_ids[gear_type] = existing_task_id
             results.append({'gear': gear_type, 'task_id': existing_task_id,
                             'subtasks': [], 'action': 'updated'})
@@ -2043,8 +2727,10 @@ def push_clickup():
             ]
             if order_date_ms:
                 custom_fields.append({'id': CF_ORDER_DATE, 'value': order_date_ms})
-            if has_tracking and actual_ship_ms:
-                custom_fields.append({'id': CF_SHIP_DATE_ACT, 'value': actual_ship_ms})
+            gear_ship_ms = _gear_ship_ms(owned_tns or gear_trackings, tn_ship_date, actual_ship_ms)
+            if has_tracking and gear_ship_ms:
+                custom_fields.append({'id': CF_SHIP_DATE_ACT, 'value': gear_ship_ms})
+                custom_fields.append({'id': CF_PHASE,         'value': 3})
             custom_fields.extend(calc_gear_dates(gear_type, order_date))
 
             resp = create_clickup_task({
@@ -2063,70 +2749,143 @@ def push_clickup():
             results.append({'gear': gear_type, 'task_id': task_id,
                             'subtasks': [], 'action': 'created'})
 
-    # ── PASS 2: one subtask per shipment (unique tracking #) ─────────────────
-    for tn, letter in t2letter.items():
-        primary_gear = t2primary[tn]
-        parent_id    = parent_task_ids.get(primary_gear)
-        if not parent_id:
-            continue
+    # ── PASS 2: subtasks — same split logic as manual tracking entry ──────────
+    _FORMULA_FIELD_IDS = {
+        '08f6fefb-3605-48e4-bdbb-b5e1c765d87a',
+        '43acbd5f-e47a-4230-93fd-cc7f596a731d',
+        '0245e34f-f032-44c5-b016-792b4447c658',
+        '9e1380de-7dbf-4c77-afdb-7de496f61e2b',
+    }
 
-        # Skip if a subtask with this tracking number already exists under this parent
-        existing_subs = _get_clickup_subtasks(parent_id)
-        if any(_get_task_cf(s, CF_TRACKING) == tn for s in existing_subs):
-            continue
+    # Group packing-list TNs by primary gear (preserving appearance order)
+    gear_to_new_tns = defaultdict(list)
+    for tn in t2letter:
+        pg = t2primary[tn]
+        if parent_task_ids.get(pg):
+            gear_to_new_tns[pg].append(tn)
 
-        shipment_rows  = t2rows[tn]
-        gear_types_in  = sorted({r['gear_type'] for r in shipment_rows})
-        contents_desc  = ', '.join(gear_types_in)
-        weights        = [r['weight'] for r in shipment_rows if r.get('weight')]
-        values         = [r['declared_value'] for r in shipment_rows if r.get('declared_value')]
+    for gear_type, new_tns in gear_to_new_tns.items():
+        parent_id     = parent_task_ids[gear_type]
+        existing_subs = parent_subs_before.get(gear_type)
+        if existing_subs is None:
+            existing_subs = _get_clickup_subtasks(parent_id)
+        old_tn = old_parent_tns.get(gear_type, '')
 
-        # Name and order code mirror the parent + shipment letter appended
-        base_name  = gear_task_names.get(primary_gear, f"{market} {season} {sport} {primary_gear} {num_for_code}")
-        base_code  = gear_order_codes.get(primary_gear, num_for_code)
-        sub_name   = f"{base_name}{letter}"       # e.g. "Dallas Summer BSBL Jersey 1A"
-        sub_code   = f"{base_code}{letter}"       # e.g. "DAL-BSBL-JRS-042426-1A"
-
-        # Copy all non-empty parent fields, then override with subtask-specific values.
-        # Skip formula/auto-calculated fields that ClickUp computes itself.
-        _FORMULA_FIELD_IDS = {
-            '08f6fefb-3605-48e4-bdbb-b5e1c765d87a',  # Days Ahead/Behind (formula)
-            '43acbd5f-e47a-4230-93fd-cc7f596a731d',  # Total LT (auto)
-            '0245e34f-f032-44c5-b016-792b4447c658',  # Shipping Time (auto)
-            '9e1380de-7dbf-4c77-afdb-7de496f61e2b',  # Production Time (auto)
-        }
-        parent_task = _get_clickup_task(parent_id)
-        sub_fields_map = {}
-        if parent_task:
-            for cf in parent_task.get('custom_fields', []):
-                val = cf.get('value')
-                if val is not None and cf['id'] not in _FORMULA_FIELD_IDS:
-                    sub_fields_map[cf['id']] = val
-
-        # Subtask-specific overrides (always set regardless of parent value)
-        sub_fields_map[CF_TRACKING]   = tn
-        sub_fields_map[CF_ORDER_TEXT] = sub_code
-
-        sub_fields = [{'id': fid, 'value': val} for fid, val in sub_fields_map.items()]
-
-        sresp = create_clickup_task({
-            'name': sub_name,
-            'parent': parent_id,
-            'description': (
-                f"Gear: {contents_desc}\n"
-                f"Weight: {'; '.join(weights)}\n"
-                f"Declared Value: {'; '.join(values)}\n"
-                f"Carrier: {shipment_rows[0].get('carrier', 'fedex').upper()}"
-            ),
-            'custom_fields': sub_fields,
-        })
-        if sresp.status_code in (200, 201):
-            for r in results:
-                if r['gear'] == primary_gear:
-                    r['subtasks'].append(sresp.json().get('id'))
-                    break
+        if not existing_subs:
+            # No existing subtasks — mirror push_update_ship logic
+            if old_tn and old_tn not in new_tns:
+                # Parent had a different TN → A=old, B/C/...=new PL TNs
+                tns_to_create = [old_tn] + list(new_tns)
+            elif len(new_tns) > 1:
+                # Multiple TNs in packing list → A, B, ...
+                tns_to_create = list(new_tns)
+            else:
+                # Single TN, no split needed
+                tns_to_create = []
+            letter_base = 0
         else:
-            errors.append(f"  Shipment {order_num}{letter}: {sresp.status_code}")
+            # Existing subtasks — only create for uncovered TNs
+            existing_sub_tns = {_get_task_cf(s, CF_TRACKING) for s in existing_subs}
+            tns_to_create = [tn for tn in new_tns if tn not in existing_sub_tns]
+            letter_base = None  # use _next_subtask_letter
+
+        # Fetch parent once for field copy
+        parent_task_data = _get_clickup_task(parent_id)
+
+        for i, sub_tn in enumerate(tns_to_create):
+            if letter_base is not None:
+                letter = chr(ord('A') + letter_base + i)
+            else:
+                letter = _next_subtask_letter(existing_subs)
+
+            shipment_rows = t2rows.get(sub_tn, [])
+            gear_types_in = sorted({r['gear_type'] for r in shipment_rows}) if shipment_rows else [gear_type]
+            contents_desc = ', '.join(gear_types_in)
+            weights       = [r['weight'] for r in shipment_rows if r.get('weight')]
+            values        = [r['declared_value'] for r in shipment_rows if r.get('declared_value')]
+            carrier       = shipment_rows[0].get('carrier', 'fedex').upper() if shipment_rows else 'FEDEX'
+
+            base_name = gear_task_names.get(gear_type, f"{market} {season} {sport} {gear_type} {num_for_code}")
+            base_code = gear_order_codes.get(gear_type, num_for_code)
+            sub_name  = f"{base_name}{letter}"
+            sub_code  = f"{base_code}{letter}"
+
+            sub_fields_map = {}
+            if parent_task_data:
+                for cf in parent_task_data.get('custom_fields', []):
+                    val = cf.get('value')
+                    if val is not None and cf['id'] not in _FORMULA_FIELD_IDS:
+                        sub_fields_map[cf['id']] = val
+
+            sub_fields_map[CF_TRACKING]   = sub_tn
+            sub_fields_map[CF_ORDER_TEXT] = sub_code
+            sub_ship_ms = tn_ship_date.get(sub_tn) or actual_ship_ms
+            if shipment_rows and sub_ship_ms:
+                sub_fields_map[CF_SHIP_DATE_ACT] = sub_ship_ms
+            os_val = gear_order_status.get(gear_type)
+            if os_val is not None:
+                sub_fields_map[CF_ORDER_STATUS] = os_val
+            if sub_ship_ms:
+                sub_fields_map[CF_PHASE] = 3
+
+            sresp = create_clickup_task({
+                'name':   sub_name,
+                'parent': parent_id,
+                'description': (
+                    f"Gear: {contents_desc}\n"
+                    f"Weight: {'; '.join(weights)}\n"
+                    f"Declared Value: {'; '.join(values)}\n"
+                    f"Carrier: {carrier}"
+                ),
+                'custom_fields': [{'id': fid, 'value': val} for fid, val in sub_fields_map.items()],
+            })
+            if sresp.status_code in (200, 201):
+                for r in results:
+                    if r['gear'] == gear_type:
+                        r['subtasks'].append(sresp.json().get('id'))
+                        break
+                if letter_base is None:
+                    existing_subs.append({'name': f'{base_name}{letter}'})
+            else:
+                errors.append(f"  Shipment {order_num}{letter}: {sresp.status_code}")
+
+    # ── PASS 3: push sub-orders (Freshman, Remake, …) ───────────────────────
+    # Rows whose market is not a known MARKET_CODES key (and not the parent market
+    # after #N stripping) belong to a sub-order stored under the same parent market
+    # but with order_num = the label (e.g. market="Dallas", order_num="Freshman").
+    sub_label_rows: dict = defaultdict(list)
+    for r in rows:
+        m = r['market'].strip()
+        hm = re.match(r'^(.+?)#(\d+)$', m)
+        if hm:
+            m = hm.group(1).strip()
+        if m.lower() not in MARKET_CODES:
+            sub_label_rows[r['market'].strip()].append(r)
+
+    for label, sub_rows in sub_label_rows.items():
+        sub_saved = find_order(market, label)
+        if not sub_saved or not sub_saved.get('gear_tasks'):
+            continue
+
+        sub_by_gear: dict = defaultdict(list)
+        for r in sub_rows:
+            sub_by_gear[r['gear_type']].append(r)
+
+        for gear_type, boxes in sub_by_gear.items():
+            task_id = sub_saved['gear_tasks'].get(gear_type)
+            if not task_id:
+                continue
+            gear_trackings = list({b['tracking_number'] for b in boxes if b['tracking_number']})
+            if not gear_trackings:
+                continue
+            tracking_str = ', '.join(gear_trackings)
+            gear_ship_ms = _gear_ship_ms(gear_trackings, tn_ship_date, actual_ship_ms)
+            set_clickup_field(task_id, CF_TRACKING, tracking_str)
+            if gear_ship_ms:
+                set_clickup_field(task_id, CF_SHIP_DATE_ACT, gear_ship_ms)
+                set_clickup_field(task_id, CF_PHASE, 3)
+            results.append({'gear': f'{label} {gear_type}', 'task_id': task_id,
+                            'subtasks': [], 'action': 'updated'})
 
     # ── Persist to registry ───────────────────────────────────────────────────
     order_record = {
@@ -2327,7 +3086,14 @@ def _build_aftership_items(rows: list, meta: dict) -> list:
             for gear, qty in sorted(gear_qtys.items()) if qty > 0
         )
         gear_type_list = sorted({r['gear_type'] for r in shipment_rows})
-        box_count = len(shipment_rows)
+        # Physical box count: deduplicate rows sharing the same (box_num, contents) key
+        _phys = set()
+        for r in shipment_rows:
+            c = r.get('contents', '').strip()
+            if c.lower() == 'see attached':
+                c = ''
+            _phys.add((r.get('box_num', ''), c))
+        box_count = len(_phys)
         contents  = gear_summary if gear_summary else ', '.join(gear_type_list)
         note = f"Order {order_id} | {box_count} box{'es' if box_count != 1 else ''} | {contents}" if contents else f"Order {order_id} | {box_count} box{'es' if box_count != 1 else ''}"
 
@@ -2413,8 +3179,8 @@ def aftership_csv():
             v = '"' + v.replace('"', '""') + '"'
         return v
 
-    # Group selected items by TN — same TN may come from multiple orders
-    tn_order_map: dict = {}   # tn → list of order dicts
+    # Collect selected TNs (deduplicated) — user may select only one checkbox per TN
+    selected_tns: dict = {}   # tn → first selected order (for contact/market info)
     for item in items:
         if '|' not in item:
             continue
@@ -2423,15 +3189,12 @@ def aftership_csv():
         order = orders_map.get(order_id)
         if not tn or not order:
             continue
-        tn_order_map.setdefault(tn, [])
-        if order not in tn_order_map[tn]:
-            tn_order_map[tn].append(order)
+        if tn not in selected_tns:
+            selected_tns[tn] = order   # keep first selected order for contact info
 
     rows = []
 
-    for tn, tn_orders in tn_order_map.items():
-        # Use the first order for contact/carrier/date (all share the same destination)
-        first_order = tn_orders[0]
+    for tn, first_order in selected_tns.items():
         market     = first_order.get('market', '')
         order_date = first_order.get('order_date', '')
         carrier    = 'fedex'
@@ -2442,21 +3205,23 @@ def aftership_csv():
             continue
         clean_market = contact['market']
 
-        # Collect ALL manual shipment entries for this TN across ALL selected orders
+        # Always collect gear from ALL orders that have this TN — not just selected ones.
+        # User uploads one TN to AfterShip; custom fields must reflect everything in that shipment.
         all_entries = []
         order_labels = []
-        for order in tn_orders:
+        for order in orders_all:
             entries = [x for x in order.get('manual_shipments', [])
                        if x.get('tracking_number', '').strip() == tn]
+            if not entries:
+                continue
             all_entries.extend(entries)
-            if entries:
-                carrier = entries[0].get('carrier', 'fedex').lower()
-                sport      = order.get('sport', 'BSBL')
-                order_num  = order.get('num_for_code', order.get('order_num', ''))
-                gear_types_o = list(dict.fromkeys(e.get('gear_type', '') for e in entries if e.get('gear_type')))
-                primary_gear = gear_types_o[0] if gear_types_o else ''
-                order_code_o = build_order_code(market, sport, primary_gear, order_date, order_num)
-                order_labels.append(f"Order {order_code_o}: {', '.join(gear_types_o)}")
+            carrier = entries[0].get('carrier', 'fedex').lower()
+            sport      = order.get('sport', 'BSBL')
+            order_num  = order.get('num_for_code', order.get('order_num', ''))
+            gear_types_o = list(dict.fromkeys(e.get('gear_type', '') for e in entries if e.get('gear_type')))
+            primary_gear = gear_types_o[0] if gear_types_o else ''
+            order_code_o = build_order_code(market, sport, primary_gear, order_date, order_num)
+            order_labels.append(f"Order {order_code_o}: {', '.join(gear_types_o)}")
 
         if not all_entries:
             continue
@@ -2469,14 +3234,30 @@ def aftership_csv():
         first_gear     = first_entries[0].get('gear_type', '') if first_entries else ''
         order_code     = build_order_code(market, first_sport, first_gear, order_date, first_order_num)
 
-        # Aggregate across all orders
-        box_count     = len(all_entries)
+        # Aggregate across all orders — count physical boxes by deduplicating
+        # gears that share the same notes string (same physical box).
+        _notes_seen: set = set()
+        box_count = 0
+        for e in all_entries:
+            n = e.get('notes', '').strip()
+            if n:
+                if n not in _notes_seen:
+                    _notes_seen.add(n)
+                    box_count += 1
+            else:
+                box_count += 1
         declared_vals = [e.get('declared_value', '').strip() for e in all_entries if e.get('declared_value', '').strip()]
         note_texts    = list(dict.fromkeys(e.get('notes', '').strip() for e in all_entries if e.get('notes', '').strip()))
 
-        # Build note: list each order's contribution
+        # custom_1: flat, deduplicated gear list across all orders sharing this TN
+        all_gear_types = list(dict.fromkeys(
+            e.get('gear_type', '') for e in all_entries if e.get('gear_type', '')
+        ))
+        custom_1 = ', '.join(all_gear_types) if all_gear_types else ''
+
+        # custom_2: full detail note per order
         contents_parts = ' + '.join(order_labels) if order_labels else 'Mixed'
-        note = f"{box_count} box{'es' if box_count != 1 else ''} | {contents_parts}"
+        custom_2 = f"{box_count} box{'es' if box_count != 1 else ''} | {contents_parts}"
         if declared_vals:
             total_declared = 0.0
             for v in declared_vals:
@@ -2484,15 +3265,15 @@ def aftership_csv():
                     total_declared += float(v.replace('$', '').replace(',', ''))
                 except ValueError:
                     pass
-            note += f" | Declared: ${total_declared:g}"
+            custom_2 += f" | Declared: ${total_declared:g}"
         if note_texts:
-            note += ' | ' + ' | '.join(note_texts)
+            custom_2 += ' | ' + ' | '.join(note_texts)
 
         order_date_iso = (order_date + 'T00:00:00+00:00') if order_date else ''
 
         row = [
             carrier, tn, order_code, order_code, '',
-            'CHN', 'USA', note, '',
+            'CHN', 'USA', custom_1, custom_2,
             '', '', '', '', '',
             order_date_iso, order_code,
             'en', 'FedEx International Connect Plus', '', '', '',
@@ -2544,24 +3325,49 @@ def _collect_shipments(order: dict) -> list:
             })
 
     tn_info = {}
-    for box in packing:
-        tn = box.get('tracking_number', '').strip()
-        if not tn:
-            continue
-        if tn not in tn_info:
-            tn_info[tn] = {
-                'carrier':    box.get('carrier', 'fedex'),
-                'gear_types': {},
-                'notes':      '',
-            }
-        gt = box.get('gear_type', '')
-        tn_info[tn]['gear_types'][gt] = tn_info[tn]['gear_types'].get(gt, 0) + 1
 
-    # Merge manual shipments (entered via update panel)
+    # Build gear_types from packing_list using contents-aware physical box detection:
+    # - rows with the same (box_num, non-empty contents) = same physical box → count once
+    #   under the highest-priority gear in that box
+    # - rows with empty/"see attached" contents each count as their own physical box
+    #   (per-gear box numbering assumed when contents are missing)
+    for tn, boxes in tn_boxes.items():
+        first = next((b for b in packing if b.get('tracking_number', '').strip() == tn), {})
+        all_pl_gears = {box['gear'] for box in boxes}
+        by_physical_box: dict = {}
+        for box in boxes:
+            bn = box['box_num']
+            c = box.get('contents', '').strip()
+            if c.lower() == 'see attached':
+                c = ''
+            # Empty/"see attached" → box_num is absolute; group by (box_num, '') so
+            # all gear types in the same numbered box share one physical box.
+            # Non-empty contents → unique contents string identifies the physical box.
+            key = (bn, c)
+            by_physical_box.setdefault(key, []).append(box['gear'])
+        gear_counts: dict = {}
+        for gears_in_box in by_physical_box.values():
+            primary = _primary_gear(gears_in_box) or gears_in_box[0]
+            gear_counts[primary] = gear_counts.get(primary, 0) + 1
+        # Non-primary gears in shared boxes get count 0 so they still appear in
+        # gear_summary (for sync/delivered logic) but don't inflate box counts.
+        for g in all_pl_gears:
+            if g not in gear_counts:
+                gear_counts[g] = 0
+        tn_info[tn] = {
+            'carrier':    first.get('carrier', 'fedex'),
+            'gear_types': gear_counts,
+            'notes':      '',
+        }
+
+    # Merge manual shipments (entered via update panel).
+    # When packing_list already covers a TN, skip box_count (avoid double-counting);
+    # still merge notes, ship_date, and carrier for display.
     for m in order.get('manual_shipments', []):
         tn = m.get('tracking_number', '').strip()
         if not tn:
             continue
+        has_pl = tn in tn_boxes  # True only if packing_list covers this TN
         if tn not in tn_info:
             tn_info[tn] = {
                 'carrier':    m.get('carrier', 'FedEx'),
@@ -2571,14 +3377,42 @@ def _collect_shipments(order: dict) -> list:
                 'ship_date':  m.get('ship_date', ''),
                 'added_at':   m.get('added_at', ''),
             }
+        else:
+            if not tn_info[tn].get('ship_date') and m.get('ship_date'):
+                tn_info[tn]['ship_date'] = m['ship_date']
+            if not tn_info[tn].get('added_at') and m.get('added_at'):
+                tn_info[tn]['added_at'] = m['added_at']
         gt = m.get('gear_type', '')
         if gt:
-            try:
-                boxes = max(1, int(m.get('box_count', 1)))
-            except (TypeError, ValueError):
-                boxes = 1
-            tn_info[tn]['gear_types'][gt] = tn_info[tn]['gear_types'].get(gt, 0) + boxes
             tn_info[tn].setdefault('gear_notes', {})[gt] = m.get('notes', '')
+            if not has_pl:
+                try:
+                    boxes = max(1, int(m.get('box_count', 1)))
+                except (TypeError, ValueError):
+                    boxes = 1
+                tn_info[tn]['gear_types'][gt] = tn_info[tn]['gear_types'].get(gt, 0) + boxes
+
+    # For manual-only TNs (no packing list): gears sharing the same non-empty notes
+    # are in the same physical box. Keep box_count on the highest-priority gear only;
+    # set the rest to 0 so they appear in gear_summary without inflating box totals.
+    pl_tns = set(tn_boxes.keys())
+    for tn, info in tn_info.items():
+        if tn in pl_tns:
+            continue
+        gear_notes = info.get('gear_notes', {})
+        gear_types = info['gear_types']
+        notes_groups: dict = {}
+        for g in list(gear_types.keys()):
+            n = gear_notes.get(g, '').strip()
+            if n:
+                notes_groups.setdefault(n, []).append(g)
+        for gears_in_group in notes_groups.values():
+            if len(gears_in_group) <= 1:
+                continue
+            primary = _primary_gear(gears_in_group) or gears_in_group[0]
+            count = max(gear_types.get(g, 0) for g in gears_in_group)
+            for g in gears_in_group:
+                gear_types[g] = count if g == primary else 0
 
     shipments = []
     for tn, info in tn_info.items():
@@ -2599,16 +3433,30 @@ def _collect_shipments(order: dict) -> list:
             n = g['notes'].strip()
             if n:
                 if n not in _noted:
-                    _noted[n] = {'gears': [], 'boxes': g['boxes']}
+                    _noted[n] = {'gears': [], 'box_counts': []}
+                _noted[n]['box_counts'].append(g['boxes'])
                 _noted[n]['gears'].append(g['gear'])
             else:
                 _solo.append(g)
+        _individual = []  # single-gear groups (one gear per physical box)
+        _shared     = []  # multi-gear groups (multiple gear types share a box)
         for grp in _noted.values():
-            bw = 'box' if grp['boxes'] == 1 else 'boxes'
-            gear_groups.append(f"{', '.join(sorted(grp['gears']))} × {grp['boxes']} {bw}")
+            if any(b == 0 for b in grp['box_counts']):
+                total = sum(b for b in grp['box_counts'] if b > 0) or 1
+            else:
+                total = max(grp['box_counts']) if grp['box_counts'] else 1
+            bw   = 'box' if total == 1 else 'boxes'
+            line = f"{', '.join(sorted(grp['gears']))} × {total} {bw}"
+            if len(grp['gears']) == 1:
+                _individual.append(line)
+            else:
+                _shared.append(line)
         for g in sorted(_solo, key=lambda x: x['gear']):
+            if g['boxes'] == 0:
+                continue
             bw = 'box' if g['boxes'] == 1 else 'boxes'
-            gear_groups.append(f"{g['gear']} × {g['boxes']} {bw}")
+            _individual.append(f"{g['gear']} × {g['boxes']} {bw}")
+        gear_groups = sorted(_individual) + _shared
         shipments.append({
             'tracking_number': tn,
             'carrier':         info['carrier'],
@@ -2621,6 +3469,7 @@ def _collect_shipments(order: dict) -> list:
             'status_label':    label,
             'status_color':    color,
             'notes':           saved.get('notes', ''),
+            'location':        saved.get('location', ''),
             'updated_at':      saved.get('updated_at', ''),
             'delivered_at':    saved.get('delivered_at', ''),
         })
@@ -2637,6 +3486,7 @@ def _build_tracking_payload():
         shipments = _collect_shipments(order)
         # Most recently updated shipment first; fall back to shipped_at on order
         shipments.sort(key=lambda s: s.get('updated_at', '') or order.get('shipped_at', ''), reverse=True)
+        dest = _ship_to_info(order.get('market', ''))
         result_orders.append({
             'id':          order.get('id'),
             'market':      order.get('market', ''),
@@ -2647,6 +3497,8 @@ def _build_tracking_payload():
             'shipped_at':  order.get('shipped_at', ''),
             'gear_tasks':  order.get('gear_tasks', {}),
             'shipments':   shipments,
+            'dest_state':  dest.get('state', '') if dest else '',
+            'dest_city':   dest.get('city', '') if dest else '',
         })
     return {
         'ok':              True,
@@ -2672,10 +3524,8 @@ def _build_slack_update(order: dict, tn: str, tag: str, notes: str) -> str:
 
     gear_lines = ''
     if ship:
-        carrier = _carrier_emoji(ship.get('carrier', 'fedex'))
-        parts   = [f"{s['gear']} × {s['boxes']} box{'es' if s['boxes'] != 1 else ''}"
-                   for s in ship['gear_summary']]
-        gear_lines = '\n'.join(f"  • {p}" for p in parts)
+        carrier    = _carrier_emoji(ship.get('carrier', 'fedex'))
+        gear_lines = '\n'.join(f"  • {g}" for g in ship.get('gear_groups', []))
     else:
         carrier = 'FedEx'
 
@@ -2792,7 +3642,7 @@ def update_tracking_status():
         if tag == 'Delivered':
             actual_ms = int(datetime.now().replace(
                 hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
-            cu_errors.extend(_sync_delivered_to_clickup(order, tn, actual_ms))
+            cu_errors.extend(_sync_delivered_to_clickup(order, tn, actual_ms, all_orders=orders))
 
     # ── Notify ────────────────────────────────────────────────────────────────
     email_error = ''
@@ -2843,7 +3693,7 @@ def api_sync_delivered():
         dt = datetime.now()
     actual_ms = int(dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
 
-    errs = _sync_delivered_to_clickup(order, tn, actual_ms)
+    errs = _sync_delivered_to_clickup(order, tn, actual_ms, all_orders=orders)
     if errs:
         return jsonify({'ok': False, 'error': '; '.join(errs)})
     return jsonify({'ok': True, 'message': 'Delivered, Delivery Date [Actual], and Order Status updated in ClickUp.'})
@@ -2866,17 +3716,48 @@ def api_dashboard_reminders():
     reminders = []
 
     for order in orders:
+        order_label = (
+            f"{order.get('market')} {order.get('season')} "
+            f"{order.get('sport')} #{order.get('num_for_code', order.get('order_num'))}"
+        )
+
+        # ── ETA to Zees reminder (7-day and 14-day warning) ──────────────────
+        # Skip only if every gear has been shipped AND every TN is Delivered
+        tracking_statuses = order.get('tracking_statuses', {})
+        gear_types = set(order.get('gear_tasks', {}).keys())
+        shipped_gears = (
+            {ms.get('gear_type') for ms in order.get('manual_shipments', [])} |
+            {row.get('gear_type') for row in order.get('packing_list', [])}
+        )
+        all_shipped   = bool(gear_types) and gear_types.issubset(shipped_gears)
+        all_tn_delivered = (
+            bool(tracking_statuses) and
+            all(v.get('tag') == 'Delivered' for v in tracking_statuses.values())
+        )
+        order_fully_done = all_shipped and all_tn_delivered
+        eta_zees_str = order.get('eta_to_zees', '')
+        if eta_zees_str and not order_fully_done:
+            try:
+                eta_date   = datetime.fromisoformat(eta_zees_str).date()
+                days_until = (eta_date - today).days
+                if 1 <= days_until <= 14:
+                    reminders.append({
+                        'order_id':    order.get('id'),
+                        'order_label': order_label,
+                        'gear_type':   'All Gear',
+                        'milestone':   'ETA to Zees',
+                        'date':        eta_date.isoformat(),
+                        'days_diff':   days_until,
+                    })
+            except ValueError:
+                pass
+
         gear_tasks = order.get('gear_tasks', {})
         if not gear_tasks:
             continue
         order_date_str = order.get('order_date', '')
         if not order_date_str:
             continue
-
-        order_label = (
-            f"{order.get('market')} {order.get('season')} "
-            f"{order.get('sport')} #{order.get('num_for_code', order.get('order_num'))}"
-        )
 
         for gear_type, task_id in gear_tasks.items():
             fields = calc_gear_dates(gear_type, order_date_str)
@@ -2908,17 +3789,18 @@ def api_dashboard_reminders():
                 if milestone_date > today:
                     continue
 
-                # Condition per milestone type
+                # Condition per milestone type — only show if the action hasn't happened yet
                 if label in ('Proofs Ready', 'Proofs Approved'):
-                    # Only show if proofs haven't been approved yet
-                    if proofs_approved_act is not None:
+                    # Skip if proofs approved actual is set, OR if already shipped
+                    # (shipped implies proofs were done even if actual date wasn't recorded)
+                    if proofs_approved_act is not None or ship_act is not None:
                         continue
                 elif label == 'Ship Date':
-                    # Only show if not yet shipped
+                    # Skip if already shipped
                     if ship_act is not None:
                         continue
                 elif label == 'Delivery Date':
-                    # Only show if shipped but not yet delivered
+                    # Skip if not yet shipped, or already delivered
                     if ship_act is None or delivery_act is not None:
                         continue
 
@@ -2933,6 +3815,389 @@ def api_dashboard_reminders():
 
     reminders.sort(key=lambda r: r['days_diff'])
     return jsonify({'ok': True, 'reminders': reminders})
+
+
+_sheet_cache: dict = {}   # sheet_id → {'ts': float, 'gear_types': dict}
+_SHEET_CACHE_TTL = 600    # 10 minutes
+
+# Maps substrings in order-sheet item names → gear_task key
+_SHEET_GEAR_MAP = [
+    ('flex jersey', 'Jersey'),
+    ('jersey',      'Jersey'),
+    ('hoodie',      'Hoodie'),
+    ('tee',         'Tee'),
+    ('cap',         'Cap'),
+    ('windbreaker', 'Windbreaker'),
+    ('jacket',      'Windbreaker'),
+    ('ring',        'Ring'),
+    ('hype',        'Hypechain'),
+    ('necklace',    'Hypechain'),
+    ('name banner', 'Name Banner'),
+    ('park banner', 'Park Banner'),
+]
+
+# Tab name keywords to verify a gear type has a real vendor order (not just an estimate).
+# If the matching tab has only 1 numeric row (a single summary), treat qty as 0.
+_GEAR_TAB_KW = {
+    'Jersey':      ['jersey'],
+    'Hoodie':      ['hoodie'],
+    'Tee':         ['tee'],
+    'Cap':         ['cap'],
+    'Windbreaker': ['jacket', 'windbreaker'],
+    'Ring':        ['ring'],
+    'Hypechain':   ['hype', 'necklace'],
+    'Name Banner': ['name banner'],
+    'Park Banner': ['park banner'],
+}
+
+
+def _count_numeric_rows(csv_text: str) -> int:
+    """Count rows in a CSV that contain at least one cell parseable as a number ≥ 1."""
+    count = 0
+    for row in csv.reader(StringIO(csv_text)):
+        for cell in row:
+            try:
+                if float(cell.strip().replace(',', '')) >= 1:
+                    count += 1
+                    break
+            except ValueError:
+                pass
+    return count
+
+
+def _ordered_gear_types(sheet_url: str) -> dict | None:
+    """Return {gear_type: qty} for confirmed gear orders on the sheet, or None on error.
+
+    A gear type is 'confirmed' when:
+      1. The Order Home Page shows qty > 0, AND
+      2. The matching gear tab has ≥ 2 numeric rows (real size/team breakdown),
+         not just a single summary row (which indicates a registration estimate).
+    """
+    if not sheet_url:
+        return None
+    m = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', sheet_url)
+    if not m:
+        return None
+    sheet_id = m.group(1)
+
+    cached = _sheet_cache.get(sheet_id)
+    if cached and (time.time() - cached['ts']) < _SHEET_CACHE_TTL:
+        return cached['gear_types'] or None
+
+    gkey = os.getenv('GOOGLE_API_KEY', '')
+    if not gkey:
+        return None
+
+    try:
+        meta = requests.get(
+            f'https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}',
+            params={'key': gkey, 'fields': 'sheets.properties'},
+            timeout=10,
+        )
+        meta.raise_for_status()
+        tabs = meta.json().get('sheets', [])
+    except Exception:
+        return None
+
+    home_gid   = None
+    home_title = ''
+    for tab in tabs:
+        name = tab['properties']['title'].lower()
+        if 'order home' in name or 'home page' in name:
+            home_gid   = str(tab['properties']['sheetId'])
+            home_title = name
+            break
+    if home_gid is None and tabs:
+        home_gid   = str(tabs[0]['properties']['sheetId'])
+        home_title = tabs[0]['properties']['title'].lower()
+    if home_gid is None:
+        return None
+
+    try:
+        csv_resp = requests.get(
+            f'https://docs.google.com/spreadsheets/d/{sheet_id}/export',
+            params={'format': 'csv', 'gid': home_gid},
+            timeout=15,
+        )
+        csv_resp.raise_for_status()
+        if 'accounts.google.com' in csv_resp.url:
+            return None
+    except Exception:
+        return None
+
+    # Parse home page: col B (index 1) = item name, col E (index 4) = qty
+    candidate_qty: dict[str, int] = {}
+    for row in csv.reader(StringIO(csv_resp.text)):
+        if len(row) < 5:
+            continue
+        name_cell = row[1].strip().lower()
+        qty_str   = row[4].strip().replace(',', '').replace('$', '')
+        try:
+            qty = float(qty_str)
+        except ValueError:
+            continue
+        if qty <= 0:
+            continue
+        for substr, gear_type in _SHEET_GEAR_MAP:
+            if substr in name_cell:
+                if gear_type not in candidate_qty:
+                    candidate_qty[gear_type] = int(qty)
+                break
+
+    if not candidate_qty:
+        _sheet_cache[sheet_id] = {'ts': time.time(), 'gear_types': {}}
+        return None
+
+    # Verify each candidate against its gear-specific tab.
+    # A tab with only 1 numeric row is a summary placeholder, not a real vendor order.
+    confirmed: dict[str, int] = {}
+    for gear_type, qty in candidate_qty.items():
+        keywords = _GEAR_TAB_KW.get(gear_type, [])
+        gear_gid = None
+        for tab in tabs:
+            tname = tab['properties']['title'].lower()
+            if tname == home_title:
+                continue
+            if any(kw in tname for kw in keywords):
+                gear_gid = str(tab['properties']['sheetId'])
+                break
+
+        if gear_gid is None:
+            confirmed[gear_type] = qty
+            continue
+
+        try:
+            gr = requests.get(
+                f'https://docs.google.com/spreadsheets/d/{sheet_id}/export',
+                params={'format': 'csv', 'gid': gear_gid},
+                timeout=15,
+            )
+            gr.raise_for_status()
+            if _count_numeric_rows(gr.text) >= 2:
+                confirmed[gear_type] = qty
+        except Exception:
+            confirmed[gear_type] = qty  # on fetch error, trust home page
+
+    _sheet_cache[sheet_id] = {'ts': time.time(), 'gear_types': confirmed}
+    return confirmed if confirmed else None
+
+
+_cu_task_cache: dict = {}
+_CU_TASK_TTL = 1800  # 30 minutes
+
+_ERROR_KW       = ('remake', 'redo', 're-order', 'reorder', 'replacement')
+_CU_AUTO_PREFIXES = ('📦 Shipped', '📬', 'Tracking:', 'Shipped\n', '✅')
+
+
+def _get_task_error_info(task_id: str) -> dict | None:
+    """Return {'is_error': bool, 'reason': str|None} for a ClickUp task.
+
+    'is_error' is True only when the task name contains a remake/redo keyword.
+    'reason' is the first non-shipping comment text (first line only).
+    Returns None on fetch error.
+    """
+    if not task_id:
+        return None
+    cached = _cu_task_cache.get(task_id)
+    if cached is not None and (time.time() - cached['ts']) < _CU_TASK_TTL:
+        return cached.get('info')
+
+    cu_token = os.getenv('CLICKUP_TOKEN', '')
+    if not cu_token:
+        return None
+
+    try:
+        task_resp = requests.get(
+            f'https://api.clickup.com/api/v2/task/{task_id}',
+            headers={'Authorization': cu_token},
+            timeout=10,
+        )
+        task_resp.raise_for_status()
+        name = task_resp.json().get('name', '')
+    except Exception:
+        _cu_task_cache[task_id] = {'ts': time.time(), 'info': None}
+        return None
+
+    is_error = any(kw in name.lower() for kw in _ERROR_KW)
+
+    reason      = None
+    comment_qty = None
+    if is_error:
+        try:
+            comm_resp = requests.get(
+                f'https://api.clickup.com/api/v2/task/{task_id}/comment',
+                headers={'Authorization': cu_token},
+                timeout=10,
+            )
+            comm_resp.raise_for_status()
+            for comment in comm_resp.json().get('comments', []):
+                text = comment.get('comment_text', '').strip()
+                if text and not any(text.startswith(p) for p in _CU_AUTO_PREFIXES):
+                    lines = text.split('\n')
+                    reason = lines[0].rstrip(':').strip()
+                    # Sum any "Xpcs" or "X pcs" counts from subsequent lines
+                    total = sum(
+                        int(m.group(1))
+                        for line in lines[1:]
+                        for m in [re.search(r'(\d+)\s*pcs?', line, re.I)]
+                        if m
+                    )
+                    if total:
+                        comment_qty = total
+                    break
+        except Exception:
+            pass
+
+    info = {'is_error': is_error, 'reason': reason, 'comment_qty': comment_qty, 'name': name}
+    _cu_task_cache[task_id] = {'ts': time.time(), 'info': info}
+    return info
+
+
+@app.route('/api/shipment-status')
+def api_shipment_status():
+    orders = load_orders()
+
+    def tag_to_status(tag):
+        return 'arrived' if tag == 'Delivered' else 'shipped'
+
+    # market → gear_type → counts + item lists
+    # Items: {'order': order_num, 'sport': sport, 'qty': qty, 'tn': tn_or_empty, 'reason': str_or_None}
+    def _new_bucket():
+        return {
+            'arrived': 0, 'shipped': 0, 'in_production': 0, 'error': 0,
+            'arrived_items': [], 'shipped_items': [], 'in_production_items': [], 'error_items': [],
+        }
+    market_gear: dict = defaultdict(lambda: defaultdict(_new_bucket))
+
+    for order in orders:
+        market            = order.get('market', 'Unknown')
+        order_num         = str(order.get('order_num', '?'))
+        sport             = order.get('sport', '')
+        tracking_statuses = order.get('tracking_statuses', {})
+        gear_tasks        = order.get('gear_tasks', {})
+        manual_shipments  = order.get('manual_shipments', [])
+        packing_list      = order.get('packing_list', [])
+        sheet_url         = order.get('order_sheet_url', '')
+
+        ordered_gear = _ordered_gear_types(sheet_url)  # None = couldn't read sheet
+
+        for gear_type, task_id in gear_tasks.items():
+            has_evidence = any(
+                e.get('gear_type') == gear_type
+                for e in (manual_shipments + packing_list)
+            )
+            if ordered_gear is not None and gear_type not in ordered_gear and not has_evidence:
+                continue
+
+            qty         = (ordered_gear or {}).get(gear_type, 0) or 1
+            bucket      = market_gear[market][gear_type]
+            task_info   = _get_task_error_info(task_id)
+            is_error    = bool(task_info and task_info.get('is_error'))
+            reason      = (task_info or {}).get('reason') if is_error else None
+            comment_qty = (task_info or {}).get('comment_qty') if is_error else None
+
+            seen_tns: set[str] = set()
+            ship_items: list[dict] = []
+            tags: list[str]        = []
+
+            if manual_shipments:
+                for ms in manual_shipments:
+                    if ms.get('gear_type') == gear_type:
+                        tn  = ms.get('tracking_number', '')
+                        tag = tracking_statuses.get(tn, {}).get('tag', '')
+                        if tn not in seen_tns:
+                            seen_tns.add(tn)
+                            ship_items.append({'order': order_num, 'sport': sport, 'qty': qty, 'tn': tn})
+                            tags.append(tag)
+
+            if not tags:
+                for pl in packing_list:
+                    if pl.get('gear_type') == gear_type:
+                        tn  = pl.get('tracking_number', '')
+                        tag = tracking_statuses.get(tn, {}).get('tag', '')
+                        if tn not in seen_tns:
+                            seen_tns.add(tn)
+                            ship_items.append({'order': order_num, 'sport': sport, 'qty': qty, 'tn': tn})
+                            tags.append(tag)
+
+            error_qty = comment_qty or qty
+            item_base = {'order': order_num, 'sport': sport, 'qty': qty}
+
+            if is_error:
+                bucket['error'] += error_qty
+                tns = list(dict.fromkeys(i['tn'] for i in ship_items if i['tn']))
+                bucket['error_items'].append({
+                    'order':      order_num,
+                    'sport':      sport,
+                    'gear_type':  gear_type,
+                    'market':     market,
+                    'qty':        error_qty,
+                    'reason':     reason,
+                    'tns':        tns,
+                })
+            elif not tags:
+                bucket['in_production'] += qty
+                bucket['in_production_items'].append(item_base)
+            else:
+                statuses = {tag_to_status(t) if t else 'shipped' for t in tags}
+                if 'arrived' in statuses:
+                    bucket['arrived'] += qty
+                    bucket['arrived_items'].extend(ship_items)
+                else:
+                    bucket['shipped'] += qty
+                    bucket['shipped_items'].extend(ship_items)
+
+    result = {}
+    for market, gear_data in market_gear.items():
+        gear_list = []
+        m_arrived = m_shipped = m_in_prod = m_error = 0
+
+        for gear_type, counts in sorted(gear_data.items()):
+            total = counts['arrived'] + counts['shipped'] + counts['in_production'] + counts['error']
+            gear_list.append({
+                'gear_type':           gear_type,
+                'arrived':             counts['arrived'],
+                'shipped':             counts['shipped'],
+                'in_production':       counts['in_production'],
+                'error':               counts['error'],
+                'total':               total,
+                'arrived_items':       counts['arrived_items'],
+                'shipped_items':       counts['shipped_items'],
+                'in_production_items': counts['in_production_items'],
+                'error_items':         counts['error_items'],
+            })
+            m_arrived  += counts['arrived']
+            m_shipped  += counts['shipped']
+            m_in_prod  += counts['in_production']
+            m_error    += counts['error']
+
+        def sort_key(g):
+            if g['error'] > 0:
+                return 0
+            if g['in_production'] > 0 and g['arrived'] == 0 and g['shipped'] == 0:
+                return 3
+            if g['shipped'] > 0 and g['arrived'] == 0 and g['in_production'] == 0:
+                return 2
+            if g['shipped'] > 0 or g['in_production'] > 0:
+                return 1
+            return 0
+
+        gear_list.sort(key=sort_key)
+        total = m_arrived + m_shipped + m_in_prod + m_error
+        result[market] = {
+            'arrived_pct':       round(m_arrived / total * 100) if total else 0,
+            'shipped_pct':       round(m_shipped / total * 100) if total else 0,
+            'in_production_pct': round(m_in_prod / total * 100) if total else 0,
+            'error_pct':         round(m_error   / total * 100) if total else 0,
+            'arrived':           m_arrived,
+            'shipped':           m_shipped,
+            'in_production':     m_in_prod,
+            'error':             m_error,
+            'total':             total,
+            'gear':              gear_list,
+        }
+
+    return jsonify({'ok': True, 'markets': result})
 
 
 @app.route('/dashboard')
@@ -3014,6 +4279,8 @@ def contents_lookup():
 
 @app.route('/public/orders')
 def public_orders():
+    if not pub_authed():
+        return redirect('/public/login?next=/public/orders')
     orders = load_orders()
     enriched = []
     for o in sorted(orders, key=lambda x: x.get('created_at', ''), reverse=True):
@@ -3024,11 +4291,15 @@ def public_orders():
 
 @app.route('/public/tracking')
 def public_tracking():
+    if not pub_authed():
+        return redirect('/public/login?next=/public/tracking')
     return render_template('public_tracking.html')
 
 
 @app.route('/public/contents')
 def public_contents():
+    if not pub_authed():
+        return redirect('/public/login?next=/public/contents')
     orders = load_orders()
     rows = []
     for o in sorted(orders, key=lambda x: x.get('created_at', ''), reverse=True):
@@ -3078,12 +4349,66 @@ def public_contents():
 
 @app.route('/public/dashboard')
 def public_dashboard():
+    if not pub_authed():
+        return redirect('/public/login?next=/public/dashboard')
     return render_template('public_dashboard.html')
 
 
+@app.route('/calendar')
+def calendar():
+    return render_template('calendar.html')
+
 @app.route('/public/calendar')
 def public_calendar():
+    if not pub_authed():
+        return redirect('/public/login?next=/public/calendar')
     return render_template('public_calendar.html')
+
+@app.route('/public/order-sheet')
+def public_order_sheet():
+    host = request.host.split(':')[0]
+    if host == 'orders.msm-hq.com':
+        if not orders_authed():
+            return redirect('/public/orders-login')
+    elif not pub_authed():
+        return redirect('/public/login?next=/public/order-sheet')
+    return send_file('/Users/mba/order-sheet-tool/index.html')
+
+
+@app.route('/public/orders-login', methods=['GET', 'POST'])
+def public_orders_login():
+    error = None
+    if request.method == 'POST':
+        if request.form.get('password') in ORDERS_PASSES:
+            session['orders_authed'] = True
+            return redirect('/public/order-sheet')
+        error = 'Incorrect password.'
+    return render_template('public_orders_login.html', error=error)
+
+
+@app.route('/public/orders-logout')
+def public_orders_logout():
+    session.pop('orders_authed', None)
+    return redirect('/public/orders-login')
+
+
+@app.route('/public/login', methods=['GET', 'POST'])
+def public_login():
+    error = None
+    if request.method == 'POST':
+        if request.form.get('password') == PUBLIC_PASS:
+            session['pub_authed'] = True
+            next_url = request.args.get('next', '/public/dashboard')
+            return redirect(next_url)
+        error = 'Incorrect password.'
+    next_url = request.args.get('next', '/public/dashboard')
+    return render_template('public_login.html', next_url=next_url, error=error)
+
+
+@app.route('/public/logout')
+def public_logout():
+    session.pop('pub_authed', None)
+    return redirect('/public/login')
 
 
 @app.route('/api/calendar-events')
@@ -3149,6 +4474,21 @@ def api_save_shipment_boxes():
             'carrier':         'fedex',
         })
 
+    # Fill missing weight / declared_value on matching manual_shipment entries
+    for ms in order.get('manual_shipments', []):
+        if ms.get('tracking_number', '').strip() != tracking:
+            continue
+        gear = ms.get('gear_type', '')
+        gear_boxes = [b for b in boxes if b.get('gear_type') == gear] or boxes
+        if not ms.get('weight'):
+            w = next((b['weight'] for b in gear_boxes if b.get('weight')), '')
+            if w:
+                ms['weight'] = w
+        if not ms.get('declared_value'):
+            dv = next((b['declared_value'] for b in gear_boxes if b.get('declared_value')), '')
+            if dv:
+                ms['declared_value'] = dv
+
     save_orders(orders)
     return jsonify({'ok': True, 'saved': len(boxes)})
 
@@ -3198,7 +4538,7 @@ def api_order_sheet_teams():
         'Tee':         ['tourney', 'tee', 'tees'],
         'Cap':         ['cap', 'caps'],
         'Windbreaker': ['windbreaker', 'jacket'],
-        'Cage Jacket': ['cage jacket', 'jacket'],
+        'Cage Jacket': ['cage jacket'],
         'Ring':        ['ring', 'rings', 'award'],
         'Hypechain':   ['hype chain', 'hypechain'],
         'Name Banner': ['name banner', 'banner'],
@@ -3287,12 +4627,10 @@ def api_dashboard_data():
 
     for order in orders:
         order_date_str = order.get('order_date', '')
-        if not order_date_str:
-            continue
         try:
-            order_date = datetime.strptime(order_date_str, '%Y-%m-%d')
+            order_date = datetime.strptime(order_date_str, '%Y-%m-%d') if order_date_str else None
         except ValueError:
-            continue
+            order_date = None
 
         gear_tasks = order.get('gear_tasks', {})
         if not gear_tasks:
@@ -3318,7 +4656,7 @@ def api_dashboard_data():
 
         def _wdays(ms):
             dt = _dt(ms)
-            return count_working_days(order_date, dt) if dt else None
+            return count_working_days(order_date, dt) if (dt and order_date) else None
 
         def _late(act_ms, est_ms):
             a, e = _wdays(act_ms), _wdays(est_ms)
@@ -3378,7 +4716,7 @@ def api_dashboard_data():
                 except (TypeError, ValueError):
                     pass
 
-        sport_year = order_date.year if order_date.month >= 4 else order_date.year - 1
+        sport_year = (order_date.year if order_date.month >= 4 else order_date.year - 1) if order_date else datetime.now().year
 
         order_status_raw = _get_task_cf(task, CF_ORDER_STATUS)
         try:
@@ -3397,11 +4735,17 @@ def api_dashboard_data():
             'days_to_proofs':   _wdays(proofs_act_ms),
             'days_to_ship':     _wdays(ship_act_ms),
             'days_to_delivery': _wdays(delivery_act_ms),
+            'days_ship_to_delivery': (
+                round((_dt(delivery_act_ms) - _dt(ship_act_ms)).days)
+                if _dt(ship_act_ms) and _dt(delivery_act_ms) else None
+            ),
             'is_delayed':       is_delayed,
             'error_count':      error_count,
             'received_count':   received_count,
             'current_phase':    current_phase,
             'order_status':     order_status,
+            'remake_qty':       order.get('remake_qty'),
+            'order_jersey_qty': order.get('total_jersey_qty'),
         })
 
     return jsonify({'ok': True, 'orders': result})
@@ -3485,6 +4829,201 @@ def tourney_ical():
         'Content-Type': 'text/calendar; charset=utf-8',
         'Content-Disposition': 'inline; filename="tourney.ics"',
     }
+
+
+INVENTORY_SHEET_ID   = '1rJTevdKr-8ONV56D0yvUBpvoaRlzYJZtyLqp_8R_9Js'
+INVENTORY_LOG_FILE   = DATA_FOLDER / 'inventory_log.json'
+INVENTORY_STOCK_FILE = DATA_FOLDER / 'inventory_stock.json'
+
+_REVERSIBLE_SPORTS = {'Soccer', 'Bowling', '7V7'}
+
+
+def calc_2026_price(gear_type: str, sport: str, season: str) -> float | None:
+    """Return 2026 franchise sell price per unit. None = no known price."""
+    gt = gear_type.lower().strip()
+    sp = sport.strip()
+
+    if 'jersey' in gt:
+        return 18.50 if sp in _REVERSIBLE_SPORTS else 14.50
+    if gt == 'hoodies':
+        return 20.00
+    if gt in ('cage jackets', 'cage jacket'):
+        return 21.50
+    if gt == 'windbreakers':
+        return 21.50
+    if gt == 'tees':
+        return 11.00 if sp == 'Baseball' else 12.00
+    if gt == 'caps':
+        return 11.00
+    if gt == 'rings':
+        return 10.50
+    if gt in ('hype chains', 'hype chain'):
+        return 12.00
+    if gt == 'park banner':
+        return 140.00
+    return None
+
+
+def _load_inv_log() -> list:
+    if not INVENTORY_LOG_FILE.exists():
+        return []
+    try:
+        return json.loads(INVENTORY_LOG_FILE.read_text())
+    except Exception:
+        return []
+
+
+def _save_inv_log(entries: list):
+    INVENTORY_LOG_FILE.write_text(json.dumps(entries, indent=2))
+
+
+def _load_inv_stock() -> dict:
+    if not INVENTORY_STOCK_FILE.exists():
+        return {}
+    try:
+        return json.loads(INVENTORY_STOCK_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_inv_stock(data: dict):
+    INVENTORY_STOCK_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _item_key(row: dict) -> str:
+    return '|'.join([row.get('gear_type',''), row.get('name',''), row.get('sport',''),
+                     row.get('code',''), row.get('size',''), row.get('color','')])
+
+
+@app.route('/inventory')
+def inventory():
+    return render_template('inventory.html')
+
+
+@app.route('/public/inventory')
+def public_inventory():
+    if not pub_authed():
+        return redirect('/public/login?next=/public/inventory')
+    return render_template('public_inventory.html')
+
+
+@app.route('/api/inventory-data')
+def api_inventory_data():
+    api_key = os.getenv('GOOGLE_API_KEY', '')
+    if not api_key:
+        return jsonify({'ok': False, 'error': 'GOOGLE_API_KEY not configured'}), 500
+    try:
+        r = requests.get(
+            f'https://sheets.googleapis.com/v4/spreadsheets/{INVENTORY_SHEET_ID}/values/HQ%20Inventory!A1:N300',
+            params={'key': api_key},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 502
+
+    rows = data.get('values', [])
+    if len(rows) < 2:
+        return jsonify({'ok': True, 'items': []})
+
+    def _f(v):
+        try:
+            return float(str(v).replace(',', '').strip())
+        except Exception:
+            return 0.0
+
+    local_stock = _load_inv_stock()
+
+    items = []
+    for idx, row in enumerate(rows[1:], start=2):
+        while len(row) < 14:
+            row.append('')
+        gear_type     = row[0]
+        sport         = row[2]
+        season        = row[4]
+        cost_per_unit = _f(row[11])
+        p2026         = calc_2026_price(gear_type, sport, season)
+        item = {
+            'row':           idx,
+            'gear_type':     gear_type,
+            'name':          row[1],
+            'sport':         sport,
+            'code':          row[3],
+            'season':        season,
+            'status':        row[5],
+            'color':         row[6],
+            'size':          row[7],
+            'stock_in':      _f(row[8]),
+            'stock_out':     _f(row[9]),
+            'current_stock': _f(row[10]),
+            'cost_per_unit': cost_per_unit,
+            'price_per_unit': p2026,
+        }
+        key = _item_key(item)
+        if key in local_stock:
+            saved = local_stock[key]
+            item['stock_in']      = saved.get('stock_in', item['stock_in'])
+            item['stock_out']     = saved.get('stock_out', item['stock_out'])
+            item['current_stock'] = saved.get('current_stock', item['current_stock'])
+            item['last_updated']  = saved.get('last_updated', '')
+        cs = item['current_stock']
+        item['total_cost']  = round(cs * cost_per_unit, 2)
+        item['total_price'] = round(cs * p2026, 2) if p2026 is not None else 0
+        items.append(item)
+    return jsonify({'ok': True, 'items': items})
+
+
+@app.route('/api/inventory-update', methods=['POST'])
+def api_inventory_update():
+    body          = request.get_json(force=True)
+    item_key      = body.get('item_key')
+    new_stock_in  = body.get('stock_in')
+    new_stock_out = body.get('stock_out')
+    new_current   = body.get('current_stock')
+    cst_now       = body.get('cst_now') or _fmt_cst()
+    log_entry     = body.get('log_entry', {})
+
+    if not item_key:
+        return jsonify({'ok': False, 'error': 'item_key required'}), 400
+
+    stock = _load_inv_stock()
+    stock[item_key] = {
+        'stock_in':      new_stock_in,
+        'stock_out':     new_stock_out,
+        'current_stock': new_current,
+        'last_updated':  cst_now,
+    }
+    _save_inv_stock(stock)
+
+    if log_entry:
+        entries = _load_inv_log()
+        log_entry['id']          = str(uuid.uuid4())
+        log_entry['server_time'] = _fmt_cst()
+        entries.insert(0, log_entry)
+        _save_inv_log(entries)
+
+    return jsonify({'ok': True})
+
+
+@app.route('/api/inventory-log', methods=['GET'])
+def get_inventory_log():
+    entries = _load_inv_log()
+    limit = request.args.get('limit', type=int)
+    if limit:
+        entries = entries[:limit]
+    return jsonify({'ok': True, 'entries': entries})
+
+
+@app.route('/api/inventory-log', methods=['POST'])
+def add_inventory_log():
+    entry = request.get_json(force=True)
+    entries = _load_inv_log()
+    entry['id']          = str(uuid.uuid4())
+    entry['server_time'] = _fmt_cst()
+    entries.insert(0, entry)
+    _save_inv_log(entries)
+    return jsonify({'ok': True, 'id': entry['id']})
 
 
 if __name__ == '__main__':

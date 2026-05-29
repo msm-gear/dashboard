@@ -30,10 +30,21 @@
     <button id="sport-All" onclick="setSport('All')" class="px-4 py-2 bg-purple-600 text-white font-semibold text-sm">All</button>
   </div>
 
+  <div class="relative" id="exclude-wrap">
+    <button onclick="toggleExclude()" id="exclude-btn"
+            class="flex items-center gap-2 px-4 py-2 bg-white border border-gray-200 rounded-xl text-sm font-semibold text-gray-600 hover:border-purple-400 transition-all">
+      <span id="exclude-label">Exclude orders</span>
+      <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+    </button>
+    <div id="exclude-menu" class="hidden absolute z-10 mt-1 left-0 bg-white border border-gray-200 rounded-xl shadow-lg py-1 min-w-64 max-h-64 overflow-y-auto">
+      <div id="exclude-list" class="px-1"></div>
+    </div>
+  </div>
+
 </div>
 
-<!-- Summary cards -->
-<div class="grid grid-cols-2 md:grid-cols-3 gap-4 mb-4">
+<!-- Summary cards row 1 -->
+<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
   <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
     <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">Order → Proofs</p>
     <p class="text-2xl font-bold text-gray-900" id="card-proofs">—</p>
@@ -49,7 +60,14 @@
     <p class="text-2xl font-bold text-gray-900" id="card-delivery">—</p>
     <p class="text-xs text-gray-400 mt-0.5">avg working days</p>
   </div>
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">Ship → Delivery</p>
+    <p class="text-2xl font-bold text-gray-900" id="card-ship-to-delivery">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">avg calendar days in transit</p>
+  </div>
 </div>
+
+<!-- Summary cards row 2 -->
 <div class="grid grid-cols-2 gap-4 mb-4">
   <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
     <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">% Delayed</p>
@@ -60,6 +78,25 @@
     <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">% Error</p>
     <p class="text-2xl font-bold" id="card-error">—</p>
     <p class="text-xs text-gray-400 mt-0.5">gear items received incorrectly</p>
+  </div>
+</div>
+
+<!-- Summary cards row 3 — gear KPIs (populated by loadGearStatus) -->
+<div class="grid grid-cols-3 gap-4 mb-4">
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">% Arrived</p>
+    <p class="text-2xl font-bold text-green-600" id="card-gear-arrived">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">of all ordered gear units</p>
+  </div>
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">% Shipped</p>
+    <p class="text-2xl font-bold text-orange-500" id="card-gear-shipped">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">in transit to markets</p>
+  </div>
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">% In Production</p>
+    <p class="text-2xl font-bold text-gray-500" id="card-gear-production">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">not yet shipped</p>
   </div>
 </div>
 
@@ -106,6 +143,20 @@
   </div>
 </div>
 
+<!-- Gear Status -->
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden mb-8">
+  <div class="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+    <h2 class="font-bold text-gray-800 text-base">Gear Status</h2>
+    <span class="text-xs text-gray-400" id="gear-status-updated"></span>
+  </div>
+  <div id="gear-status-body" class="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+    <div class="text-center text-gray-400 text-sm py-6 col-span-full">Loading…</div>
+  </div>
+</div>
+
+<!-- Floating tooltip -->
+<div id="gear-tip" style="display:none;position:fixed;z-index:9999;pointer-events:none;background:#1e293b;color:#f1f5f9;font-family:ui-monospace,monospace;font-size:12px;line-height:1.7;padding:8px 12px;border-radius:8px;white-space:pre;box-shadow:0 4px 16px rgba(0,0,0,.25)"></div>
+
 <!-- Per-market table -->
 <div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
   <div class="px-6 py-4 border-b border-gray-100">
@@ -120,12 +171,13 @@
           <th class="px-4 py-3 text-center">→ Proofs</th>
           <th class="px-4 py-3 text-center">→ Ship</th>
           <th class="px-4 py-3 text-center">→ Delivery</th>
+          <th class="px-4 py-3 text-center">Ship → Del</th>
           <th class="px-4 py-3 text-center">% Delayed</th>
           <th class="px-4 py-3 text-center">% Error</th>
         </tr>
       </thead>
       <tbody id="market-table" class="divide-y divide-gray-100">
-        <tr><td colspan="7" class="px-6 py-8 text-center text-gray-400 text-sm">Loading…</td></tr>
+        <tr><td colspan="8" class="px-6 py-8 text-center text-gray-400 text-sm">Loading…</td></tr>
       </tbody>
     </table>
   </div>
@@ -136,6 +188,16 @@
   let _season    = 'All';
   let _year      = 'All';
   let _sport     = 'All';
+  let _excluded  = new Set();
+
+  document.addEventListener('click', e => {
+    if (!document.getElementById('exclude-wrap').contains(e.target))
+      document.getElementById('exclude-menu').classList.add('hidden');
+  });
+
+  function toggleExclude() {
+    document.getElementById('exclude-menu').classList.toggle('hidden');
+  }
 
   function setSeason(s) {
     _season = s;
@@ -153,15 +215,13 @@
     const wrap = document.getElementById('sport-toggle');
     wrap.innerHTML = '';
     const allBtn = document.createElement('button');
-    allBtn.id = 'sport-All';
-    allBtn.onclick = () => setSport('All');
+    allBtn.id = 'sport-All'; allBtn.onclick = () => setSport('All');
     allBtn.textContent = 'All';
     allBtn.className = 'px-4 py-2 bg-purple-600 text-white font-semibold text-sm';
     wrap.appendChild(allBtn);
     sports.forEach(s => {
       const btn = document.createElement('button');
-      btn.id = 'sport-' + s;
-      btn.onclick = () => setSport(s);
+      btn.id = 'sport-' + s; btn.onclick = () => setSport(s);
       btn.textContent = s;
       btn.className = 'px-4 py-2 bg-white text-gray-600 hover:bg-gray-50 font-semibold text-sm';
       wrap.appendChild(btn);
@@ -184,15 +244,13 @@
     const wrap = document.getElementById('year-toggle');
     wrap.innerHTML = '';
     const allBtn = document.createElement('button');
-    allBtn.id = 'year-All';
-    allBtn.onclick = () => setYear('All');
+    allBtn.id = 'year-All'; allBtn.onclick = () => setYear('All');
     allBtn.textContent = 'All';
     allBtn.className = 'px-4 py-2 bg-purple-600 text-white font-semibold text-sm';
     wrap.appendChild(allBtn);
     years.forEach(y => {
       const btn = document.createElement('button');
-      btn.id = 'year-' + y;
-      btn.onclick = () => setYear(y);
+      btn.id = 'year-' + y; btn.onclick = () => setYear(y);
       btn.textContent = y;
       btn.className = 'px-4 py-2 bg-white text-gray-600 hover:bg-gray-50 font-semibold text-sm';
       wrap.appendChild(btn);
@@ -210,8 +268,35 @@
     render();
   }
 
+  function buildExcludeList() {
+    const el = document.getElementById('exclude-list');
+    el.innerHTML = '';
+    _allOrders.forEach(o => {
+      const row = document.createElement('label');
+      row.className = 'flex items-center gap-2 px-3 py-1.5 hover:bg-gray-50 cursor-pointer rounded-lg text-sm text-gray-700';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.className = 'rounded';
+      cb.checked = _excluded.has(o.id);
+      cb.onchange = () => {
+        if (cb.checked) _excluded.add(o.id); else _excluded.delete(o.id);
+        updateExcludeLabel();
+        render();
+      };
+      row.appendChild(cb);
+      row.appendChild(document.createTextNode(o.label));
+      el.appendChild(row);
+    });
+  }
+
+  function updateExcludeLabel() {
+    const n = _excluded.size;
+    document.getElementById('exclude-label').textContent =
+      n === 0 ? 'Exclude orders' : `Excluding ${n} order${n > 1 ? 's' : ''}`;
+  }
+
   function filtered() {
     return _allOrders.filter(o =>
+      !_excluded.has(o.id) &&
       (_season === 'All' || o.season === _season) &&
       (_year   === 'All' || o.year   === _year) &&
       (_sport  === 'All' || o.sport  === _sport)
@@ -230,9 +315,20 @@
   }
 
   function pctError(arr) {
-    const total = arr.reduce((s, o) => s + (o.received_count || 0), 0);
-    if (!total) return null;
-    return arr.reduce((s, o) => s + (o.error_count || 0), 0) / total * 100;
+    const remadeTotal  = arr.reduce((s, o) => s + (o.remake_qty || 0), 0);
+    const orderedTotal = arr.reduce((s, o) => s + (o.order_jersey_qty || 0), 0);
+    if (!orderedTotal) return null;
+    return remadeTotal / orderedTotal * 100;
+  }
+
+  function errorTip(arr) {
+    const remakes = arr.filter(o => (o.remake_qty || 0) > 0);
+    if (!remakes.length) return '';
+    return remakes.map(o => `${o.label}  —  ${o.remake_qty} remakes`).join('\n');
+  }
+
+  function fmtErrorItem(i) {
+    return `${i.market} ${i.gear_type} Order ${i.order} (Remake) — ${i.reason || 'issue'}: ${u(i.qty)}`;
   }
 
   function fmtDays(v) { return v !== null && v !== undefined ? v.toFixed(1) + ' d' : '—'; }
@@ -242,7 +338,6 @@
     if (v === null || v === undefined) return 'text-gray-400';
     return v > 0 ? 'text-red-600 font-semibold' : 'text-green-600 font-semibold';
   }
-
   function errorClass(v) {
     if (v === null || v === undefined) return 'text-gray-400';
     return v > 0 ? 'text-red-600 font-semibold' : 'text-green-600 font-semibold';
@@ -258,39 +353,76 @@
     return g;
   }
 
+  // ── Tooltip (status breakdown hovers) ───────────────────────────────────────
+  const _tip = (() => {
+    const el = document.createElement('div');
+    el.id = 'st-tooltip';
+    el.style.cssText = 'position:fixed;z-index:9999;pointer-events:none;display:none';
+    el.className = 'bg-gray-900 text-white text-xs rounded-xl shadow-xl px-3 py-2.5 max-w-xs';
+    document.body.appendChild(el);
+    return el;
+  })();
+
+  function showTip(e, orders) {
+    if (!orders.length) return;
+    _tip.innerHTML = orders.map(l => `<div class="py-0.5 leading-snug">${l}</div>`).join('');
+    _tip.style.display = 'block';
+    moveTip(e);
+  }
+
+  function moveTip(e) {
+    const pad = 12;
+    const tw = _tip.offsetWidth, th = _tip.offsetHeight;
+    let x = e.clientX + pad, y = e.clientY + pad;
+    if (x + tw > window.innerWidth  - pad) x = e.clientX - tw - pad;
+    if (y + th > window.innerHeight - pad) y = e.clientY - th - pad;
+    _tip.style.left = x + 'px';
+    _tip.style.top  = y + 'px';
+  }
+
+  function hideTip() { _tip.style.display = 'none'; }
+
   function setStatusCell(id, orders) {
     const el = document.getElementById(id);
     const n  = Array.isArray(orders) ? orders.length : orders;
+    const labels = Array.isArray(orders) ? orders.map(o => typeof o === 'string' ? o : o.label) : [];
     el.textContent = n === 0 ? '0' : (n || '—');
+    if (labels.length) {
+      el.style.cursor = 'default';
+      el.onmouseenter = e => showTip(e, labels);
+      el.onmousemove  = e => moveTip(e);
+      el.onmouseleave = hideTip;
+    } else {
+      el.style.cursor = '';
+      el.onmouseenter = el.onmousemove = el.onmouseleave = null;
+    }
   }
 
   function renderStatusBreakdown(data) {
     const ongoing   = data.filter(o => (o.current_phase ?? -1) < 4);
     const delivered = data.filter(o => (o.current_phase ?? -1) >= 4);
-    const og = statusGroups(ongoing);
-    const dl = statusGroups(delivered);
-    const tt = statusGroups(data);
-
-    setStatusCell('st-ongoing-total',      og.total);
-    setStatusCell('st-ongoing-behind',     og.behind);
-    setStatusCell('st-ongoing-ahead',      og.ahead);
-    setStatusCell('st-ongoing-onschedule', og.onschedule);
+    const og = statusGroups(ongoing), dl = statusGroups(delivered), tt = statusGroups(data);
+    setStatusCell('st-ongoing-total',        og.total);
+    setStatusCell('st-ongoing-behind',       og.behind);
+    setStatusCell('st-ongoing-ahead',        og.ahead);
+    setStatusCell('st-ongoing-onschedule',   og.onschedule);
     setStatusCell('st-delivered-total',      dl.total);
     setStatusCell('st-delivered-behind',     dl.behind);
     setStatusCell('st-delivered-ahead',      dl.ahead);
     setStatusCell('st-delivered-onschedule', dl.onschedule);
-    setStatusCell('st-total-total',      tt.total);
-    setStatusCell('st-total-behind',     tt.behind);
-    setStatusCell('st-total-ahead',      tt.ahead);
-    setStatusCell('st-total-onschedule', tt.onschedule);
+    setStatusCell('st-total-total',          tt.total);
+    setStatusCell('st-total-behind',         tt.behind);
+    setStatusCell('st-total-ahead',          tt.ahead);
+    setStatusCell('st-total-onschedule',     tt.onschedule);
   }
 
   function render() {
     const data = filtered();
 
-    document.getElementById('card-proofs').textContent   = fmtDays(avg(data, 'days_to_proofs'));
-    document.getElementById('card-ship').textContent     = fmtDays(avg(data, 'days_to_ship'));
-    document.getElementById('card-delivery').textContent = fmtDays(avg(data, 'days_to_delivery'));
+    document.getElementById('card-proofs').textContent            = fmtDays(avg(data, 'days_to_proofs'));
+    document.getElementById('card-ship').textContent              = fmtDays(avg(data, 'days_to_ship'));
+    document.getElementById('card-delivery').textContent          = fmtDays(avg(data, 'days_to_delivery'));
+    document.getElementById('card-ship-to-delivery').textContent  = fmtDays(avg(data, 'days_ship_to_delivery'));
 
     const delayEl = document.getElementById('card-delay');
     const dp = pctDelayed(data);
@@ -299,8 +431,9 @@
 
     const errorEl = document.getElementById('card-error');
     const ep = pctError(data);
-    errorEl.textContent = fmtPct(ep);
-    errorEl.className   = 'text-2xl font-bold ' + errorClass(ep);
+    errorEl.textContent  = fmtPct(ep);
+    errorEl.className    = 'text-2xl font-bold cursor-help ' + errorClass(ep);
+    errorEl.dataset.tip  = errorTip(data);
 
     renderStatusBreakdown(data);
 
@@ -309,22 +442,28 @@
 
     const tbody = document.getElementById('market-table');
     if (!Object.keys(markets).length) {
-      tbody.innerHTML = '<tr><td colspan="7" class="px-6 py-8 text-center text-gray-400 text-sm">No data for selected filters.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="8" class="px-6 py-8 text-center text-gray-400 text-sm">No data for selected filters.</td></tr>';
       return;
     }
-
     tbody.innerHTML = Object.entries(markets)
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([market, rows]) => {
-        const dp2 = pctDelayed(rows), ep2 = pctError(rows);
+        const mp  = avg(rows, 'days_to_proofs');
+        const ms  = avg(rows, 'days_to_ship');
+        const md  = avg(rows, 'days_to_delivery');
+        const msd = avg(rows, 'days_ship_to_delivery');
+        const dp2 = pctDelayed(rows);
+        const ep2 = pctError(rows);
+        const et  = errorTip(rows);
         return `<tr class="hover:bg-gray-50">
           <td class="px-6 py-3 font-semibold text-gray-800">${market}</td>
           <td class="px-4 py-3 text-center text-gray-500">${rows.length}</td>
-          <td class="px-4 py-3 text-center text-gray-700">${fmtDays(avg(rows, 'days_to_proofs'))}</td>
-          <td class="px-4 py-3 text-center text-gray-700">${fmtDays(avg(rows, 'days_to_ship'))}</td>
-          <td class="px-4 py-3 text-center text-gray-700">${fmtDays(avg(rows, 'days_to_delivery'))}</td>
+          <td class="px-4 py-3 text-center text-gray-700">${fmtDays(mp)}</td>
+          <td class="px-4 py-3 text-center text-gray-700">${fmtDays(ms)}</td>
+          <td class="px-4 py-3 text-center text-gray-700">${fmtDays(md)}</td>
+          <td class="px-4 py-3 text-center text-gray-700">${fmtDays(msd)}</td>
           <td class="px-4 py-3 text-center ${delayClass(dp2)}">${fmtPct(dp2)}</td>
-          <td class="px-4 py-3 text-center ${errorClass(ep2)}">${fmtPct(ep2)}</td>
+          <td class="px-4 py-3 text-center ${errorClass(ep2)}${et ? ' cursor-help' : ''}"${et ? ` data-tip="${et.replace(/"/g,'&quot;')}"` : ''}>${fmtPct(ep2)}</td>
         </tr>`;
       }).join('');
   }
@@ -341,6 +480,7 @@
         _allOrders = data.orders;
         buildYearToggle();
         buildSportToggle();
+        buildExcludeList();
         render();
         document.getElementById('last-loaded').textContent =
           `Last loaded ${new Date().toLocaleTimeString()}`;
@@ -353,6 +493,189 @@
     }
   }
 
+  // ── Gear Status ──────────────────────────────────────────────────────────────
+  const _expandedMarkets = new Set();
+
+  const u = n => `${(n||0).toLocaleString()} unit${(n||0)===1?'':'s'}`;
+
+  function fmtItemRows(items, showTn) {
+    const groups = new Map();
+    for (const i of (items || [])) {
+      const key = `${i.order}||${i.sport}`;
+      if (!groups.has(key)) groups.set(key, { order: i.order, sport: i.sport, qty: i.qty, tns: [] });
+      const g = groups.get(key);
+      if (i.tn && !g.tns.includes(i.tn)) g.tns.push(i.tn);
+    }
+    return [...groups.values()].map(g => {
+      const sport = (g.sport || '—').padEnd(5);
+      const order = `Order ${g.order}`.padEnd(9);
+      const qty   = `${(g.qty || 0).toLocaleString()} unit${(g.qty||0)===1?'':'s'}`.padEnd(11);
+      const tn    = showTn && g.tns.length ? `  TN: ${g.tns.map(t => `…${t.slice(-6)}`).join(', ')}` : '';
+      return `${sport}  ${order}  ${qty}${tn}`;
+    }).join('\n');
+  }
+
+  function gearTooltip(label, qty, items, showTn, extra) {
+    const rows = fmtItemRows(items || [], showTn);
+    const parts = [label];
+    if (rows) parts.push(rows);
+    if (extra && extra.length) parts.push(...extra);
+    return parts.join('\n');
+  }
+
+  function gearStatusHTML(market, d) {
+    const isExpanded = _expandedMarkets.has(market);
+
+    const arrivedGear = d.gear.filter(g => g.arrived > 0).map(g => `${g.gear_type} (${u(g.arrived)})`).join(', ');
+    const shippedGear = d.gear.filter(g => g.shipped > 0).map(g => `${g.gear_type} (${u(g.shipped)})`).join(', ');
+    const inProdGear  = d.gear.filter(g => g.in_production > 0).map(g => `${g.gear_type} (${u(g.in_production)})`).join(', ');
+    const errorRows   = d.gear.flatMap(g => (g.error_items || []).map(fmtErrorItem)).join('\n');
+    const arrivedTip  = [`Arrived: ${u(d.arrived)}`, arrivedGear].filter(Boolean).join('\n');
+    const shippedTip  = [`Shipped: ${u(d.shipped)}`, shippedGear].filter(Boolean).join('\n');
+    const inProdTip   = [`In Production: ${u(d.in_production)}`, inProdGear].filter(Boolean).join('\n');
+    const errorTip    = errorRows.trim();
+
+    const gearRows = d.gear.map(g => {
+      const ap = g.total ? Math.round(g.arrived       / g.total * 100) : 0;
+      const sp = g.total ? Math.round(g.shipped       / g.total * 100) : 0;
+      const ip = g.total ? Math.round(g.in_production / g.total * 100) : 0;
+      const ep = g.total ? Math.round((g.error || 0)  / g.total * 100) : 0;
+      const label = (ep > 0 && ap === 0 && sp === 0 && ip === 0) ? '⚠ Issue'
+                  : (ep > 0)                                       ? `⚠ ${ep}% issue`
+                  : (ip === 100)                                   ? 'Not shipped'
+                  : (ap === 100)                                   ? '100% arrived'
+                  : (ap === 0 && sp > 0)                          ? 'In transit'
+                  : `${ap}% arrived`;
+      const labelCls = (ep > 0)    ? 'text-red-500'
+                     : (ip === 100) ? 'text-gray-400'
+                     : (ap === 100) ? 'text-green-600'
+                     : 'text-orange-500';
+
+      let tip = '';
+      if (g.arrived > 0)       tip += gearTooltip('Arrived',       g.arrived,       g.arrived_items,       false, []) + '\n';
+      if (g.shipped > 0)       tip += gearTooltip('In Transit',    g.shipped,       g.shipped_items,       true,  []) + '\n';
+      if (g.in_production > 0) tip += gearTooltip('In Production', g.in_production, g.in_production_items, false, []) + '\n';
+      if (g.error > 0) {
+        const errLines = (g.error_items || []).map(i =>
+          `${i.market} ${i.gear_type} Order ${i.order} (Remake) — ${i.reason || 'issue'}: ${u(i.qty)}`
+        ).join('\n');
+        tip += errLines + '\n';
+      }
+      tip = tip.trim();
+      const tipAttr = tip ? ` data-tip="${tip.replace(/"/g, '&quot;')}"` : '';
+
+      return `<div class="flex items-center gap-2 py-1">
+        <span class="text-gray-600 text-xs w-24 shrink-0 truncate">${g.gear_type}</span>
+        <div class="flex-1 h-1.5 bg-gray-100 rounded-full overflow-hidden flex cursor-help"${tipAttr}>
+          ${ap > 0 ? `<div class="h-full bg-green-500"  style="width:${ap}%"></div>` : ''}
+          ${sp > 0 ? `<div class="h-full bg-orange-400" style="width:${sp}%"></div>` : ''}
+          ${ep > 0 ? `<div class="h-full bg-red-400"    style="width:${ep}%"></div>` : ''}
+          ${ip > 0 ? `<div class="h-full bg-gray-300"   style="width:${ip}%"></div>` : ''}
+        </div>
+        <span class="text-xs w-20 text-right shrink-0 ${labelCls} cursor-help"${tipAttr}>${label}</span>
+      </div>`;
+    }).join('');
+
+    return `<div class="border border-gray-200 rounded-xl p-4">
+      <button class="w-full flex items-center justify-between mb-3 text-left"
+              onclick="toggleGearMarket('${market}')">
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="font-semibold text-gray-800 text-sm">${market}</span>
+          ${d.arrived > 0       ? `<span class="text-xs text-green-600">${d.arrived.toLocaleString()} arrived</span>`         : ''}
+          ${d.shipped > 0       ? `<span class="text-xs text-orange-500">${d.shipped.toLocaleString()} in transit</span>`     : ''}
+          ${d.error > 0         ? `<span class="text-xs text-red-500 cursor-help" data-tip="${errorTip.replace(/"/g, '&quot;')}">${d.error.toLocaleString()} issue${d.error>1?'s':''}</span>` : ''}
+          ${d.in_production > 0 ? `<span class="text-xs text-gray-400">${d.in_production.toLocaleString()} in production</span>` : ''}
+        </div>
+        <span class="text-gray-400 text-xs">${isExpanded ? '▲' : '▼'}</span>
+      </button>
+      <div class="h-2.5 bg-gray-100 rounded-full overflow-hidden flex mb-3">
+        ${d.arrived_pct       > 0 ? `<div class="h-full bg-green-500"  style="width:${d.arrived_pct}%"></div>`                          : ''}
+        ${d.shipped_pct       > 0 ? `<div class="h-full bg-orange-400" style="width:${d.shipped_pct}%"></div>`                          : ''}
+        ${d.error > 0             ? `<div class="h-full bg-red-400"    style="width:${Math.max(d.error_pct,1)}%"></div>`               : ''}
+        ${d.in_production_pct > 0 ? `<div class="h-full bg-gray-300"   style="width:${d.in_production_pct}%"></div>`                   : ''}
+      </div>
+      <div class="flex flex-wrap gap-x-4 gap-y-0.5 text-xs">
+        <span class="text-green-600 font-medium cursor-help" data-tip="${arrivedTip.replace(/"/g, '&quot;')}">✓ ${d.arrived_pct}% Arrived</span>
+        <span class="text-orange-500 font-medium cursor-help" data-tip="${shippedTip.replace(/"/g, '&quot;')}">⬆ ${d.shipped_pct}% Shipped</span>
+        ${d.error > 0 ? `<span class="text-red-500 font-medium cursor-help" data-tip="${errorTip.replace(/"/g, '&quot;')}">⚠ ${d.error_pct > 0 ? d.error_pct+'%' : u(d.error)} Issues</span>` : ''}
+        <span class="text-gray-400 cursor-help" data-tip="${inProdTip.replace(/"/g, '&quot;')}">○ ${d.in_production_pct}% In Production</span>
+      </div>
+      ${isExpanded ? `<div class="mt-3 pt-3 border-t border-gray-100">${gearRows}</div>` : ''}
+    </div>`;
+  }
+
+  function toggleGearMarket(market) {
+    if (_expandedMarkets.has(market)) _expandedMarkets.delete(market);
+    else _expandedMarkets.add(market);
+    renderGearStatus(_lastGearData);
+  }
+
+  let _lastGearData = {};
+
+  function renderGearStatus(markets) {
+    _lastGearData = markets;
+    const body = document.getElementById('gear-status-body');
+    const keys  = Object.keys(markets);
+    if (!keys.length) {
+      body.innerHTML = '<div class="text-center text-gray-400 text-sm py-6 col-span-full">No data.</div>';
+      return;
+    }
+    body.innerHTML = keys
+      .sort((a, b) => markets[b].arrived_pct - markets[a].arrived_pct)
+      .map(m => gearStatusHTML(m, markets[m]))
+      .join('');
+
+    let totArr = 0, totShp = 0, totPrd = 0, totAll = 0;
+    for (const d of Object.values(markets)) {
+      totArr += d.arrived; totShp += d.shipped;
+      totPrd += d.in_production; totAll += d.total;
+    }
+    const fmtP = (n, t) => t ? Math.round(n / t * 100) + '%' : '—';
+    document.getElementById('card-gear-arrived').textContent    = fmtP(totArr, totAll);
+    document.getElementById('card-gear-shipped').textContent    = fmtP(totShp, totAll);
+    document.getElementById('card-gear-production').textContent = fmtP(totPrd, totAll);
+  }
+
+  async function loadGearStatus() {
+    try {
+      const resp = await fetch('/api/shipment-status');
+      const data = await resp.json();
+      if (data.ok) {
+        renderGearStatus(data.markets);
+        document.getElementById('gear-status-updated').textContent =
+          `Updated ${new Date().toLocaleTimeString()}`;
+      }
+    } catch(e) {
+      document.getElementById('gear-status-body').innerHTML =
+        `<div class="text-center text-red-400 text-sm py-6 col-span-full">Error: ${e.message}</div>`;
+    }
+  }
+
+  // ── Floating tooltip ──────────────────────────────────────────────────────────
+  (function () {
+    const tip = document.getElementById('gear-tip');
+    let cur = null;
+    document.addEventListener('mouseover', e => {
+      const el = e.target.closest('[data-tip]');
+      if (el === cur) return;
+      cur = el;
+      if (!el) { tip.style.display = 'none'; return; }
+      tip.textContent = el.dataset.tip;
+      tip.style.display = 'block';
+    });
+    document.addEventListener('mousemove', e => {
+      if (!cur) return;
+      const x = e.clientX + 14, y = e.clientY + 14;
+      tip.style.left = (x + tip.offsetWidth  > window.innerWidth  ? e.clientX - tip.offsetWidth  - 8 : x) + 'px';
+      tip.style.top  = (y + tip.offsetHeight > window.innerHeight ? e.clientY - tip.offsetHeight - 8 : y) + 'px';
+    });
+    document.addEventListener('mouseout', e => {
+      if (cur && !cur.contains(e.relatedTarget)) { cur = null; tip.style.display = 'none'; }
+    });
+  })();
+
   loadData();
+  loadGearStatus();
+  setInterval(() => { loadData(); loadGearStatus(); }, 60000);
 </script>
 {% endblock %}

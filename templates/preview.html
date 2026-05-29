@@ -62,7 +62,7 @@
       <select id="season" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300"
               onchange="updateMeta('season', this.value)">
         {% for s in seasons %}
-        <option value="{{ s }}" {% if meta.get('season', 'Fall') == s %}selected{% endif %}>{{ s }}</option>
+        <option value="{{ s }}" {% if meta.get('season', 'Summer') == s %}selected{% endif %}>{{ s }}</option>
         {% endfor %}
       </select>
     </div>
@@ -249,7 +249,7 @@
   // Hydrate data from server
   let shipmentData = {{ rows | tojson }};
   let shipmentMeta = Object.assign(
-    { sport: 'BSBL', season: 'Fall', order_date: '', ship_date: '{{ today }}', order_sheet_url: '' },
+    { sport: 'BSBL', season: 'Summer', order_date: '', ship_date: '{{ today }}', order_sheet_url: '' },
     {{ meta | tojson }}
   );
 

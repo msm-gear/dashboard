@@ -10,6 +10,27 @@
   </div>
 </div>
 
+<!-- ── Pending Orders Summary ─────────────────────────────────────────── -->
+<div id="ord-summary-wrap" class="bg-white rounded-2xl border border-gray-200 shadow-sm mb-6 overflow-hidden">
+  <div class="px-5 py-3 flex items-center justify-between bg-gray-50 border-b border-gray-100 cursor-pointer select-none"
+       onclick="toggleOrdSummary()">
+    <div class="flex items-center gap-3">
+      <span class="font-semibold text-gray-800 text-sm">Order Summary</span>
+      <span id="ord-summary-count" class="text-xs text-gray-400">Loading…</span>
+    </div>
+    <span id="ord-summary-chevron" class="text-gray-400 text-sm rotate-180">▼</span>
+  </div>
+  <div id="ord-summary-body">
+    <div class="px-5 py-6 text-center text-gray-400 text-sm">
+      <svg class="spin w-5 h-5 inline-block mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+      </svg>
+      Fetching from ClickUp…
+    </div>
+  </div>
+</div>
+
 {% if manual_tns %}
 <div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden mb-6">
   <div class="px-6 py-3 border-b border-gray-100 flex items-center justify-between">
@@ -253,7 +274,7 @@
                 class="w-full flex items-center justify-between px-6 py-3 hover:bg-white transition-colors text-left">
           <div class="flex items-center gap-2">
             <span class="text-sm font-semibold text-gray-800">{{ gear }}</span>
-            <span class="text-xs text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full">Not shipped</span>
+            <span class="text-xs text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full">No tracking #</span>
             <span id="cur-phase-{{ order.id }}-{{ gear }}"
                   class="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full"></span>
           </div>
@@ -880,5 +901,127 @@
   document.getElementById('bc-modal').addEventListener('click', function(e) {
     if (e.target === this) closeBcModal();
   });
+</script>
+
+<script>
+// ── Pending Orders Summary ──────────────────────────────────────────────────
+let _ordSummaryCollapsed = false;
+
+const PHASE_COLORS = {
+  0: 'bg-gray-100 text-gray-500',
+  1: 'bg-yellow-100 text-yellow-700',
+  2: 'bg-blue-100 text-blue-700',
+  3: 'bg-purple-100 text-purple-700',
+  4: 'bg-green-100 text-green-700',
+  5: 'bg-teal-100 text-teal-700',
+};
+const PHASE_LABELS_JS = ['Submitted','Proofs','Production','Shipped','Delivered','Counted'];
+
+function fmtSummaryDate(d) {
+  if (!d) return '—';
+  try {
+    return new Date(d + 'T12:00:00').toLocaleDateString('en-US', {month:'short', day:'numeric'});
+  } catch { return d; }
+}
+
+function toggleOrdSummary() {
+  _ordSummaryCollapsed = !_ordSummaryCollapsed;
+  const body    = document.getElementById('ord-summary-body');
+  const chevron = document.getElementById('ord-summary-chevron');
+  if (body)    body.classList.toggle('hidden', _ordSummaryCollapsed);
+  if (chevron) chevron.classList.toggle('rotate-180', !_ordSummaryCollapsed);
+}
+
+async function loadOrdSummary() {
+  try {
+    const resp = await fetch('/api/orders-summary');
+    const data = await resp.json();
+    if (!data.ok) { renderOrdSummaryEmpty('Failed to load'); return; }
+
+    const orders = data.orders || [];
+    document.getElementById('ord-summary-count').textContent =
+      `${orders.length} pending order${orders.length !== 1 ? 's' : ''}`;
+
+    if (!orders.length) {
+      renderOrdSummaryEmpty('No pending orders');
+      return;
+    }
+
+    const rows = orders.map(o => {
+      const phases   = o.gear_phases || {};
+      const gearList = Object.keys(phases);
+
+      // Phase summary: group gears by phase
+      const byPhase = {};
+      gearList.forEach(g => {
+        const p = phases[g];
+        const label = p !== null && p !== undefined ? (PHASE_LABELS_JS[p] || `Phase ${p}`) : '?';
+        (byPhase[label] = byPhase[label] || []).push(g);
+      });
+      const phaseSummary = Object.entries(byPhase).map(([label, gears]) => {
+        const p = PHASE_LABELS_JS.indexOf(label);
+        const cls = PHASE_COLORS[p] ?? 'bg-gray-100 text-gray-500';
+        return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold ${cls}">${label}
+          <span class="font-normal opacity-70">${gears.join(', ')}</span></span>`;
+      }).join(' ');
+
+      // Actual dates column
+      const actualParts = [];
+      if (o.proofs_act)  actualParts.push(`Proofs: ${fmtSummaryDate(o.proofs_act)}`);
+      if (o.ship_act)    actualParts.push(`Shipped: ${fmtSummaryDate(o.ship_act)}`);
+      if (o.delivery_act) actualParts.push(`Delivered: ${fmtSummaryDate(o.delivery_act)}`);
+
+      // Expected dates column — show the next upcoming date based on min phase
+      const minPhase = Math.min(...Object.values(phases).filter(p => p !== null && p !== undefined));
+      const estParts = [];
+      if (minPhase <= 2 && o.ship_est)            estParts.push(`Ship: ${fmtSummaryDate(o.ship_est)}`);
+      else if (minPhase === 3 && o.delivery_est)  estParts.push(`Delivery: ${fmtSummaryDate(o.delivery_est)}`);
+
+      return `<tr class="border-t border-gray-100 hover:bg-gray-50 transition-colors">
+        <td class="px-4 py-3 whitespace-nowrap">
+          <span class="font-semibold text-gray-900 text-xs">${o.market}</span>
+          <span class="text-gray-400 text-xs"> ${o.season} ${o.sport} · Order #${o.order_num}</span>
+        </td>
+        <td class="px-4 py-3 text-xs text-gray-600">
+          ${gearList.map(g => `<span class="inline-block bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full mr-1 mb-0.5">${g}</span>`).join('')}
+        </td>
+        <td class="px-4 py-3">${phaseSummary}</td>
+        <td class="px-4 py-3 text-xs text-gray-600 whitespace-nowrap">
+          ${actualParts.length ? actualParts.join('<br>') : '<span class="text-gray-300">—</span>'}
+        </td>
+        <td class="px-4 py-3 text-xs text-gray-600 whitespace-nowrap">
+          ${estParts.length ? estParts.join('<br>') : '<span class="text-gray-300">—</span>'}
+        </td>
+      </tr>`;
+    }).join('');
+
+    document.getElementById('ord-summary-body').innerHTML = `
+      <div class="overflow-x-auto">
+        <table class="w-full text-left">
+          <thead>
+            <tr class="text-xs font-semibold text-gray-400 uppercase tracking-wide border-b border-gray-100">
+              <th class="px-4 py-2">Order</th>
+              <th class="px-4 py-2">Gear</th>
+              <th class="px-4 py-2">Phase</th>
+              <th class="px-4 py-2">Actual Dates</th>
+              <th class="px-4 py-2">Expected Dates</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+
+  } catch (e) {
+    renderOrdSummaryEmpty('Error: ' + e.message);
+  }
+}
+
+function renderOrdSummaryEmpty(msg) {
+  document.getElementById('ord-summary-count').textContent = '';
+  document.getElementById('ord-summary-body').innerHTML =
+    `<p class="px-5 py-4 text-xs text-gray-400">${msg}</p>`;
+}
+
+loadOrdSummary();
 </script>
 {% endblock %}

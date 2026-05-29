@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{% block title %}MSM Shipment Tracker{% endblock %}</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  {% block head_extra %}{% endblock %}
   <style>
     body { font-family: 'Inter', system-ui, sans-serif; }
     .btn { @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg font-semibold text-sm transition-all; }
@@ -36,8 +37,14 @@
       <a href="/contents" class="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
         🔍 Contents
       </a>
+      <a href="/calendar" class="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
+        📅 Calendar
+      </a>
       <a href="/dashboard" class="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
         📊 Dashboard
+      </a>
+      <a href="/inventory" class="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
+        📦 Inventory
       </a>
       <a href="/settings" class="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
         ⚙️ Settings
@@ -45,6 +52,7 @@
     </div>
   </nav>
 
+  {% block full_width %}{% endblock %}
   <main class="max-w-5xl mx-auto px-6 py-8">
     {% block content %}{% endblock %}
   </main>

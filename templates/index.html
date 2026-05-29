@@ -55,46 +55,44 @@
   </form>
 </div>
 
-<div class="mt-8 bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
-  <h2 class="font-semibold text-gray-700 mb-3 text-sm uppercase tracking-wide">Expected File Format</h2>
-  <p class="text-gray-500 text-sm mb-3">Your packing list should follow the standard format:</p>
-  <div class="overflow-x-auto">
+{% if pl_rows %}
+<div class="mt-8 bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
+  <div class="px-6 py-3 border-b border-gray-100 flex items-center justify-between">
+    <h2 class="font-semibold text-gray-700 text-sm uppercase tracking-wide">Uploaded Packing Lists</h2>
+    <span class="text-xs text-gray-400">{{ pl_rows|length }} box entries</span>
+  </div>
+  <div class="overflow-x-auto max-h-80 overflow-y-auto">
     <table class="text-sm w-full border-collapse">
-      <thead>
+      <thead class="sticky top-0">
         <tr class="bg-gray-50 text-gray-600 text-left">
-          <th class="px-3 py-2 border border-gray-200 font-medium">Items</th>
+          <th class="px-3 py-2 border border-gray-200 font-medium">Item</th>
           <th class="px-3 py-2 border border-gray-200 font-medium">Contents</th>
-          <th class="px-3 py-2 border border-gray-200 font-medium">Weight</th>
-          <th class="px-3 py-2 border border-gray-200 font-medium">Declared Value</th>
+          <th class="px-3 py-2 border border-gray-200 font-medium">Weight (KG)</th>
+          <th class="px-3 py-2 border border-gray-200 font-medium">Declared ($)</th>
           <th class="px-3 py-2 border border-gray-200 font-medium">Tracking Number</th>
         </tr>
       </thead>
       <tbody class="text-gray-600">
-        <tr>
-          <td class="px-3 py-2 border border-gray-200">Dallas#1 tee-1</td>
-          <td class="px-3 py-2 border border-gray-200">YL-81 YXL-112</td>
-          <td class="px-3 py-2 border border-gray-200">21.7KG</td>
-          <td class="px-3 py-2 border border-gray-200">22$</td>
-          <td class="px-3 py-2 border border-gray-200">871507330118</td>
+        {% for row in pl_rows %}
+        <tr class="{% if loop.index is even %}bg-gray-50{% endif %}">
+          <td class="px-3 py-2 border border-gray-200 whitespace-nowrap">{{ row.item }}</td>
+          <td class="px-3 py-2 border border-gray-200 text-gray-500 max-w-xs truncate">{{ row.contents or '—' }}</td>
+          <td class="px-3 py-2 border border-gray-200">{{ row.weight or '—' }}</td>
+          <td class="px-3 py-2 border border-gray-200">{{ row.declared or '—' }}</td>
+          <td class="px-3 py-2 border border-gray-200 font-mono text-xs">{{ row.tn or '—' }}</td>
         </tr>
-        <tr class="bg-gray-50">
-          <td class="px-3 py-2 border border-gray-200">Dallas #1 jersey-2</td>
-          <td class="px-3 py-2 border border-gray-200">see attached</td>
-          <td class="px-3 py-2 border border-gray-200">23.86KG</td>
-          <td class="px-3 py-2 border border-gray-200">24$</td>
-          <td class="px-3 py-2 border border-gray-200"></td>
-        </tr>
+        {% endfor %}
       </tbody>
     </table>
   </div>
-  <p class="text-gray-400 text-xs mt-2">Item format: <code class="bg-gray-100 px-1 rounded">Market#OrderNum GearType-BoxNum</code></p>
 </div>
+{% endif %}
 
 {% if manual_rows %}
 <div class="mt-6 bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
   <div class="flex items-center justify-between mb-3">
     <h2 class="font-semibold text-gray-700 text-sm uppercase tracking-wide">Captured Tracking Numbers</h2>
-    <span class="text-xs text-gray-400">{{ manual_rows|length }} shipment(s) — edit weight &amp; declared value then save</span>
+    <span class="text-xs text-gray-400">{{ manual_rows|length }} shipment(s) — edit fields then save</span>
   </div>
   <div class="overflow-x-auto">
     <table class="text-sm w-full border-collapse">
@@ -102,8 +100,8 @@
         <tr class="bg-gray-50 text-gray-600 text-left">
           <th class="px-3 py-2 border border-gray-200 font-medium">Items</th>
           <th class="px-3 py-2 border border-gray-200 font-medium">Notes</th>
-          <th class="px-3 py-2 border border-gray-200 font-medium">Weight</th>
-          <th class="px-3 py-2 border border-gray-200 font-medium">Declared Value</th>
+          <th class="px-3 py-2 border border-gray-200 font-medium">Weight (KG)</th>
+          <th class="px-3 py-2 border border-gray-200 font-medium">Declared Value ($)</th>
           <th class="px-3 py-2 border border-gray-200 font-medium">Tracking Number</th>
           <th class="px-3 py-2 border border-gray-200 font-medium w-16"></th>
         </tr>
@@ -115,19 +113,28 @@
             <p class="font-medium text-gray-800">{{ row.gear_type }}</p>
             <p class="text-xs text-gray-400">{{ row.order_label }}</p>
           </td>
-          <td class="px-3 py-2 border border-gray-200 text-gray-500 text-xs">{{ row.notes or '—' }}</td>
+          <td class="px-3 py-2 border border-gray-200">
+            <input type="text"
+                   id="meta-notes-{{ loop.index }}"
+                   value="{{ row.notes }}"
+                   placeholder="{% if not row.notes %}fetching…{% else %}notes{% endif %}"
+                   data-order-id="{{ row.order_id }}"
+                   data-tn="{{ row.tn }}"
+                   data-has-notes="{{ 'true' if row.notes else 'false' }}"
+                   class="w-full border border-gray-200 rounded px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400 bg-white">
+          </td>
           <td class="px-3 py-2 border border-gray-200">
             <input type="text"
                    id="meta-weight-{{ loop.index }}"
                    value="{{ row.weight }}"
-                   placeholder="e.g. 21.7KG"
+                   placeholder="e.g. 21.7"
                    class="w-full border border-gray-200 rounded px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400 bg-white">
           </td>
           <td class="px-3 py-2 border border-gray-200">
             <input type="text"
                    id="meta-declared-{{ loop.index }}"
                    value="{{ row.declared_value }}"
-                   placeholder="e.g. 22$"
+                   placeholder="e.g. 22"
                    class="w-full border border-gray-200 rounded px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400 bg-white">
           </td>
           <td class="px-3 py-2 border border-gray-200 font-mono text-xs text-gray-700">{{ row.tn }}</td>
@@ -179,17 +186,40 @@
     }
   });
 
+  // Auto-fetch missing notes from ClickUp on page load
+  async function fetchMissingNotes() {
+    const inputs = document.querySelectorAll('[id^="meta-notes-"]');
+    for (const inp of inputs) {
+      if (inp.dataset.hasNotes === 'true') continue;
+      const orderId = inp.dataset.orderId;
+      const tn      = inp.dataset.tn;
+      try {
+        const res  = await fetch(`/api/fetch-shipment-notes?order_id=${encodeURIComponent(orderId)}&tn=${encodeURIComponent(tn)}`);
+        const data = await res.json();
+        if (data.ok && data.notes) {
+          inp.value = data.notes;
+          inp.placeholder = 'notes';
+          inp.dataset.hasNotes = 'true';
+        } else {
+          inp.placeholder = '—';
+        }
+      } catch { inp.placeholder = '—'; }
+    }
+  }
+  fetchMissingNotes();
+
   async function saveShipmentMeta(idx, orderId, tn) {
     const btn      = document.getElementById('meta-save-' + idx);
-    const weight   = document.getElementById('meta-weight-' + idx)?.value.trim() || '';
-    const declared = document.getElementById('meta-declared-' + idx)?.value.trim() || '';
+    const notes    = document.getElementById('meta-notes-'   + idx)?.value.trim() ?? null;
+    const weight   = document.getElementById('meta-weight-'  + idx)?.value.trim() || '';
+    const declared = document.getElementById('meta-declared-'+ idx)?.value.trim() || '';
     btn.disabled = true;
     btn.textContent = '…';
     try {
       const res = await fetch('/api/update-shipment-meta', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ order_id: orderId, tracking_number: tn, weight, declared_value: declared }),
+        body: JSON.stringify({ order_id: orderId, tracking_number: tn, weight, declared_value: declared, notes }),
       });
       if (res.ok) {
         btn.textContent = '✓';

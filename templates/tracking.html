@@ -119,7 +119,8 @@ function carrierUrl(tn, carrier) {
 }
 
 // ── Stuck detection ──────────────────────────────────────────────────────────
-const TWO_DAYS_MS = 2 * 24 * 60 * 60 * 1000;
+const TWO_DAYS_MS  = 2 * 24 * 60 * 60 * 1000;
+const FIVE_DAYS_MS = 5 * 24 * 60 * 60 * 1000;
 
 function stuckInfo(s, order) {
   if (s.tag === 'Delivered' || s.tag === 'Pending') return null;
@@ -132,6 +133,44 @@ function stuckInfo(s, order) {
 
   const days = Math.floor(elapsed / 86400000);
   return days;
+}
+
+// Returns days stuck at ClearedCustoms (≥5), or null
+function customsStuck(s) {
+  if (s.tag !== 'ClearedCustoms') return null;
+  const ref = s.updated_at;
+  if (!ref) return null;
+  const elapsed = Date.now() - new Date(ref);
+  if (elapsed < FIVE_DAYS_MS) return null;
+  return Math.floor(elapsed / 86400000);
+}
+
+// US state abbreviations list (for extracting state from location strings)
+const US_STATES = new Set(['AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL',
+  'IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ',
+  'NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA',
+  'WV','WI','WY','DC']);
+
+function extractState(locationStr) {
+  if (!locationStr) return null;
+  // Match ", XX" or "XX, " where XX is a US state abbreviation
+  const m = locationStr.match(/,\s*([A-Z]{2})\b/) || locationStr.match(/\b([A-Z]{2})\s*,/);
+  if (m && US_STATES.has(m[1])) return m[1];
+  return null;
+}
+
+// Returns off-route info {locationState, destState} if package is in wrong US state, or null
+function offRoute(s, order) {
+  // Only flag when actively in US transit or out for delivery — not pre-customs or delivered
+  if (!['USTransit', 'OutForDelivery'].includes(s.tag)) return null;
+  if (!order.dest_state || !s.location) return null;
+  const locState = extractState(s.location);
+  if (!locState) return null;
+  if (locState === order.dest_state) return null;
+  // FedEx hub states that are normal waypoints for any US destination — don't flag
+  const HUB_STATES = new Set(['TN', 'IN', 'TX', 'CA', 'IL', 'OH', 'GA', 'NY', 'NJ']);
+  if (HUB_STATES.has(locState)) return null;
+  return { locationState: locState, destState: order.dest_state, location: s.location };
 }
 
 // ── Progress stepper ──────────────────────────────────────────────────────────
@@ -190,9 +229,11 @@ function buildSummaryText(s, order) {
     '',
     `Tracking: ${s.tracking_number} (${(s.carrier || 'FedEx').toUpperCase()})`,
   ];
-  if (s.gear_summary && s.gear_summary.length) {
+  const groups = (s.gear_groups && s.gear_groups.length) ? s.gear_groups
+    : (s.gear_summary || []).filter(g => g.boxes > 0).map(g => `${g.gear} × ${g.boxes} box${g.boxes !== 1 ? 'es' : ''}`);
+  if (groups.length) {
     lines.push('Contents:');
-    s.gear_summary.forEach(g => lines.push(`  • ${g.gear} × ${g.boxes} box${g.boxes !== 1 ? 'es' : ''}`));
+    groups.forEach(g => lines.push(`  • ${g}`));
   }
   lines.push(`Status: ${emoji} ${info.label}`);
   if (s.notes) lines.push(`Notes: ${s.notes}`);
@@ -223,12 +264,15 @@ function renderShipment(s, order, idx) {
   const uid      = `${orderId.slice(0,8)}-${idx}`;
   const selId    = `sel-${uid}`;
   const notesId  = `notes-${uid}`;
-  const info     = ALL_STATUSES.find(st => st.tag === s.tag) || { label: s.status_label, color: 'gray' };
-  const stuck    = stuckInfo(s, order);
+  const info         = ALL_STATUSES.find(st => st.tag === s.tag) || { label: s.status_label, color: 'gray' };
+  const stuck        = stuckInfo(s, order);
+  const customsDays  = customsStuck(s);
+  const routeIssue   = offRoute(s, order);
 
-  const gearTags = s.gear_summary.map(g =>
-    `<span class="inline-block bg-gray-100 text-gray-700 text-xs px-2.5 py-1 rounded-full font-medium">
-      ${g.gear} × ${g.boxes} box${g.boxes !== 1 ? 'es' : ''}</span>`
+  const gearTagList = (s.gear_groups && s.gear_groups.length) ? s.gear_groups
+    : (s.gear_summary || []).filter(g => g.boxes > 0).map(g => `${g.gear} × ${g.boxes} box${g.boxes !== 1 ? 'es' : ''}`);
+  const gearTags = gearTagList.map(g =>
+    `<span class="inline-block bg-gray-100 text-gray-700 text-xs px-2.5 py-1 rounded-full font-medium">${g}</span>`
   ).join(' ');
 
   const statusOpts = ALL_STATUSES.map(st =>
@@ -245,12 +289,31 @@ function renderShipment(s, order, idx) {
          class="ml-auto text-orange-700 font-semibold underline whitespace-nowrap">Check FedEx →</a>
     </div>` : '';
 
-  const cardBorder = stuck ? 'border-orange-300 bg-orange-50/30' : 'border-gray-100 bg-white';
+  const customsBanner = customsDays ? `
+    <div class="flex items-center gap-2 bg-red-50 border border-red-300 rounded-lg px-3 py-2 mb-3 text-sm text-red-800">
+      <span class="text-base">🛃</span>
+      <span>Stuck at customs for <strong>${customsDays} day${customsDays !== 1 ? 's' : ''}</strong> — no location change since clearing</span>
+      <a href="${carrierUrl(s.tracking_number, s.carrier)}" target="_blank"
+         class="ml-auto text-red-700 font-semibold underline whitespace-nowrap">Check FedEx →</a>
+    </div>` : '';
+
+  const routeBanner = routeIssue ? `
+    <div class="flex items-center gap-2 bg-yellow-50 border border-yellow-300 rounded-lg px-3 py-2 mb-3 text-sm text-yellow-800">
+      <span class="text-base">🗺️</span>
+      <span>Package in <strong>${routeIssue.location}</strong> — expected destination is <strong>${order.dest_city}, ${routeIssue.destState}</strong></span>
+      <a href="${carrierUrl(s.tracking_number, s.carrier)}" target="_blank"
+         class="ml-auto text-yellow-700 font-semibold underline whitespace-nowrap">Check FedEx →</a>
+    </div>` : '';
+
+  const cardBorder = customsDays ? 'border-red-300 bg-red-50/20'
+                   : stuck       ? 'border-orange-300 bg-orange-50/30'
+                   : routeIssue  ? 'border-yellow-300 bg-yellow-50/20'
+                   :               'border-gray-100 bg-white';
 
   return `
   <div class="border ${cardBorder} rounded-xl p-4 mb-3 hover:shadow-sm transition-shadow">
 
-    ${stuckBanner}
+    ${customsBanner}${stuckBanner}${routeBanner}
 
     <!-- Top row: tracking # + gear -->
     <div class="flex items-start justify-between gap-4 mb-4">
@@ -326,7 +389,9 @@ function renderOrder(order) {
   const allDone        = total > 0 && deliveredCount === total;
   const progressColor  = allDone ? 'text-green-600 font-semibold' : 'text-gray-500';
 
-  const stuckCount = order.shipments.filter(s => stuckInfo(s, order)).length;
+  const stuckCount   = order.shipments.filter(s => stuckInfo(s, order)).length;
+  const customsCount = order.shipments.filter(s => customsStuck(s)).length;
+  const routeCount   = order.shipments.filter(s => offRoute(s, order)).length;
 
   const cards = order.shipments.length === 0
     ? `<p class="text-gray-400 text-sm py-4">No tracking numbers on record for this order.</p>`
@@ -341,7 +406,9 @@ function renderOrder(order) {
         ${order.order_date ? `<span class="text-gray-400 text-xs ml-3">Ordered ${fmtDate(order.order_date)}</span>` : ''}
       </div>
       <div class="flex items-center gap-3">
+        ${customsCount ? `<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-red-100 text-red-800">🛃 ${customsCount} customs hold</span>` : ''}
         ${stuckCount ? `<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-orange-100 text-orange-800">⚠️ ${stuckCount} stuck</span>` : ''}
+        ${routeCount ? `<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-yellow-100 text-yellow-800">🗺️ ${routeCount} off route</span>` : ''}
         <span class="text-sm ${progressColor}">${deliveredCount}/${total} delivered</span>
       </div>
     </div>
@@ -473,6 +540,114 @@ async function syncDelivered(orderId, tn, dateInputId, uid) {
   }
 }
 
+// ── Tracking summary table ────────────────────────────────────────────────────
+let _summaryCollapsed = false;
+
+function renderSummaryTable(orders) {
+  // Flatten all shipments across all orders
+  const rows = [];
+  orders.forEach(order => {
+    order.shipments.forEach(s => {
+      rows.push({ s, order });
+    });
+  });
+  if (!rows.length) return '';
+
+  // Sort: active (non-Delivered, non-Pending) first, then Pending, then Delivered
+  const rank = tag => tag === 'Delivered' ? 2 : tag === 'Pending' ? 1 : 0;
+  rows.sort((a, b) => rank(a.s.tag) - rank(b.s.tag));
+
+  const STATUS_EMOJI = {
+    Pending:'⏳', LabelCreated:'🏷️', PickedUp:'📬', InTransitIntl:'✈️',
+    AtCustoms:'🛃', ClearedCustoms:'✅', InTransitDom:'🚛',
+    OutForDelivery:'🚚', Delivered:'📦', Exception:'🚨'
+  };
+
+  const rowsHtml = rows.map(({ s, order }) => {
+    const info     = ALL_STATUSES.find(st => st.tag === s.tag) || { label: s.tag, color: 'gray' };
+    const c        = STATUS_COLORS[info.color] || STATUS_COLORS.gray;
+    const emoji    = STATUS_EMOJI[s.tag] || '📦';
+    const gearList = (s.gear_groups && s.gear_groups.length) ? s.gear_groups
+      : (s.gear_summary || []).filter(g => g.boxes > 0).map(g => `${g.gear} × ${g.boxes} box${g.boxes !== 1 ? 'es' : ''}`);
+    const gearStr  = gearList.join(' · ') || '—';
+
+    // Status + location + date
+    const locStr   = s.location ? ` (${s.location})` : '';
+    const dateStr  = s.updated_at
+      ? new Date(s.updated_at).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})
+      : '';
+
+    // Alert indicators
+    const isStuck   = !!stuckInfo(s, order);
+    const isCustoms = !!customsStuck(s);
+    const isRoute   = !!offRoute(s, order);
+    const alertDot  = isCustoms ? '<span class="w-1.5 h-1.5 rounded-full bg-red-500 inline-block mr-1 flex-shrink-0"></span>'
+                    : isStuck   ? '<span class="w-1.5 h-1.5 rounded-full bg-orange-400 inline-block mr-1 flex-shrink-0"></span>'
+                    : isRoute   ? '<span class="w-1.5 h-1.5 rounded-full bg-yellow-400 inline-block mr-1 flex-shrink-0"></span>'
+                    : '';
+
+    return `<tr class="border-t border-gray-100 hover:bg-gray-50 transition-colors">
+      <td class="px-4 py-2.5 whitespace-nowrap">
+        <div class="flex items-center gap-1">
+          ${alertDot}
+          <a href="${carrierUrl(s.tracking_number, s.carrier)}" target="_blank" rel="noopener"
+             class="font-mono text-blue-600 hover:underline text-xs font-semibold">${s.tracking_number}</a>
+        </div>
+      </td>
+      <td class="px-4 py-2.5 text-xs text-gray-700 whitespace-nowrap">
+        <span class="font-semibold">${order.market}</span>
+        <span class="text-gray-400"> ${order.season} ${order.sport} · Order #${order.order_num}</span>
+      </td>
+      <td class="px-4 py-2.5 text-xs text-gray-600 max-w-xs truncate">${gearStr}</td>
+      <td class="px-4 py-2.5 whitespace-nowrap">
+        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold ${c.bg} ${c.text}">
+          ${emoji} ${info.label}${locStr}
+        </span>
+      </td>
+      <td class="px-4 py-2.5 text-xs text-gray-400 whitespace-nowrap">${dateStr}</td>
+    </tr>`;
+  }).join('');
+
+  const deliveredCount = rows.filter(r => r.s.tag === 'Delivered').length;
+  const totalCount     = rows.length;
+
+  return `
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm mb-6 overflow-hidden">
+    <div class="px-5 py-3 flex items-center justify-between bg-gray-50 border-b border-gray-100 cursor-pointer select-none"
+         onclick="toggleSummary()">
+      <div class="flex items-center gap-3">
+        <span class="font-semibold text-gray-800 text-sm">Tracking Summary</span>
+        <span class="text-xs text-gray-400">${totalCount} shipment${totalCount !== 1 ? 's' : ''} · ${deliveredCount} delivered</span>
+      </div>
+      <span id="summary-chevron" class="text-gray-400 text-sm transition-transform ${_summaryCollapsed ? '' : 'rotate-180'}">▼</span>
+    </div>
+    <div id="summary-body" class="${_summaryCollapsed ? 'hidden' : ''}">
+      <div class="overflow-x-auto">
+        <table class="w-full text-left">
+          <thead>
+            <tr class="text-xs font-semibold text-gray-400 uppercase tracking-wide">
+              <th class="px-4 py-2">Tracking #</th>
+              <th class="px-4 py-2">Order</th>
+              <th class="px-4 py-2">Contents</th>
+              <th class="px-4 py-2">Status</th>
+              <th class="px-4 py-2">Date</th>
+            </tr>
+          </thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </div>
+    </div>
+  </div>`;
+}
+
+function toggleSummary() {
+  _summaryCollapsed = !_summaryCollapsed;
+  const body    = document.getElementById('summary-body');
+  const chevron = document.getElementById('summary-chevron');
+  if (body)    body.classList.toggle('hidden', _summaryCollapsed);
+  if (chevron) chevron.classList.toggle('rotate-180', !_summaryCollapsed);
+}
+
 // ── Load ──────────────────────────────────────────────────────────────────────
 async function loadOrders() {
   document.getElementById('refreshIcon').classList.add('spin');
@@ -489,13 +664,18 @@ async function loadOrders() {
         </div>`;
       return;
     }
-    const totalStuck = data.orders.reduce((n, o) =>
-      n + o.shipments.filter(s => stuckInfo(s, o)).length, 0);
+    const totalStuck   = data.orders.reduce((n, o) => n + o.shipments.filter(s => stuckInfo(s, o)).length, 0);
+    const totalCustoms = data.orders.reduce((n, o) => n + o.shipments.filter(s => customsStuck(s)).length, 0);
+    const totalRoute   = data.orders.reduce((n, o) => n + o.shipments.filter(s => offRoute(s, o)).length, 0);
 
-    const topAlert = totalStuck > 0
-      ? `<div class="bg-orange-50 border border-orange-200 rounded-xl px-5 py-3 mb-5 flex items-center gap-3 text-sm text-orange-800">
-           <span class="text-lg">⚠️</span>
-           <span><strong>${totalStuck} shipment${totalStuck !== 1 ? 's' : ''}</strong> with no status update for 2+ days.</span>
+    const alertLines = [];
+    if (totalCustoms) alertLines.push(`🛃 <strong>${totalCustoms} shipment${totalCustoms !== 1 ? 's' : ''}</strong> stuck at customs for 5+ days`);
+    if (totalStuck)   alertLines.push(`⚠️ <strong>${totalStuck} shipment${totalStuck !== 1 ? 's' : ''}</strong> with no status update for 2+ days`);
+    if (totalRoute)   alertLines.push(`🗺️ <strong>${totalRoute} shipment${totalRoute !== 1 ? 's' : ''}</strong> may be off route`);
+
+    const topAlert = alertLines.length
+      ? `<div class="bg-orange-50 border border-orange-200 rounded-xl px-5 py-3 mb-5 flex flex-col gap-1 text-sm text-orange-800">
+           ${alertLines.map(l => `<div>${l}</div>`).join('')}
          </div>` : '';
 
     // Show/hide FedEx controls
@@ -505,7 +685,8 @@ async function loadOrders() {
       document.getElementById('lastCheckTime').textContent = data.last_auto_check || 'not yet';
     }
 
-    document.getElementById('content').innerHTML = topAlert + data.orders.map(renderOrder).join('');
+    const summary = renderSummaryTable(data.orders);
+    document.getElementById('content').innerHTML = topAlert + summary + data.orders.map(renderOrder).join('');
   } catch (e) {
     document.getElementById('content').innerHTML =
       `<div class="bg-red-50 border border-red-200 rounded-lg p-5 text-red-700 text-sm">Failed to load: ${e.message}</div>`;

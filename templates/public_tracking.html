@@ -29,14 +29,16 @@
 
 <script>
 const ALL_STATUSES = [
-  { tag:'Pending',         label:'Pending',          color:'gray'   },
-  { tag:'LabelCreated',    label:'Label Created',     color:'gray'   },
-  { tag:'InTransit',       label:'In Transit',        color:'blue'   },
-  { tag:'InTransitIntl',   label:'In Transit (Intl)', color:'blue'   },
-  { tag:'OutForDelivery',  label:'Out for Delivery',  color:'orange' },
-  { tag:'Delivered',       label:'Delivered',         color:'green'  },
-  { tag:'Exception',       label:'Exception',         color:'red'    },
-  { tag:'Expired',         label:'Expired',           color:'red'    },
+  { tag:'Pending',         label:'Pending',                   color:'gray'   },
+  { tag:'LabelCreated',    label:'Label Created',             color:'gray'   },
+  { tag:'PickedUp',        label:'Picked Up',                 color:'gray'   },
+  { tag:'InTransitIntl',   label:'In Transit (Intl)',         color:'blue'   },
+  { tag:'AtCustoms',       label:'At US Customs',             color:'orange' },
+  { tag:'ClearedCustoms',  label:'Cleared Customs',           color:'blue'   },
+  { tag:'InTransitDom',    label:'In Transit',                color:'blue'   },
+  { tag:'OutForDelivery',  label:'Out for Delivery',          color:'orange' },
+  { tag:'Delivered',       label:'Delivered',                 color:'green'  },
+  { tag:'Exception',       label:'Exception / Delay',         color:'red'    },
 ];
 
 function badge(label, color) {
@@ -120,25 +122,25 @@ async function loadOrders() {
   const icon = document.getElementById('refreshIcon');
   icon.classList.add('spin');
   try {
-    const resp = await fetch('/api/shipments');
+    const resp = await fetch('/api/tracking-status');
     const data = await resp.json();
     const container = document.getElementById('content');
-    if (!data.length) {
+    const orders = data.orders || [];
+    const withShipments = orders.filter(o => o.shipments?.length);
+    if (!withShipments.length) {
       container.innerHTML = '<p class="text-center text-gray-400 py-12">No shipments yet.</p>';
       return;
     }
-    container.innerHTML = data.map(order => {
-      if (!order.shipments?.length) return '';
-      return `
-        <div class="mb-6">
-          <p class="text-sm font-semibold text-gray-600 mb-2">${order.market} ${order.season} ${order.sport} #${order.order_num}</p>
-          ${order.shipments.map((s, i) => renderShipment(s, order, i)).join('')}
-        </div>`;
-    }).join('');
+    container.innerHTML = withShipments.map(order => `
+      <div class="mb-6">
+        <p class="text-sm font-semibold text-gray-600 mb-2">${order.market} ${order.season} ${order.sport} #${order.order_num}</p>
+        ${order.shipments.map((s, i) => renderShipment(s, order, i)).join('')}
+      </div>`).join('');
   } finally {
     icon.classList.remove('spin');
   }
 }
 loadOrders();
+setInterval(loadOrders, 60000);
 </script>
 {% endblock %}
