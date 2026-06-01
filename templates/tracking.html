@@ -115,7 +115,7 @@ function carrierUrl(tn, carrier) {
     usps:  `https://tools.usps.com/go/TrackConfirmAction?tLabels=${tn}`,
     dhl:   `https://www.dhl.com/us-en/home/tracking/tracking-express.html?submit=1&tracking-id=${tn}`,
   };
-  return m[carrier] || m.fedex;
+  return m[(carrier || '').toLowerCase()] || m.fedex;
 }
 
 // ── Stuck detection ──────────────────────────────────────────────────────────

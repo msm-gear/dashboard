@@ -198,9 +198,19 @@
         Created {{ order.get('created_at', '')[:10] }}
         {% if order.get('shipped_at') %} · Shipped {{ order.shipped_at[:10] }}{% endif %}
       </p>
+      <div class="mt-1">
+        {% if order.get('supplier') == 'Team Green' %}
+          <span class="inline-block text-xs font-semibold bg-green-100 text-green-700 px-2 py-0.5 rounded-full">🌿 Team Green</span>
+        {% elif order.get('supplier') == 'LNX' %}
+          <span class="inline-block text-xs font-semibold bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">🔵 LNX</span>
+        {% else %}
+          <span id="supplier-badge-{{ order.id }}" class="text-xs text-gray-300 cursor-pointer hover:text-gray-500"
+                onclick="loadSupplier('{{ order.id }}')">— supplier</span>
+        {% endif %}
+      </div>
       <div class="flex flex-wrap gap-1.5 mt-2">
         {% for gear in order.gear_tasks.keys() %}
-        <span class="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{{ gear }}</span>
+        <span class="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{{ gear | gear_display }}</span>
         {% endfor %}
       </div>
     </div>
@@ -247,7 +257,7 @@
                     onclick="toggleGear('{{ order.id }}', '{{ g.gear }}')"
                     class="w-full flex items-center justify-between px-6 py-3 hover:bg-white transition-colors text-left">
               <div class="flex items-center gap-2">
-                <span class="text-sm font-semibold text-gray-800">{{ g.gear }}</span>
+                <span class="text-sm font-semibold text-gray-800">{{ g.gear | gear_display }}</span>
                 <span class="text-xs text-gray-400">× {{ g.boxes }}</span>
                 <span id="cur-phase-{{ order.id }}-{{ g.gear }}"
                       class="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full"></span>
@@ -273,7 +283,7 @@
                 onclick="toggleGear('{{ order.id }}', '{{ gear }}')"
                 class="w-full flex items-center justify-between px-6 py-3 hover:bg-white transition-colors text-left">
           <div class="flex items-center gap-2">
-            <span class="text-sm font-semibold text-gray-800">{{ gear }}</span>
+            <span class="text-sm font-semibold text-gray-800">{{ gear | gear_display }}</span>
             <span class="text-xs text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full">No tracking #</span>
             <span id="cur-phase-{{ order.id }}-{{ gear }}"
                   class="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full"></span>
@@ -297,7 +307,7 @@
                 onclick="toggleGear('{{ order.id }}', '{{ gear }}')"
                 class="w-full flex items-center justify-between px-6 py-3 hover:bg-white transition-colors text-left">
           <div class="flex items-center gap-2">
-            <span class="text-sm font-semibold text-gray-800">{{ gear }}</span>
+            <span class="text-sm font-semibold text-gray-800">{{ gear | gear_display }}</span>
             <span id="cur-phase-{{ order.id }}-{{ gear }}"
                   class="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full"></span>
           </div>
@@ -901,6 +911,34 @@
   document.getElementById('bc-modal').addEventListener('click', function(e) {
     if (e.target === this) closeBcModal();
   });
+
+  // ── Supplier badges ────────────────────────────────────────────────────────
+  async function loadSupplier(orderId) {
+    const el = document.getElementById('supplier-badge-' + orderId);
+    if (!el) return;
+    el.textContent = '…';
+    try {
+      const res  = await fetch(`/api/fetch-supplier/${orderId}`);
+      const data = await res.json();
+      if (data.ok && data.supplier) {
+        const isChina = data.supplier === 'Team Green';
+        el.className = `inline-block text-xs font-semibold px-2 py-0.5 rounded-full ${isChina ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`;
+        el.textContent = isChina ? '🌿 Team Green' : '🔵 LNX';
+        el.onclick = null;
+      } else {
+        el.textContent = '— supplier';
+        el.className = 'text-xs text-gray-300 cursor-pointer hover:text-gray-500';
+      }
+    } catch { el.textContent = '— supplier'; }
+  }
+
+  // Auto-load suppliers for all orders on page open
+  document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('[id^="supplier-badge-"]').forEach(el => {
+      const orderId = el.id.replace('supplier-badge-', '');
+      loadSupplier(orderId);
+    });
+  });
 </script>
 
 <script>
@@ -952,18 +990,30 @@ async function loadOrdSummary() {
       const gearList = Object.keys(phases);
 
       // Phase summary: group gears by phase
+      const phaseVals = Object.values(phases).filter(p => p !== null && p !== undefined);
+      const allDelivered = phaseVals.length > 0 && phaseVals.every(p => p >= 4);
+      const allShipped   = phaseVals.length > 0 && phaseVals.every(p => p >= 3);
+
       const byPhase = {};
       gearList.forEach(g => {
         const p = phases[g];
         const label = p !== null && p !== undefined ? (PHASE_LABELS_JS[p] || `Phase ${p}`) : '?';
         (byPhase[label] = byPhase[label] || []).push(g);
       });
-      const phaseSummary = Object.entries(byPhase).map(([label, gears]) => {
+      const phaseBadges = Object.entries(byPhase).map(([label, gears]) => {
         const p = PHASE_LABELS_JS.indexOf(label);
         const cls = PHASE_COLORS[p] ?? 'bg-gray-100 text-gray-500';
         return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold ${cls}">${label}
           <span class="font-normal opacity-70">${gears.join(', ')}</span></span>`;
       }).join(' ');
+
+      const statusFlag = allDelivered
+        ? `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-700 mt-1">✅ All Delivered</span>`
+        : allShipped
+        ? `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-purple-100 text-purple-700 mt-1">📦 All Shipped</span>`
+        : '';
+
+      const phaseSummary = phaseBadges;
 
       // Actual dates column
       const actualParts = [];
@@ -981,6 +1031,7 @@ async function loadOrdSummary() {
         <td class="px-4 py-3 whitespace-nowrap">
           <span class="font-semibold text-gray-900 text-xs">${o.market}</span>
           <span class="text-gray-400 text-xs"> ${o.season} ${o.sport} · Order #${o.order_num}</span>
+          ${statusFlag ? `<div class="mt-1">${statusFlag}</div>` : ''}
         </td>
         <td class="px-4 py-3 text-xs text-gray-600">
           ${gearList.map(g => `<span class="inline-block bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full mr-1 mb-0.5">${g}</span>`).join('')}

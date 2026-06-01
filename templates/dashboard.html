@@ -659,10 +659,11 @@
     const errorTip    = errorRows.trim();
 
     const gearRows = d.gear.map(g => {
-      const ap = g.total ? Math.round(g.arrived      / g.total * 100) : 0;
+      const ap = g.total ? Math.floor(g.arrived      / g.total * 100) : 0;
       const sp = g.total ? Math.round(g.shipped      / g.total * 100) : 0;
       const ip = g.total ? Math.round(g.in_production/ g.total * 100) : 0;
-      const ep = g.total ? Math.round(g.error        / g.total * 100) : 0;
+      const allTotal = g.total + (g.error || 0);
+      const ep = allTotal ? Math.round(g.error / allTotal * 100) : 0;
       const label = (ep > 0 && ap === 0 && sp === 0 && ip === 0) ? '⚠ Issue'
                   : (ep > 0)                                       ? `⚠ ${ep}% issue`
                   : (ip === 100)                                   ? 'Not shipped'
@@ -691,8 +692,7 @@
         <span class="text-gray-600 text-xs w-24 shrink-0 truncate">${g.gear_type}</span>
         <div class="flex-1 h-1.5 bg-gray-100 rounded-full overflow-hidden flex cursor-help"${tipAttr}>
           ${ap > 0 ? `<div class="h-full bg-green-500"  style="width:${ap}%"></div>` : ''}
-          ${sp > 0 ? `<div class="h-full bg-orange-400" style="width:${sp}%"></div>` : ''}
-          ${ep > 0 ? `<div class="h-full bg-red-400"    style="width:${ep}%"></div>` : ''}
+          ${sp > 0 ? `<div class="h-full bg-orange-400" style="width:${Math.max(sp,0.5)}%"></div>` : ''}
           ${ip > 0 ? `<div class="h-full bg-gray-300"   style="width:${ip}%"></div>` : ''}
         </div>
         <span class="text-xs w-20 text-right shrink-0 ${labelCls} cursor-help"${tipAttr}>${label}</span>
@@ -712,14 +712,13 @@
         <span class="text-gray-400 text-xs">${isExpanded ? '▲' : '▼'}</span>
       </button>
       <div class="h-2.5 bg-gray-100 rounded-full overflow-hidden flex mb-3">
-        ${arrivedW        > 0 ? `<div class="h-full bg-green-500"  style="width:${arrivedW}%"></div>`        : ''}
-        ${shippedW        > 0 ? `<div class="h-full bg-orange-400" style="width:${shippedW}%"></div>`        : ''}
-        ${d.error > 0 ? `<div class="h-full bg-red-400" style="width:${Math.max(d.error_pct,1)}%"></div>` : ''}
-        ${inProdW         > 0 ? `<div class="h-full bg-gray-300"   style="width:${inProdW}%"></div>`         : ''}
+        ${arrivedW        > 0 ? `<div class="h-full bg-green-500"  style="width:${arrivedW}%"></div>`                              : ''}
+        ${d.shipped > 0   ? `<div class="h-full bg-orange-400" style="width:${Math.max(shippedW,0.5)}%"></div>`                    : ''}
+        ${inProdW         > 0 ? `<div class="h-full bg-gray-300"   style="width:${inProdW}%"></div>`                              : ''}
       </div>
       <div class="flex flex-wrap gap-x-4 gap-y-0.5 text-xs">
         <span class="text-green-600 font-medium cursor-help" data-tip="${arrivedTip.replace(/"/g, '&quot;')}">✓ ${d.arrived_pct}% Arrived</span>
-        <span class="text-orange-500 font-medium cursor-help" data-tip="${shippedTip.replace(/"/g, '&quot;')}">⬆ ${d.shipped_pct}% Shipped</span>
+        ${d.shipped > 0 ? `<span class="text-orange-500 font-medium cursor-help" data-tip="${shippedTip.replace(/"/g, '&quot;')}">⬆ ${d.shipped_pct > 0 ? d.shipped_pct+'%' : '< 1%'} Shipped</span>` : ''}
         ${d.error > 0 ? `<span class="text-red-500 font-medium cursor-help" data-tip="${errorTip.replace(/"/g, '&quot;')}">⚠ ${d.error_pct > 0 ? d.error_pct+'%' : u(d.error)} Issues</span>` : ''}
         <span class="text-gray-400 cursor-help" data-tip="${inProdTip.replace(/"/g, '&quot;')}">○ ${d.in_production_pct}% In Production</span>
       </div>
@@ -756,11 +755,15 @@
       totPrd += d.in_production;
       totAll += d.total;
     }
-    const fmtP = (n, t) => t ? Math.round(n / t * 100) + '%' : '—';
     const el = id => document.getElementById(id);
-    if (el('card-gear-arrived'))   el('card-gear-arrived').textContent   = fmtP(totArr, totAll);
-    if (el('card-gear-shipped'))   el('card-gear-shipped').textContent   = fmtP(totShp, totAll);
-    if (el('card-gear-production')) el('card-gear-production').textContent = fmtP(totPrd, totAll);
+    if (totAll) {
+      const pArr = Math.floor(totArr / totAll * 100);
+      const pShp = Math.round(totShp / totAll * 100);
+      const pPrd = 100 - pArr - pShp;   // remainder ensures sum = 100%
+      if (el('card-gear-arrived'))    el('card-gear-arrived').textContent    = pArr + '%';
+      if (el('card-gear-shipped'))    el('card-gear-shipped').textContent    = pShp + '%';
+      if (el('card-gear-production')) el('card-gear-production').textContent = pPrd + '%';
+    }
   }
 
   async function loadGearStatus() {

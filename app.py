@@ -27,6 +27,24 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = 'msm-shipment-tracker-2026'
 
+# Server-side sessions — keeps the cookie tiny (just a session ID)
+_SESSION_DIR = Path(__file__).parent / 'data' / 'sessions'
+_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+app.config['SESSION_TYPE']             = 'filesystem'
+app.config['SESSION_FILE_DIR']         = str(_SESSION_DIR)
+app.config['SESSION_PERMANENT']        = False
+app.config['SESSION_USE_SIGNER']       = True
+app.config['SESSION_COOKIE_SAMESITE']  = 'Lax'
+app.config['SESSION_COOKIE_NAME']      = 'msm_s'  # new name — forces old bloated cookie to be ignored
+
+from flask_session import Session as FlaskSession
+FlaskSession(app)
+
+
+@app.template_filter('gear_display')
+def gear_display_filter(gear: str) -> str:
+    return GEAR_DISPLAY.get(gear, gear)
+
 PUBLIC_PASS = 'GearUp@MSM2026'
 
 ORDERS_PASSES = {'GearUp2Sell26!', 'GearUp@MSM2026'}  # Zee | MSM
@@ -38,6 +56,14 @@ def pub_authed():
 
 def orders_authed():
     return session.get('orders_authed') is True
+
+@app.after_request
+def expire_old_session_cookie(response):
+    """Expire the old 'session' cookie so browsers stop sending the bloated payload."""
+    if request.cookies.get('session'):
+        response.delete_cookie('session', path='/')
+    return response
+
 
 @app.before_request
 def block_external_admin():
@@ -220,9 +246,14 @@ GEAR_CODES = {
     'Park Banner': 'BAN',
     'Name Banner': 'NBN',
     'Hybrid Pullover': 'HYP',
+    'Drawstring Bag':  'BAG',
 }
 
 ALL_GEAR_TYPES = list(GEAR_CODES.keys())  # preserves insertion order
+
+GEAR_DISPLAY = {
+    'Drawstring Bag': 'Drawstring Bags',
+}
 
 # ClickUp custom field IDs for "Order Tracking [NEW]" list
 CF_TRACKING        = '3641c929-080f-4b11-9438-7b54aa7ab859'  # 🚚 Tracking # (short_text)
@@ -460,6 +491,8 @@ def normalize_gear(raw: str) -> str:
         'parkbanner': 'Park Banner', 'parkbannner': 'Park Banner',
         'name banner': 'Name Banner', 'namebanner': 'Name Banner',
         'hybrid': 'Hybrid Pullover', 'hybrid pullover': 'Hybrid Pullover',
+        'bag': 'Drawstring Bag', 'bags': 'Drawstring Bag',
+        'drawstring bag': 'Drawstring Bag', 'drawstring bags': 'Drawstring Bag',
     }
     return mapping.get(raw, raw.capitalize())
 
@@ -703,6 +736,8 @@ def get_settings():
         'track17_api_key':    os.getenv('TRACK17_API_KEY', ''),
         'fedex_api_key':      os.getenv('FEDEX_API_KEY', ''),
         'fedex_secret_key':   os.getenv('FEDEX_SECRET_KEY', ''),
+        'ups_client_id':      os.getenv('UPS_CLIENT_ID', ''),
+        'ups_client_secret':  os.getenv('UPS_CLIENT_SECRET', ''),
     }
 
 
@@ -772,7 +807,25 @@ def _fedex_code_to_stage(code: str, desc: str, country_code: str) -> str:
     return 'Pending'
 
 
+def _detect_carrier(tn: str) -> str:
+    """Return 'ups', 'usps', or 'fedex' based on tracking number format."""
+    tn = tn.strip().upper()
+    if tn.startswith('1Z'):
+        return 'ups'
+    if len(tn) == 22 and tn.startswith('9'):
+        return 'usps'
+    if tn.startswith('94') or tn.startswith('92') or tn.startswith('93'):
+        return 'usps'
+    return 'fedex'
+
+
+# 17track carrier codes
+_17TRACK_CARRIER = {'fedex': 100003, 'ups': 100002, 'usps': 100001}
+
+
 def _fetch_fedex(tracking_number: str) -> dict | None:
+    if _detect_carrier(tracking_number) != 'fedex':
+        return None  # FedEx API only handles FedEx numbers
     token = _get_fedex_token()
     if not token:
         return None
@@ -862,6 +915,107 @@ def _17track_tag_to_stage(tag17: str, event_desc: str, location: str, country: s
     return 'Pending'
 
 
+_ups_token_cache: dict = {'token': None, 'expires_at': 0}
+
+
+def _get_ups_token() -> str | None:
+    client_id     = os.getenv('UPS_CLIENT_ID', '')
+    client_secret = os.getenv('UPS_CLIENT_SECRET', '')
+    if not client_id or not client_secret:
+        return None
+    now = time.time()
+    if _ups_token_cache['token'] and now < _ups_token_cache['expires_at']:
+        return _ups_token_cache['token']
+    try:
+        r = requests.post(
+            'https://onlinetools.ups.com/security/v1/oauth/token',
+            data={'grant_type': 'client_credentials'},
+            auth=(client_id, client_secret),
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            timeout=10,
+        )
+        r.raise_for_status()
+        d = r.json()
+        _ups_token_cache['token']      = d['access_token']
+        _ups_token_cache['expires_at'] = now + int(d.get('expires_in', 14400)) - 60
+        return _ups_token_cache['token']
+    except Exception:
+        return None
+
+
+def _ups_activity_to_stage(status_type: str, desc: str, country: str) -> str:
+    s = (status_type or '').upper()
+    d = (desc or '').upper()
+    if s == 'D':
+        return 'Delivered'
+    if s == 'X':
+        return 'Exception'
+    if s in ('P', 'M'):
+        return 'PickedUp'
+    if s == 'I':
+        if 'OUT FOR DELIVERY' in d:
+            return 'OutForDelivery'
+        if 'CLEARED CUSTOMS' in d or 'RELEASED' in d:
+            return 'ClearedCustoms'
+        if 'CUSTOMS' in d or 'CLEARANCE' in d:
+            return 'AtCustoms'
+        if country == 'US':
+            return 'InTransitDom'
+        if country and country != 'US':
+            return 'InTransitIntl'
+        return 'InTransitDom'
+    if s in ('O', 'L'):
+        return 'LabelCreated'
+    return 'Pending'
+
+
+def _fetch_ups(tracking_number: str) -> dict | None:
+    if _detect_carrier(tracking_number) != 'ups':
+        return None
+    token = _get_ups_token()
+    if not token:
+        return None
+    try:
+        r = requests.get(
+            f'https://onlinetools.ups.com/api/track/v1/details/{tracking_number}',
+            params={'locale': 'en_US', 'returnSignature': 'false'},
+            headers={
+                'Authorization': f'Bearer {token}',
+                'transId':       tracking_number[:16],
+                'transactionSrc': 'MSMTracker',
+            },
+            timeout=15,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        data = r.json()
+
+        shipment  = (data.get('trackResponse', {})
+                         .get('shipment', [{}])[0])
+        package   = (shipment.get('package', [{}])[0])
+        activity  = package.get('activity', [])
+        latest    = activity[0] if activity else {}
+
+        status     = latest.get('status', {})
+        status_type = status.get('type', '')
+        desc       = status.get('description', '')
+        loc_data   = latest.get('location', {}).get('address', {})
+        city       = loc_data.get('city', '')
+        state      = loc_data.get('stateProvince', '')
+        country    = loc_data.get('countryCode', '')
+        location   = ', '.join(filter(None, [city, state]))
+        event_time = latest.get('date', '') + 'T' + latest.get('time', '')
+
+        if not status_type:
+            return None
+
+        stage = _ups_activity_to_stage(status_type, desc, country)
+        return {'tag': stage, 'last_event': desc, 'location': location, 'event_time': event_time}
+    except Exception:
+        return None
+
+
 def _fetch_17track(tracking_number: str) -> dict:
     """Returns {'tag', 'last_event', 'location'} via 17track API."""
     api_key = os.getenv('TRACK17_API_KEY', '')
@@ -870,18 +1024,19 @@ def _fetch_17track(tracking_number: str) -> dict:
 
     headers = {'17token': api_key, 'Content-Type': 'application/json'}
 
-    # Register with FedEx carrier 100003; if already registered on wrong carrier, delete + re-register
-    if tracking_number not in _17TRACK_REGISTERED:
+    carrier_code = _17TRACK_CARRIER.get(_detect_carrier(tracking_number), 100003)
+    reg_key = (tracking_number, carrier_code)
+    if reg_key not in _17TRACK_REGISTERED:
         try:
             r = requests.post(
                 'https://api.17track.net/track/v2.2/register',
-                json=[{'number': tracking_number, 'carrier': 100003}],
+                json=[{'number': tracking_number, 'carrier': carrier_code}],
                 headers=headers,
                 timeout=10,
             )
             rejected = r.json().get('data', {}).get('rejected', [])
             if rejected:
-                # Already registered (possibly wrong carrier) — delete and retry
+                # Already registered on a different carrier — delete and re-register
                 requests.post(
                     'https://api.17track.net/track/v2.2/deletetrack',
                     json=[{'number': tracking_number}],
@@ -891,11 +1046,11 @@ def _fetch_17track(tracking_number: str) -> dict:
                 time.sleep(1)
                 requests.post(
                     'https://api.17track.net/track/v2.2/register',
-                    json=[{'number': tracking_number, 'carrier': 100003}],
+                    json=[{'number': tracking_number, 'carrier': carrier_code}],
                     headers=headers,
                     timeout=10,
                 )
-            _17TRACK_REGISTERED.add(tracking_number)
+            _17TRACK_REGISTERED.add(reg_key)
         except Exception:
             pass
 
@@ -937,11 +1092,12 @@ def check_all_fedex_statuses(notify_changes: bool = False) -> dict:
     """
     global _last_auto_check
 
-    use_fedex  = bool(os.getenv('FEDEX_API_KEY') and os.getenv('FEDEX_SECRET_KEY'))
+    use_fedex   = bool(os.getenv('FEDEX_API_KEY') and os.getenv('FEDEX_SECRET_KEY'))
+    use_ups     = bool(os.getenv('UPS_CLIENT_ID') and os.getenv('UPS_CLIENT_SECRET'))
     use_17track = bool(os.getenv('TRACK17_API_KEY'))
 
-    if not use_fedex and not use_17track:
-        return {'ok': False, 'error': 'No tracking API configured. Add FedEx credentials in Settings.'}
+    if not use_fedex and not use_ups and not use_17track:
+        return {'ok': False, 'error': 'No tracking API configured. Add FedEx or UPS credentials in Settings.'}
 
     orders = load_orders()
 
@@ -964,7 +1120,10 @@ def check_all_fedex_statuses(notify_changes: bool = False) -> dict:
     for tn in all_tns:
         try:
             r = None
-            if use_fedex:
+            carrier = _detect_carrier(tn)
+            if carrier == 'ups' and use_ups:
+                r = _fetch_ups(tn)
+            elif carrier == 'fedex' and use_fedex:
                 r = _fetch_fedex(tn)
             if r is None and use_17track:
                 r = _fetch_17track(tn)
@@ -1043,8 +1202,9 @@ def _start_fedex_poller():
         time.sleep(60)
         while True:
             has_fedex   = bool(os.getenv('FEDEX_API_KEY') and os.getenv('FEDEX_SECRET_KEY'))
+            has_ups     = bool(os.getenv('UPS_CLIENT_ID') and os.getenv('UPS_CLIENT_SECRET'))
             has_17track = bool(os.getenv('TRACK17_API_KEY'))
-            if has_fedex or has_17track:
+            if has_fedex or has_ups or has_17track:
                 try:
                     check_all_fedex_statuses(notify_changes=True)
                 except Exception:
@@ -1055,6 +1215,269 @@ def _start_fedex_poller():
 
 
 _start_fedex_poller()
+
+
+# ── ClickUp → local sync ──────────────────────────────────────────────────────
+
+def _parse_clickup_task_name(name: str) -> dict | None:
+    """
+    Parse a ClickUp task name in the format:
+      {market} {season} {sport} {gear} {order_num}
+    e.g. "Dallas Fall BSBL Jersey 1"  or  "South Florida Summer SOC Hoodie 2"
+    Returns a dict with keys: market, season, sport, gear, order_num, or None.
+    """
+    name = name.strip()
+    # Build sorted-longest-first lists to avoid short prefix matches
+    markets_sorted = sorted(MARKETS, key=len, reverse=True)
+    seasons_sorted = sorted(SEASONS, key=len, reverse=True)
+    sport_codes    = [s[0] for s in SPORTS]  # ['BSBL', 'SBL', 'SOC', ...]
+    # Include common aliases (longest first so "Drawstring Bag" beats "Bag")
+    _gear_aliases = {'Bags': 'Drawstring Bag', 'Bag': 'Drawstring Bag',
+                     'Drawstring Bags': 'Drawstring Bag'}
+    gear_names     = sorted(list(ALL_GEAR_TYPES) + list(_gear_aliases.keys()), key=len, reverse=True)
+
+    market = None
+    for m in markets_sorted:
+        if name.lower().startswith(m.lower()):
+            market = m
+            name = name[len(m):].strip()
+            break
+    if not market:
+        return None
+
+    season = None
+    for s in seasons_sorted:
+        if name.lower().startswith(s.lower()):
+            season = s
+            name = name[len(s):].strip()
+            break
+    if not season:
+        return None
+
+    sport = None
+    for code in sport_codes:
+        if name.upper().startswith(code.upper()):
+            sport = code
+            name = name[len(code):].strip()
+            break
+    if not sport:
+        return None
+
+    gear = None
+    for g in gear_names:
+        if name.lower().startswith(g.lower()):
+            gear = g
+            name = name[len(g):].strip()
+            break
+    if not gear:
+        return None
+
+    order_num = name.strip() or '1'
+    gear = _gear_aliases.get(gear, gear)
+
+    return {'market': market, 'season': season, 'sport': sport,
+            'gear': gear, 'order_num': order_num}
+
+
+def _sync_clickup_tasks() -> dict:
+    """
+    Fetch all tasks from the ClickUp order-tracking list and upsert any that
+    are not already linked in orders.json.  Returns {'added': int, 'skipped': int}.
+    """
+    settings = get_settings()
+    token    = settings.get('clickup_token', '')
+    list_id  = settings.get('clickup_list_id', '')
+    if not token or not list_id:
+        return {'added': 0, 'skipped': 0, 'error': 'ClickUp not configured'}
+
+    headers = {'Authorization': token}
+
+    # Collect every task from the list (paginated)
+    all_tasks = []
+    page = 0
+    while True:
+        resp = requests.get(
+            f'https://api.clickup.com/api/v2/list/{list_id}/task',
+            headers=headers,
+            params={'page': page, 'include_closed': 'true', 'subtasks': 'false'},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return {'added': 0, 'skipped': 0, 'error': f'ClickUp {resp.status_code}'}
+        data  = resp.json()
+        batch = data.get('tasks', [])
+        all_tasks.extend(batch)
+        if data.get('last_page') or not batch:
+            break
+        page += 1
+
+    # Fix any existing manual_shipments that have the wrong carrier stored
+    orders = load_orders()
+    carrier_fixed = False
+    for o in orders:
+        for m in o.get('manual_shipments', []):
+            tn = m.get('tracking_number', '').strip()
+            if not tn:
+                continue
+            correct = _detect_carrier(tn).upper()
+            stored  = m.get('carrier', '').upper()
+            if stored != correct:
+                m['carrier'] = correct
+                carrier_fixed = True
+    if carrier_fixed:
+        save_orders(orders)
+
+    # Build a set of all task IDs already tracked or explicitly blocked
+    orders = load_orders()
+    tracked_ids: set = set()
+    for o in orders:
+        for tid in o.get('gear_tasks', {}).values():
+            if tid:
+                tracked_ids.add(str(tid))
+        for tid in o.get('sync_blocked_task_ids', []):
+            if tid:
+                tracked_ids.add(str(tid))
+
+    added = 0
+    skipped = 0
+
+    # Only consider tasks created on/after the display cutoff (April 2026)
+    _cutoff_ms = 1743465600000  # 2026-04-01 00:00 UTC in ms
+
+    for task in all_tasks:
+        task_id = str(task.get('id', ''))
+        if not task_id or task_id in tracked_ids:
+            skipped += 1
+            continue
+
+        # Skip old tasks — only sync one-offs created from April 2026 onward
+        try:
+            date_created_ms = int(task.get('date_created') or 0)
+        except (TypeError, ValueError):
+            date_created_ms = 0
+        if date_created_ms < _cutoff_ms:
+            skipped += 1
+            continue
+
+        parsed = _parse_clickup_task_name(task.get('name', ''))
+        if not parsed:
+            skipped += 1
+            continue
+
+        market    = parsed['market']
+        season    = parsed['season']
+        sport     = parsed['sport']
+        gear      = parsed['gear']
+        order_num = parsed['order_num']
+
+        # Pull useful custom field values from the task
+        def _cf(fid):
+            return _get_task_cf(task, fid)
+
+        def _ms_to_date(ms_val):
+            if not ms_val:
+                return ''
+            try:
+                return datetime.utcfromtimestamp(int(ms_val) / 1000).strftime('%Y-%m-%d')
+            except Exception:
+                return ''
+
+        order_date = _ms_to_date(_cf(CF_ORDER_DATE))
+        eta_zees   = _ms_to_date(_cf(CF_ETA_ZEES))
+        tracking   = (_cf(CF_TRACKING) or '').strip()
+        ship_date  = _ms_to_date(_cf(CF_SHIP_DATE_ACT))
+
+        # Pull notes/box count from the shipping comment on the task
+        cu_notes = ''
+        if tracking:
+            try:
+                cr = requests.get(
+                    f'https://api.clickup.com/api/v2/task/{task_id}/comment',
+                    headers=headers, timeout=10,
+                )
+                for c in (cr.json().get('comments', []) if cr.status_code == 200 else []):
+                    text = c.get('comment_text', '')
+                    if f'Tracking: {tracking}' in text:
+                        for line in text.splitlines():
+                            if line.startswith('Notes:'):
+                                cu_notes = line[len('Notes:'):].strip()
+                        break
+            except Exception:
+                pass
+
+        _m2 = re.search(r'(\d+)$', order_num.strip())
+        num_for_code = order_num.strip() if order_num.strip().isdigit() else (_m2.group(1) if _m2 else '1')
+
+        # Reload inside loop so concurrent syncs don't stomp each other
+        orders = load_orders()
+        existing = find_order(market, order_num, sport)
+
+        def _add_tracking_to_order(order, gear_type, tn, ship_dt, notes=''):
+            """Upsert a manual_shipments entry for this gear+TN if not already there."""
+            if not tn:
+                return
+            manual = order.setdefault('manual_shipments', [])
+            already = any(
+                m.get('tracking_number') == tn and m.get('gear_type') == gear_type
+                for m in manual
+            )
+            if not already:
+                # Parse box count from notes if present (e.g. "3 boxes", "2 box")
+                bc_match = re.search(r'(\d+)\s*box', notes or '', re.I)
+                box_count = int(bc_match.group(1)) if bc_match else 1
+                manual.append({
+                    'gear_type':       gear_type,
+                    'tracking_number': tn,
+                    'ship_date':       ship_dt,
+                    'declared_value':  '',
+                    'notes':           notes,
+                    'box_count':       box_count,
+                    'added_at':        datetime.now().isoformat(),
+                    'carrier':         _detect_carrier(tn).upper(),
+                })
+
+        if existing:
+            # Never modify existing orders — they're managed by the app
+            skipped += 1
+        else:
+            # Brand-new stub order — safe to pull tracking from ClickUp
+            new_order = {
+                'id':              str(uuid.uuid4()),
+                'market':          market,
+                'sport':           sport,
+                'season':          season,
+                'order_num':       order_num,
+                'num_for_code':    num_for_code,
+                'order_date':      order_date,
+                'eta_to_zees':     eta_zees,
+                'order_sheet_url': '',
+                'gear_tasks':      {gear: task_id},
+                'created_at':      datetime.now().isoformat(),
+                'synced_from_clickup': True,
+            }
+            _add_tracking_to_order(new_order, gear, tracking, ship_date, cu_notes)
+            upsert_order(new_order)
+            tracked_ids.add(task_id)
+            added += 1
+
+    return {'added': added, 'skipped': skipped}
+
+
+def _start_clickup_sync():
+    """Background thread: sync ClickUp tasks into local orders every 30 minutes."""
+    def loop():
+        time.sleep(90)  # brief startup delay so FedEx poller doesn't compete
+        while True:
+            try:
+                _sync_clickup_tasks()
+            except Exception:
+                pass
+            time.sleep(30 * 60)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+_start_clickup_sync()
 
 
 TRACKING_STATUSES = [
@@ -1223,6 +1646,16 @@ def load_orders() -> list:
     for o in orders:
         _backfill_num_for_code(o)
     return orders
+
+
+_DISPLAY_CUTOFF = '2026-04-01'
+
+def _order_date_str(o: dict) -> str:
+    return (o.get('order_date') or '')[:10]
+
+def load_display_orders() -> list:
+    """Load orders filtered to April 2026+. Use this for all display/page routes."""
+    return [o for o in load_orders() if _order_date_str(o) >= _DISPLAY_CUTOFF]
 
 
 def save_orders(orders: list):
@@ -1428,10 +1861,18 @@ def _sync_delivered_to_clickup(order: dict, tn: str, actual_delivery_ms: int,
             if r.status_code not in (200, 201):
                 errors.append(f'{gear} parent CF {field_id}: {r.status_code}')
 
-        # Update any subtasks that have this tracking number
+        # Update subtasks that match this TN OR have no TN and are still at Shipped phase
+        # (subtasks with empty CF_TRACKING can't be matched by TN but should still be delivered)
         subtasks = _get_clickup_subtasks(task_id)
         for sub in subtasks:
-            if _get_task_cf(sub, CF_TRACKING) == tn:
+            sub_tn = _get_task_cf(sub, CF_TRACKING) or ''
+            sub_phase_val = _get_task_cf(sub, CF_PHASE)
+            try:
+                sub_phase = int(sub_phase_val) if sub_phase_val is not None else None
+            except (TypeError, ValueError):
+                sub_phase = None
+            # Match by TN, or fall back to any Shipped subtask with no TN
+            if sub_tn == tn or (not sub_tn and sub_phase == 3):
                 for field_id, value in [
                     (CF_PHASE,            4),
                     (CF_DELIVERY_DATE_ACT, actual_delivery_ms),
@@ -1440,6 +1881,51 @@ def _sync_delivered_to_clickup(order: dict, tn: str, actual_delivery_ms: int,
                     r = set_clickup_field(sub['id'], field_id, value)
                     if r.status_code not in (200, 201):
                         errors.append(f'Subtask {sub["id"]} CF {field_id}: {r.status_code}')
+
+    # Also update gear tasks in OTHER orders that share this TN
+    # (e.g. Tee in FSH #1 when TN 813308 is shared with Dallas #2)
+    if all_orders:
+        already_updated = set(gear_tasks.values())
+        for other_order in all_orders:
+            if other_order.get('id') == order.get('id'):
+                continue
+            tn_in_other = any(
+                ms.get('tracking_number', '').strip() == tn
+                for ms in other_order.get('manual_shipments', [])
+            ) or any(
+                row.get('tracking_number', '').strip() == tn
+                for row in other_order.get('packing_list', [])
+            )
+            if not tn_in_other:
+                continue
+            # Collect gears in the other order that are associated with this TN
+            other_shipments = _collect_shipments(other_order)
+            other_ship = next((s for s in other_shipments if s['tracking_number'] == tn), None)
+            if not other_ship:
+                continue
+            other_gears = [s['gear'] for s in other_ship['gear_summary']]
+            for g in other_gears:
+                tid = other_order.get('gear_tasks', {}).get(g)
+                if not tid or tid in already_updated:
+                    continue
+                already_updated.add(tid)
+                parent2 = _get_clickup_task(tid)
+                est2 = None
+                if parent2:
+                    val2 = _get_task_cf(parent2, CF_DELIVERY_DATE)
+                    try:
+                        est2 = int(val2) if val2 is not None else None
+                    except (TypeError, ValueError):
+                        pass
+                os2 = _delivery_order_status(est2, actual_delivery_ms)
+                for field_id, value in [
+                    (CF_PHASE,             4),
+                    (CF_DELIVERY_DATE_ACT, actual_delivery_ms),
+                    (CF_ORDER_STATUS,      os2),
+                ]:
+                    r = set_clickup_field(tid, field_id, value)
+                    if r.status_code not in (200, 201):
+                        errors.append(f'{other_order.get("market")} {g} CF {field_id}: {r.status_code}')
 
     return errors
 
@@ -1699,6 +2185,77 @@ def api_fetch_shipment_notes():
     return jsonify({'ok': True, 'notes': notes_found})
 
 
+_SUPPLIER_CACHE: dict = {}  # order_id → {ts, supplier}
+_SUPPLIER_TTL = 600  # 10 min
+
+
+def _resolve_supplier(raw: str) -> str:
+    """Map a raw 'Supplier:' comment value to 'Team Green' or 'LNX'.
+    If the comment explicitly names a China/TG supplier → Team Green.
+    Otherwise (e.g. 'LNX') → LNX. Default when called from explicit comment is LNX."""
+    if not raw:
+        return 'Team Green'
+    low = raw.lower()
+    if any(k in low for k in ('china', 'qingdao', 'shanghai', 'shenzhen', 'guangzhou',
+                               'guangdong', 'beijing', 'hangzhou', 'yiwu', 'ningbo',
+                               'fujian', 'zhejiang', 'jiangsu', 'prc', 'team green')):
+        return 'Team Green'
+    return 'LNX'
+
+
+def _fetch_supplier_from_clickup(order: dict) -> str:
+    """Return 'LNX' if a ClickUp comment explicitly says Supplier: LNX (or non-China).
+    Default is 'Team Green' (China) — no comment needed for China orders."""
+    gear_tasks = order.get('gear_tasks', {})
+    if not gear_tasks:
+        return 'Team Green'   # default
+    cu_token = os.getenv('CLICKUP_TOKEN', '')
+    for task_id in gear_tasks.values():
+        cached = _ck_notes_cache.get(f'sup_{task_id}')
+        if cached and (time.time() - cached['ts']) < _SUPPLIER_TTL:
+            comments = cached['comments']
+        else:
+            try:
+                r = requests.get(
+                    f'https://api.clickup.com/api/v2/task/{task_id}/comment',
+                    headers={'Authorization': cu_token}, timeout=10,
+                )
+                comments = r.json().get('comments', []) if r.status_code == 200 else []
+            except Exception:
+                comments = []
+            _ck_notes_cache[f'sup_{task_id}'] = {'ts': time.time(), 'comments': comments}
+
+        for c in reversed(comments):   # latest comment wins
+            text = c.get('comment_text', '').strip()
+            if text.lower().startswith('supplier'):
+                raw = text.split(':', 1)[-1].strip() if ':' in text else text
+                return _resolve_supplier(raw)   # explicit override
+    return 'Team Green'   # default: China
+
+
+@app.route('/api/fetch-supplier/<order_id>')
+def api_fetch_supplier(order_id):
+    """Return the supplier (Team Green or LNX) from ClickUp task comments."""
+    cached = _SUPPLIER_CACHE.get(order_id)
+    if cached and (time.time() - cached['ts']) < _SUPPLIER_TTL:
+        return jsonify({'ok': True, 'supplier': cached['supplier']})
+
+    orders = load_orders()
+    order  = next((o for o in orders if o.get('id') == order_id), None)
+    if not order:
+        return jsonify({'ok': False, 'error': 'Order not found'})
+
+    supplier = order.get('supplier') or _fetch_supplier_from_clickup(order)
+
+    # Persist if found and not already saved
+    if supplier and not order.get('supplier'):
+        order['supplier'] = supplier
+        upsert_order(order)
+
+    _SUPPLIER_CACHE[order_id] = {'ts': time.time(), 'supplier': supplier}
+    return jsonify({'ok': True, 'supplier': supplier})
+
+
 @app.route('/upload', methods=['POST'])
 def upload():
     if 'file' not in request.files:
@@ -1747,7 +2304,7 @@ def preview():
         if tn:
             tn_to_rows.setdefault(tn, []).append(r)
 
-    all_orders = load_orders()
+    all_orders = load_display_orders()
     auto_matched: list = []
     first_tn_matched_order = None  # track canonical order found via TN match
     for o in all_orders:
@@ -1835,7 +2392,7 @@ PHASE_LABELS = ['Submitted', 'Proofs', 'Production', 'Shipped', 'Delivered', 'Co
 
 @app.route('/orders')
 def orders_list():
-    orders = load_orders()
+    orders = load_display_orders()
     orders_sorted = sorted(orders, key=lambda o: o.get('created_at', ''), reverse=True)
     for o in orders_sorted:
         o['shipments'] = _collect_shipments(o)
@@ -1891,7 +2448,7 @@ def api_orders_summary():
         except Exception:
             return None
 
-    orders = load_orders()
+    orders = load_display_orders()
     result = []
 
     for order in orders:
@@ -3234,18 +3791,23 @@ def aftership_csv():
         first_gear     = first_entries[0].get('gear_type', '') if first_entries else ''
         order_code     = build_order_code(market, first_sport, first_gear, order_date, first_order_num)
 
-        # Aggregate across all orders — count physical boxes by deduplicating
-        # gears that share the same notes string (same physical box).
-        _notes_seen: set = set()
-        box_count = 0
+        # Aggregate across all orders — count physical boxes.
+        # Gears with the same non-empty notes share a physical box group;
+        # use the MAX box_count within that group (not just 1 per unique note).
+        # Gears with no notes each contribute their individual box_count.
+        _notes_groups: dict = {}  # notes str → list of box_counts
+        _solo_boxes = 0
         for e in all_entries:
             n = e.get('notes', '').strip()
+            bc = int(e.get('box_count') or 1)
             if n:
-                if n not in _notes_seen:
-                    _notes_seen.add(n)
-                    box_count += 1
+                _notes_groups.setdefault(n, []).append(bc)
             else:
-                box_count += 1
+                _solo_boxes += bc
+        box_count = _solo_boxes + sum(
+            max((c for c in counts if c > 0), default=1)
+            for counts in _notes_groups.values()
+        )
         declared_vals = [e.get('declared_value', '').strip() for e in all_entries if e.get('declared_value', '').strip()]
         note_texts    = list(dict.fromkeys(e.get('notes', '').strip() for e in all_entries if e.get('notes', '').strip()))
 
@@ -3271,13 +3833,23 @@ def aftership_csv():
 
         order_date_iso = (order_date + 'T00:00:00+00:00') if order_date else ''
 
+        detected = _detect_carrier(tn)
+        if detected == 'ups':
+            shipment_type  = 'UPS Worldwide Expedited'
+            origin_state   = 'Shanghai'
+            origin_city    = 'Shanghai'
+        else:
+            shipment_type  = 'FedEx International Connect Plus'
+            origin_state   = 'Shandong'
+            origin_city    = 'Qingdao'
+
         row = [
             carrier, tn, order_code, order_code, '',
             'CHN', 'USA', custom_1, custom_2,
             '', '', '', '', '',
             order_date_iso, order_code,
-            'en', 'FedEx International Connect Plus', '', '', '',
-            'Shandong', 'Qingdao', '', '',
+            'en', shipment_type, '', '', '',
+            origin_state, origin_city, '', '',
             contact.get('state', ''), contact.get('city', ''),
             contact.get('zip', ''), contact.get('address', ''),
             contact['name'], contact.get('email', ''), f"MSM {clean_market}",
@@ -3478,7 +4050,7 @@ def _collect_shipments(order: dict) -> list:
 
 
 def _build_tracking_payload():
-    orders = load_orders()
+    orders = load_display_orders()
     # Most recently shipped order first
     orders_sorted = sorted(orders, key=lambda o: o.get('shipped_at', ''), reverse=True)
     result_orders = []
@@ -3712,7 +4284,7 @@ _REMINDER_CF_LABELS = {
 @app.route('/api/dashboard-reminders')
 def api_dashboard_reminders():
     today = _now_cst().date()
-    orders = load_orders()
+    orders = load_display_orders()
     reminders = []
 
     for order in orders:
@@ -3863,6 +4435,40 @@ def _count_numeric_rows(csv_text: str) -> int:
             except ValueError:
                 pass
     return count
+
+
+def _qty_from_packing_contents(gear_type: str, pl_rows: list) -> int:
+    """
+    Parse unit qty from packing_list contents fields.
+    Handles size breakdowns (YM-82, AS-47...) and explicit counts (rings-78, necklace-30).
+    Returns 0 if nothing parseable.
+    """
+    if not pl_rows:
+        return 0
+    gear_lower = gear_type.lower()
+    total = 0
+    seen_contents: set = set()
+    for row in pl_rows:
+        content = (row.get('contents') or '').strip()
+        if not content or content in seen_contents:
+            continue
+        seen_contents.add(content)
+        # Size breakdown: YM-82, AS-47, YL-177 etc — sum all size-N patterns
+        size_matches = re.findall(r'\b(?:YXS|YS|YM|YL|YXL|AS|AM|AL|AXL|AXXL|S|M|L|XL|XXL)-(\d+)\b', content, re.I)
+        if size_matches:
+            total += sum(int(x) for x in size_matches)
+            continue
+        # Explicit item counts: rings-78, necklace-30, namebanner-7, parkbanner-20
+        item_kw = {
+            'ring': 'Ring', 'necklace': 'Hypechain', 'hypechain': 'Hypechain',
+            'namebanner': 'Name Banner', 'parkbanner': 'Park Banner', 'parkbannner': 'Park Banner',
+            'bag': 'Drawstring Bag', 'cap': 'Cap',
+        }
+        for kw, mapped_gear in item_kw.items():
+            if mapped_gear.lower() == gear_lower or kw in gear_lower:
+                for m in re.finditer(rf'{re.escape(kw)}s?[\s\-](\d+)', content, re.I):
+                    total += int(m.group(1))
+    return total
 
 
 def _ordered_gear_types(sheet_url: str) -> dict | None:
@@ -4022,31 +4628,35 @@ def _get_task_error_info(task_id: str) -> dict | None:
 
     reason      = None
     comment_qty = None
-    if is_error:
-        try:
-            comm_resp = requests.get(
-                f'https://api.clickup.com/api/v2/task/{task_id}/comment',
-                headers={'Authorization': cu_token},
-                timeout=10,
-            )
-            comm_resp.raise_for_status()
-            for comment in comm_resp.json().get('comments', []):
-                text = comment.get('comment_text', '').strip()
-                if text and not any(text.startswith(p) for p in _CU_AUTO_PREFIXES):
-                    lines = text.split('\n')
-                    reason = lines[0].rstrip(':').strip()
-                    # Sum any "Xpcs" or "X pcs" counts from subsequent lines
-                    total = sum(
-                        int(m.group(1))
-                        for line in lines[1:]
-                        for m in [re.search(r'(\d+)\s*pcs?', line, re.I)]
-                        if m
-                    )
-                    if total:
-                        comment_qty = total
-                    break
-        except Exception:
-            pass
+    try:
+        comm_resp = requests.get(
+            f'https://api.clickup.com/api/v2/task/{task_id}/comment',
+            headers={'Authorization': cu_token},
+            timeout=10,
+        )
+        comm_resp.raise_for_status()
+        for comment in comm_resp.json().get('comments', []):
+            text = comment.get('comment_text', '').strip()
+            if not text or any(text.startswith(p) for p in _CU_AUTO_PREFIXES):
+                continue
+            lines = text.split('\n')
+            if is_error and reason is None:
+                reason = lines[0].rstrip(':').strip()
+            # Parse qty only when an explicit qty/unit keyword is present
+            for line in lines:
+                m = re.search(
+                    r'(?:qty[\s\w]*[:\-]\s*|quantity[\s\w]*[:\-]\s*|total[:\s]+)(\d+)'
+                    r'|(\d+)\s*(?:pcs?|units?|caps?|bags?|jerseys?|hoodies?|tees?|rings?|pieces?)\b',
+                    line, re.I
+                )
+                if m:
+                    val = int(m.group(1) or m.group(2))
+                    if val > 0:
+                        comment_qty = (comment_qty or 0) + val
+            if comment_qty:
+                break  # use the first comment that has a qty
+    except Exception:
+        pass
 
     info = {'is_error': is_error, 'reason': reason, 'comment_qty': comment_qty, 'name': name}
     _cu_task_cache[task_id] = {'ts': time.time(), 'info': info}
@@ -4055,7 +4665,7 @@ def _get_task_error_info(task_id: str) -> dict | None:
 
 @app.route('/api/shipment-status')
 def api_shipment_status():
-    orders = load_orders()
+    orders = load_display_orders()
 
     def tag_to_status(tag):
         return 'arrived' if tag == 'Delivered' else 'shipped'
@@ -4089,12 +4699,16 @@ def api_shipment_status():
             if ordered_gear is not None and gear_type not in ordered_gear and not has_evidence:
                 continue
 
-            qty         = (ordered_gear or {}).get(gear_type, 0) or 1
             bucket      = market_gear[market][gear_type]
             task_info   = _get_task_error_info(task_id)
             is_error    = bool(task_info and task_info.get('is_error'))
             reason      = (task_info or {}).get('reason') if is_error else None
-            comment_qty = (task_info or {}).get('comment_qty') if is_error else None
+            comment_qty = (task_info or {}).get('comment_qty')
+
+            # qty: order sheet → packing contents → comment → 1
+            sheet_qty    = (ordered_gear or {}).get(gear_type, 0)
+            content_qty  = _qty_from_packing_contents(gear_type, packing_list) if not sheet_qty else 0
+            qty = sheet_qty or content_qty or comment_qty or 1
 
             seen_tns: set[str] = set()
             ship_items: list[dict] = []
@@ -4153,14 +4767,16 @@ def api_shipment_status():
         m_arrived = m_shipped = m_in_prod = m_error = 0
 
         for gear_type, counts in sorted(gear_data.items()):
-            total = counts['arrived'] + counts['shipped'] + counts['in_production'] + counts['error']
+            # bar_total excludes error so bar percentages sum to 100%
+            bar_total = counts['arrived'] + counts['shipped'] + counts['in_production']
+            all_total = bar_total + counts['error']
             gear_list.append({
                 'gear_type':           gear_type,
                 'arrived':             counts['arrived'],
                 'shipped':             counts['shipped'],
                 'in_production':       counts['in_production'],
                 'error':               counts['error'],
-                'total':               total,
+                'total':               bar_total,
                 'arrived_items':       counts['arrived_items'],
                 'shipped_items':       counts['shipped_items'],
                 'in_production_items': counts['in_production_items'],
@@ -4183,17 +4799,22 @@ def api_shipment_status():
             return 0
 
         gear_list.sort(key=sort_key)
-        total = m_arrived + m_shipped + m_in_prod + m_error
+        bar_total = m_arrived + m_shipped + m_in_prod   # denominator for bar %
+        all_total = bar_total + m_error                 # for error % only
+        # Use floor for arrived so it never rounds up to 100% when items are still in transit/production
+        arrived_pct = int(m_arrived / bar_total * 100) if bar_total else 0
+        shipped_pct = round(m_shipped / bar_total * 100) if bar_total else 0
+        in_prod_pct = round(m_in_prod / bar_total * 100) if bar_total else 0
         result[market] = {
-            'arrived_pct':       round(m_arrived / total * 100) if total else 0,
-            'shipped_pct':       round(m_shipped / total * 100) if total else 0,
-            'in_production_pct': round(m_in_prod / total * 100) if total else 0,
-            'error_pct':         round(m_error   / total * 100) if total else 0,
+            'arrived_pct':       arrived_pct,
+            'shipped_pct':       shipped_pct,
+            'in_production_pct': in_prod_pct,
+            'error_pct':         round(m_error / all_total * 100) if all_total else 0,
             'arrived':           m_arrived,
             'shipped':           m_shipped,
             'in_production':     m_in_prod,
             'error':             m_error,
-            'total':             total,
+            'total':             bar_total,
             'gear':              gear_list,
         }
 
@@ -4207,7 +4828,7 @@ def dashboard():
 
 @app.route('/contents')
 def contents_lookup():
-    orders = load_orders()
+    orders = load_display_orders()
     rows = []
 
     for o in sorted(orders, key=lambda x: x.get('created_at', ''), reverse=True):
@@ -4281,7 +4902,7 @@ def contents_lookup():
 def public_orders():
     if not pub_authed():
         return redirect('/public/login?next=/public/orders')
-    orders = load_orders()
+    orders = load_display_orders()
     enriched = []
     for o in sorted(orders, key=lambda x: x.get('created_at', ''), reverse=True):
         shipments = _collect_shipments(o)
@@ -4300,7 +4921,7 @@ def public_tracking():
 def public_contents():
     if not pub_authed():
         return redirect('/public/login?next=/public/contents')
-    orders = load_orders()
+    orders = load_display_orders()
     rows = []
     for o in sorted(orders, key=lambda x: x.get('created_at', ''), reverse=True):
         market   = o.get('market', '')
@@ -4622,7 +5243,7 @@ def api_order_sheet_teams():
 
 @app.route('/api/dashboard-data')
 def api_dashboard_data():
-    orders = load_orders()
+    orders = load_display_orders()
     result = []
 
     for order in orders:
@@ -4753,6 +5374,13 @@ def api_dashboard_data():
 
 # ── Settings ─────────────────────────────────────────────────────────────────
 
+@app.route('/api/sync-clickup', methods=['POST'])
+def api_sync_clickup():
+    result = _sync_clickup_tasks()
+    ok = 'error' not in result
+    return jsonify({'ok': ok, **result})
+
+
 @app.route('/settings', methods=['GET', 'POST'])
 def settings_page():
     env_path = Path(__file__).parent / '.env'
@@ -4760,7 +5388,7 @@ def settings_page():
 
     if request.method == 'POST':
         lines = []
-        for key in ('CLICKUP_TOKEN', 'CLICKUP_LIST_ID', 'SLACK_WEBHOOK_URL', 'EMAIL_APP_PASSWORD', 'TRACK17_API_KEY', 'FEDEX_API_KEY', 'FEDEX_SECRET_KEY'):
+        for key in ('CLICKUP_TOKEN', 'CLICKUP_LIST_ID', 'SLACK_WEBHOOK_URL', 'EMAIL_APP_PASSWORD', 'TRACK17_API_KEY', 'FEDEX_API_KEY', 'FEDEX_SECRET_KEY', 'UPS_CLIENT_ID', 'UPS_CLIENT_SECRET'):
             val = request.form.get(key, '').strip()
             lines.append(f'{key}={val}')
         env_path.write_text('\n'.join(lines) + '\n')

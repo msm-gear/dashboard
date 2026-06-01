@@ -73,6 +73,36 @@
     </div>
   </div>
 
+  <!-- UPS Direct Tracking -->
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="text-2xl">🟤</span>
+      <div>
+        <h2 class="font-bold text-gray-800">Auto-Tracking (UPS)</h2>
+        <p class="text-xs text-gray-400">Polls UPS directly for 1Z tracking numbers. Free with a UPS developer account.</p>
+      </div>
+    </div>
+    <div class="space-y-4">
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Client ID</label>
+        <input type="password" name="UPS_CLIENT_ID"
+               value="{{ settings.ups_client_id }}"
+               placeholder="Your UPS Client ID"
+               class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-yellow-300">
+      </div>
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Client Secret</label>
+        <input type="password" name="UPS_CLIENT_SECRET"
+               value="{{ settings.ups_client_secret }}"
+               placeholder="Your UPS Client Secret"
+               class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-yellow-300">
+        <p class="text-xs text-gray-400 mt-1">
+          Get at: <strong>developer.ups.com → My Apps → Add App → Track API</strong>
+        </p>
+      </div>
+    </div>
+  </div>
+
   <!-- FedEx Direct Tracking -->
   <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
     <div class="flex items-center gap-3 mb-4">
@@ -154,4 +184,47 @@
   </div>
 
 </form>
+
+<!-- ClickUp Sync -->
+<div class="mt-8 bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
+  <div class="flex items-center justify-between gap-4">
+    <div class="flex items-center gap-3">
+      <span class="text-2xl">🔁</span>
+      <div>
+        <h2 class="font-bold text-gray-800">ClickUp Auto-Sync</h2>
+        <p class="text-xs text-gray-400">Imports tasks created directly in ClickUp into the local order registry. Runs automatically every 30 minutes. Click to run immediately.</p>
+      </div>
+    </div>
+    <button id="syncBtn" onclick="runSync()"
+            class="px-5 py-2 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-xl text-sm whitespace-nowrap transition-all">
+      Sync Now
+    </button>
+  </div>
+  <div id="syncResult" class="mt-3 text-sm hidden"></div>
+</div>
+
+<script>
+async function runSync() {
+  const btn = document.getElementById('syncBtn');
+  const res = document.getElementById('syncResult');
+  btn.disabled = true;
+  btn.textContent = 'Syncing…';
+  res.className = 'mt-3 text-sm hidden';
+  try {
+    const r = await fetch('/api/sync-clickup', {method: 'POST'});
+    const d = await r.json();
+    res.className = 'mt-3 text-sm ' + (d.ok ? 'text-green-700' : 'text-red-600');
+    if (d.error) {
+      res.textContent = 'Error: ' + d.error;
+    } else {
+      res.textContent = `Done — ${d.added} order(s) added, ${d.skipped} already tracked.`;
+    }
+  } catch(e) {
+    res.className = 'mt-3 text-sm text-red-600';
+    res.textContent = 'Request failed.';
+  }
+  btn.disabled = false;
+  btn.textContent = 'Sync Now';
+}
+</script>
 {% endblock %}
