@@ -110,7 +110,7 @@ function fmtRelative(iso) {
 
 function carrierUrl(tn, carrier) {
   const m = {
-    fedex: `https://www.fedex.com/apps/fedextrack/?tracknumbers=${tn}`,
+    fedex: `https://www.fedex.com/fedextrack/?trknbr=${tn}`,
     ups:   `https://www.ups.com/track?tracknum=${tn}`,
     usps:  `https://tools.usps.com/go/TrackConfirmAction?tLabels=${tn}`,
     dhl:   `https://www.dhl.com/us-en/home/tracking/tracking-express.html?submit=1&tracking-id=${tn}`,
