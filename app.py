@@ -5824,11 +5824,13 @@ def api_packing_verifier_data(order_id):
     if not order:
         return jsonify({'ok': False, 'error': 'Order not found'}), 404
 
-    gear_tasks       = order.get('gear_tasks', {})
-    manual_shipments = order.get('manual_shipments', [])
+    gear_tasks        = order.get('gear_tasks', {})
+    manual_shipments  = order.get('manual_shipments', [])
     tracking_statuses = order.get('tracking_statuses', {})
+    packing_list_rows = order.get('packing_list', [])
 
-    # Index shipments by gear_type
+    ordered_qty_map = _ordered_gear_types(order.get('order_sheet_url', '')) or {}
+
     shipped_by_gear = {}
     for ms in manual_shipments:
         g = ms.get('gear_type', '')
@@ -5837,15 +5839,18 @@ def api_packing_verifier_data(order_id):
 
     gear_checks = []
     for gear in gear_tasks:
-        shipments = shipped_by_gear.get(gear, [])
-        shipped   = bool(shipments)
-        tns       = list(dict.fromkeys(s.get('tracking_number', '') for s in shipments if s.get('tracking_number')))
-        boxes     = sum(s.get('box_count', 0) or 0 for s in shipments)
-        ship_date = min((s.get('ship_date', '') for s in shipments if s.get('ship_date')), default='')
-        tags      = list(dict.fromkeys(
+        shipments  = shipped_by_gear.get(gear, [])
+        shipped    = bool(shipments)
+        tns        = list(dict.fromkeys(s.get('tracking_number', '') for s in shipments if s.get('tracking_number')))
+        boxes      = sum(s.get('box_count', 0) or 0 for s in shipments)
+        ship_date  = min((s.get('ship_date', '') for s in shipments if s.get('ship_date')), default='')
+        tags       = list(dict.fromkeys(
             tracking_statuses.get(tn, {}).get('tag', 'Pending')
             for tn in tns
         ))
+        pl_for_gear = [r for r in packing_list_rows if r.get('gear_type') == gear]
+        ordered_qty = ordered_qty_map.get(gear, 0)
+        packed_qty  = _qty_from_packing_contents(gear, pl_for_gear)
         gear_checks.append({
             'gear':             gear,
             'shipped':          shipped,
@@ -5853,6 +5858,8 @@ def api_packing_verifier_data(order_id):
             'box_count':        boxes if shipped else 0,
             'ship_date':        ship_date,
             'delivery_tags':    tags,
+            'ordered_qty':      ordered_qty,
+            'packed_qty':       packed_qty,
         })
 
     missing     = [g['gear'] for g in gear_checks if not g['shipped']]
@@ -5884,6 +5891,9 @@ def api_generate_packing_list(order_id):
     packing_list_rows = order.get('packing_list', [])
     tracking_statuses = order.get('tracking_statuses', {})
     gear_tasks        = order.get('gear_tasks', {})
+    sheet_url         = order.get('order_sheet_url', '')
+
+    ordered_qty_map = _ordered_gear_types(sheet_url) or {}
 
     # Collect unique tracking numbers in order of first appearance
     seen_tns = []
@@ -5891,13 +5901,11 @@ def api_generate_packing_list(order_id):
         tn = ms.get('tracking_number', '')
         if tn and tn not in seen_tns:
             seen_tns.append(tn)
-    # Also pick up any TNs only in packing_list
     for row in packing_list_rows:
         tn = row.get('tracking_number', '')
         if tn and tn not in seen_tns:
             seen_tns.append(tn)
 
-    # Build summary rows: one row per gear type (ordered)
     ordered_gears = list(gear_tasks.keys()) if gear_tasks else list(
         dict.fromkeys(ms.get('gear_type', '') for ms in manual_shipments)
     )
@@ -5919,52 +5927,98 @@ def api_generate_packing_list(order_id):
 
     # ── Order Summary Table rows ──
     summary_rows_html = ''
+    total_ordered = 0
+    total_packed  = 0
     for i, gear in enumerate(ordered_gears):
-        shipments = shipped_by_gear.get(gear, [])
-        shipped   = bool(shipments)
-        tns       = list(dict.fromkeys(s.get('tracking_number', '') for s in shipments if s.get('tracking_number')))
-        boxes     = sum(s.get('box_count', 0) or 0 for s in shipments)
+        shipments  = shipped_by_gear.get(gear, [])
+        shipped    = bool(shipments)
+        tns        = list(dict.fromkeys(s.get('tracking_number', '') for s in shipments if s.get('tracking_number')))
+        boxes      = sum(s.get('box_count', 0) or 0 for s in shipments)
         ship_dates = sorted(set(s.get('ship_date', '') for s in shipments if s.get('ship_date')))
 
-        # PL contents detail for this gear across all TNs
-        pl_gears = [r for r in packing_list_rows if r.get('gear_type') == gear]
+        pl_gears    = [r for r in packing_list_rows if r.get('gear_type') == gear]
+        ordered_qty = ordered_qty_map.get(gear, 0)
+        parsed_qty  = _qty_from_packing_contents(gear, pl_gears)
+        # Use ordered qty as packed qty when shipped (parsed only reliable for size-breakdown gear)
+        packed_qty  = ordered_qty if (shipped and ordered_qty) else parsed_qty
+
+        total_ordered += ordered_qty
+        total_packed  += packed_qty
+
+        ordered_cell = f'{ordered_qty:,}' if ordered_qty else '—'
+        packed_cell  = f'{packed_qty:,}' if packed_qty else ('—' if not shipped else f'{boxes} box{"es" if boxes != 1 else ""}')
+
+        # Build detail string matching DFW format:
+        # Tees (size breakdown): "YL 177 · YXL 74 · YM 82"
+        # Jersey/Hoodie (teams per box): "J-1: 30 teams · J-2: 11 teams"
+        # Ring/Banner/Hypechain (explicit counts from contents)
+        _GEAR_ABBR = {
+            'Jersey': 'J', 'Hoodie': 'H', 'Tee': 'T', 'Windbreaker': 'WB',
+            'Cage Jacket': 'CJ', 'Ring': 'R', 'Cap': 'C',
+            'Hypechain': 'HC', 'Park Banner': 'PB', 'Name Banner': 'NB',
+            'Drawstring Bag': 'DB', 'Awards': 'AWD',
+        }
+        abbr   = _GEAR_ABBR.get(gear, gear[:2].upper())
         detail = ''
         if pl_gears:
-            box_labels = []
+            # Try size breakdown (e.g. Tees)
+            size_parts = []
             for r in pl_gears:
-                bnum = r.get('box_num', '')
-                cnt  = r.get('contents', '')
-                if bnum and cnt and cnt.lower() != 'see attached':
-                    box_labels.append(f"Box {bnum}: {cnt[:60]}{'…' if len(cnt) > 60 else ''}")
-                elif bnum:
-                    box_labels.append(f"Box {bnum}")
-            detail = ' &nbsp;·&nbsp; '.join(box_labels[:4])
+                cnt = (r.get('contents') or '').strip()
+                matches = re.findall(r'\b(YXS|YS|YM|YL|YXL|AS|AM|AL|AXL|AXXL|S|M|L|XL|XXL)[^\d]*(\d+)', cnt, re.I)
+                for sz, qty in matches:
+                    size_parts.append(f'{sz.upper()} {qty}')
+            if size_parts:
+                detail = ' · '.join(size_parts)
+            else:
+                # Try explicit item counts (rings-78, necklace-30 etc.)
+                item_counts = []
+                for r in pl_gears:
+                    cnt = (r.get('contents') or '').strip()
+                    for kw in ('ring', 'necklace', 'hypechain', 'namebanner', 'parkbanner',
+                               'parkbannner', 'cap', 'bag'):
+                        for m in re.finditer(rf'{re.escape(kw)}s?[\s\-](\d+)', cnt, re.I):
+                            item_counts.append(m.group(1))
+                if item_counts:
+                    detail = ' · '.join(f'×{q}' for q in item_counts[:4])
+                else:
+                    # Team-name contents: show "{abbr}-{box}: N teams" per box
+                    box_map = {}
+                    for r in pl_gears:
+                        bnum = r.get('box_num', '')
+                        cnt  = (r.get('contents') or '').strip()
+                        if bnum and cnt and cnt.lower() not in ('see attached', ''):
+                            teams_list = [t.strip() for t in cnt.split(',') if t.strip()]
+                            box_map[bnum] = len(teams_list)
+                    if box_map:
+                        detail = ' · '.join(
+                            f'{abbr}-{bn}: {cnt} team{"s" if cnt != 1 else ""}'
+                            for bn, cnt in sorted(box_map.items())
+                        )
         if not detail and shipments:
             notes = shipments[0].get('notes', '')
             detail = esc(notes[:80]) if notes else ''
 
-        # Delivery status from tracking_statuses
         tags = [tracking_statuses.get(tn, {}).get('tag', '') for tn in tns]
         if all(t == 'Delivered' for t in tags if t):
-            status_cell = '<span style="background:#dcfce7; color:#166534; border-radius:5px; padding:2px 8px; font-size:11px; font-weight:700;">✓ Delivered</span>'
+            status_cell = '<span style="background:#dcfce7; color:#166534; border-radius:5px; padding:2px 8px; font-size:11px; font-weight:700;">✓</span>'
         elif any(t in ('InTransit', 'OutForDelivery') for t in tags):
-            status_cell = '<span style="background:#fef9c3; color:#854d0e; border-radius:5px; padding:2px 8px; font-size:11px; font-weight:700;">⏳ In Transit</span>'
+            status_cell = '<span style="background:#fef9c3; color:#854d0e; border-radius:5px; padding:2px 8px; font-size:11px; font-weight:700;">⏳ Transit</span>'
         elif not shipped:
-            status_cell = '<span style="background:#fee2e2; color:#991b1b; border-radius:5px; padding:2px 8px; font-size:11px; font-weight:700;">✗ Not Shipped</span>'
+            status_cell = '<span style="background:#fee2e2; color:#991b1b; border-radius:5px; padding:2px 8px; font-size:11px; font-weight:700;">✗</span>'
         else:
             status_cell = '<span style="background:#dbeafe; color:#1e40af; border-radius:5px; padding:2px 8px; font-size:11px; font-weight:700;">Shipped</span>'
 
         tn_html = '<br>'.join(esc(tn) for tn in tns) if tns else '—'
         row_bg  = ' background:#fafafa;' if i % 2 == 1 else ''
-        ship_str = ', '.join(ship_dates) if ship_dates else '—'
 
         summary_rows_html += f'''
       <tr style="border-bottom:1px solid #f3f4f6;{row_bg}">
         <td style="padding:9px 14px; font-weight:600; color:#374151;">{esc(gear)}</td>
-        <td style="padding:9px 14px; text-align:center; color:#374151;">{esc(str(boxes)) if shipped else '—'}</td>
-        <td style="padding:9px 14px; font-size:11px; color:#6b7280;">{detail or '—'}</td>
+        <td style="padding:9px 14px; text-align:center; color:#374151;">{esc(ordered_cell)}</td>
+        <td style="padding:9px 14px; text-align:center; color:#374151;">{esc(packed_cell)}</td>
+        <td style="padding:9px 14px; font-size:11px; color:#6b7280;">{esc(detail) if detail else '—'}</td>
         <td style="padding:9px 14px; font-size:11px; color:#1a2b6b; font-family:monospace;">{tn_html}</td>
-        <td style="padding:9px 14px; font-size:11px; color:#6b7280;">{esc(ship_str)}</td>
         <td style="padding:9px 14px; text-align:center;">{status_cell}</td>
       </tr>'''
 
@@ -6160,18 +6214,27 @@ def api_generate_packing_list(order_id):
   <!-- Order Summary -->
   <div style="font-size:10px; font-weight:700; letter-spacing:1.5px; color:#9ca3af; text-transform:uppercase; margin-bottom:12px;">Order Summary</div>
 
-  <table style="width:100%; border-collapse:collapse; font-size:12.5px; margin-bottom:24px; border:1px solid #e5e7eb; border-radius:10px; overflow:hidden;">
+  <table style="width:100%; border-collapse:collapse; font-size:12.5px; margin-bottom:8px; border:1px solid #e5e7eb; border-radius:10px; overflow:hidden;">
     <thead>
       <tr style="background:#1a2b6b; color:#fff;">
         <th style="padding:10px 14px; text-align:left; font-weight:700; letter-spacing:0.5px; width:18%;">GEAR</th>
-        <th style="padding:10px 14px; text-align:center; font-weight:700; letter-spacing:0.5px; width:8%;">BOXES</th>
-        <th style="padding:10px 14px; text-align:left; font-weight:700; letter-spacing:0.5px;">CONTENTS</th>
-        <th style="padding:10px 14px; text-align:left; font-weight:700; letter-spacing:0.5px; width:22%;">TRACKING</th>
-        <th style="padding:10px 14px; text-align:left; font-weight:700; letter-spacing:0.5px; width:12%;">SHIP DATE</th>
+        <th style="padding:10px 14px; text-align:center; font-weight:700; letter-spacing:0.5px; width:10%;">ORDERED</th>
+        <th style="padding:10px 14px; text-align:center; font-weight:700; letter-spacing:0.5px; width:10%;">PACKED</th>
+        <th style="padding:10px 14px; text-align:left; font-weight:700; letter-spacing:0.5px;">DETAIL</th>
+        <th style="padding:10px 14px; text-align:left; font-weight:700; letter-spacing:0.5px; width:20%;">TRACKING</th>
         <th style="padding:10px 14px; text-align:center; font-weight:700; letter-spacing:0.5px; width:10%;">STATUS</th>
       </tr>
     </thead>
     <tbody>{summary_rows_html}</tbody>
+    <tfoot>
+      <tr style="background:#8B1A1A; color:#fff;">
+        <td style="padding:11px 14px; font-weight:800; font-size:13px; letter-spacing:0.5px;">TOTAL</td>
+        <td style="padding:11px 14px; text-align:center; font-weight:800; font-size:13px;">{f"{total_ordered:,}" if total_ordered else "—"}</td>
+        <td style="padding:11px 14px; text-align:center; font-weight:800; font-size:13px;">{f"{total_packed:,}" if total_packed else "—"}</td>
+        <td colspan="2"></td>
+        <td style="padding:11px 14px; text-align:center;"><span style="background:#fff; color:#166534; border-radius:5px; padding:2px 8px; font-size:11px; font-weight:700;">✓</span></td>
+      </tr>
+    </tfoot>
   </table>
 
   <!-- Tracking Sections -->
