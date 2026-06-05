@@ -6462,6 +6462,24 @@ def api_generate_packing_list(order_id):
                 school = tok.title()
                 teams.setdefault(school, {})[gear_t] = bnum
 
+        # Fallback: if no packing list team data, pull school names from order sheet
+        # and assign all to box 1 (no packing list = box assignment unknown)
+        if not teams and sheet_url:
+            team_gears_in_tn = [g for g in gears_in_tn if g in _TEAM_GEAR_TYPES]
+            for tg in team_gears_in_tn:
+                sqmap = _sheet_qty.get(tg) or _order_sheet_qty_per_team(
+                    sheet_url, tg, order.get('order_num', ''), str(num)
+                )
+                if sqmap:
+                    _sheet_qty[tg] = sqmap
+                    if tg not in team_gears:
+                        team_gears.append(tg)
+                    for school_lower, qty in sqmap.items():
+                        school = school_lower.title()
+                        if school not in teams:
+                            teams[school] = {}
+                        teams[school][tg] = 1  # box 1 — no packing list to indicate split
+
         table_rows_html = ''
         if teams and team_gears:
             # Jersey always before Hoodie to match DFW column order
