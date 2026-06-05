@@ -79,6 +79,7 @@ def block_external_admin():
             request.path.startswith('/public/') or
             request.path == '/public/login' or
             request.path == '/public/logout' or
+            request.path.startswith('/packing-doc/') or
             request.path.startswith('/api/tracking-status') or
             request.path.startswith('/api/order-sheet') or
             request.path.startswith('/api/shipment-status') or
@@ -110,8 +111,10 @@ def block_external_admin():
 
 UPLOAD_FOLDER = Path(__file__).parent / 'uploads'
 DATA_FOLDER = Path(__file__).parent / 'data'
+PACKING_DOCS_FOLDER = UPLOAD_FOLDER / 'packing_docs'
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 DATA_FOLDER.mkdir(exist_ok=True)
+PACKING_DOCS_FOLDER.mkdir(exist_ok=True)
 
 CARRIERS = [
     ('fedex', 'FedEx'),
@@ -238,8 +241,8 @@ GEAR_CODES = {
     'Hoodie': 'HOD',
     'Tee': 'TEE',
     'Cap': 'CAP',
-    'Cage Jacket': 'CAG',
-    'Windbreaker': 'WNB',
+    'Cage Jacket': 'CAG',  # Fall only
+    'Windbreaker': 'WNB',  # Summer only
     'Ring': 'RNG',
     'Hypechain': 'HYC',
     'Awards': 'AWD',       # Rings & Hype Chains shipped together
@@ -1183,6 +1186,23 @@ def check_all_fedex_statuses(notify_changes: bool = False) -> dict:
             statuses[tn] = entry
             updated += 1
 
+            # Push Delivered phase to ClickUp when auto-detected
+            if new_tag == 'Delivered' and order.get('gear_tasks') and get_settings()['clickup_token']:
+                actual_ms = None
+                if delivered_at:
+                    try:
+                        actual_ms = int(datetime.strptime(delivered_at, '%Y-%m-%d').replace(
+                            hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+                    except (ValueError, TypeError):
+                        pass
+                if actual_ms is None:
+                    actual_ms = int(datetime.now().replace(
+                        hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+                try:
+                    _sync_delivered_to_clickup(order, tn, actual_ms, all_orders=orders)
+                except Exception:
+                    pass
+
             if notify_changes and _should_notify_today(new.get('event_time', '')):
                 msg  = _build_mac_message(order, tn, new_tag, note)
                 label, _ = _tag_info(new_tag)
@@ -1748,12 +1768,23 @@ def update_task_for_shipment(task_id: str, tracking_str: str, ship_date_ms):
 
 # ── Delivered sync helpers ───────────────────────────────────────────────────
 
+_clickup_task_cache: dict = {}  # task_id -> (fetched_at, task)
+_CLICKUP_CACHE_TTL = 300  # seconds (5 min)
+
 def _get_clickup_task(task_id: str):
+    import time
+    now = time.time()
+    if task_id in _clickup_task_cache:
+        fetched_at, task = _clickup_task_cache[task_id]
+        if now - fetched_at < _CLICKUP_CACHE_TTL:
+            return task
     resp = requests.get(
         f"https://api.clickup.com/api/v2/task/{task_id}",
         headers=clickup_headers(), timeout=10,
     )
-    return resp.json() if resp.status_code == 200 else None
+    task = resp.json() if resp.status_code == 200 else None
+    _clickup_task_cache[task_id] = (now, task)
+    return task
 
 
 def _next_subtask_letter(subtasks: list) -> str:
@@ -2638,10 +2669,16 @@ def push_update_ship():
     ship_date       = body.get('ship_date', '').strip()   # YYYY-MM-DD
     notes           = body.get('notes', '').strip()
     declared_value  = body.get('declared_value', '').strip()
+    service_type    = body.get('service_type', '').strip()  # FedEx service type for AfterShip
     try:
         box_count = max(1, int(body.get('box_count', 1)))
     except (TypeError, ValueError):
         box_count = 1
+    # Fall back to parsing box count from notes if still at default
+    if box_count == 1 and notes:
+        bc_m = re.search(r'\b(\d+)\s+box(?:es)?\b', notes, re.IGNORECASE)
+        if bc_m:
+            box_count = max(1, int(bc_m.group(1)))
 
     if not tracking_number:
         return jsonify({'ok': False, 'error': 'Tracking number is required.'})
@@ -2759,15 +2796,18 @@ def push_update_ship():
             if notes:
                 desc += f"\nNotes: {notes}"
 
+            sub_cf_ship = [{'id': fid, 'value': val} for fid, val in sub_fields_map.items()]
             sresp = create_clickup_task({
                 'name':         sub_name,
                 'parent':       task_id,
                 'description':  desc,
-                'custom_fields': [{'id': fid, 'value': val} for fid, val in sub_fields_map.items()],
+                'custom_fields': sub_cf_ship,
             })
             if sresp.status_code in (200, 201):
                 new_sub_id = sresp.json().get('id', '')
                 if new_sub_id:
+                    for f in sub_cf_ship:
+                        set_clickup_field(new_sub_id, f['id'], f['value'])
                     requests.post(
                         f"https://api.clickup.com/api/v2/task/{new_sub_id}/comment",
                         headers=clickup_headers(), json={"comment_text": comment_text}, timeout=10,
@@ -2820,15 +2860,18 @@ def push_update_ship():
                         sfm[CF_ORDER_TEXT] = sub_code
                     sfm.pop(CF_RECEIVING, None)
 
+                    sfm_list = [{'id': fid, 'value': val} for fid, val in sfm.items()]
                     sresp = create_clickup_task({
                         'name':          sub_name,
                         'parent':        task_id,
                         'description':   f"Gear: {gear}\nTracking: {sub_tn}",
-                        'custom_fields': [{'id': fid, 'value': val} for fid, val in sfm.items()],
+                        'custom_fields': sfm_list,
                     })
                     if sresp.status_code in (200, 201):
                         new_sub_id = sresp.json().get('id', '')
                         if new_sub_id:
+                            for f in sfm_list:
+                                set_clickup_field(new_sub_id, f['id'], f['value'])
                             requests.post(
                                 f"https://api.clickup.com/api/v2/task/{new_sub_id}/comment",
                                 headers=clickup_headers(), json={"comment_text": sub_comment}, timeout=10,
@@ -2842,6 +2885,7 @@ def push_update_ship():
         # Replace existing entry for same gear+tracking or append new
         existing = next((m for m in manual if m['gear_type'] == gear_type
                          and m['tracking_number'] == tracking_number), None)
+        detected_carrier = _detect_carrier(tracking_number)
         entry = {
             'gear_type':       gear_type,
             'tracking_number': tracking_number,
@@ -2850,7 +2894,8 @@ def push_update_ship():
             'notes':           notes,
             'box_count':       box_count,
             'added_at':        datetime.now().isoformat(),
-            'carrier':         'FedEx',
+            'carrier':         'UPS' if detected_carrier == 'ups' else 'FedEx',
+            'service_type':    service_type,
         }
         if existing:
             existing.update(entry)
@@ -2889,14 +2934,11 @@ def fetch_order_sheet():
 
     sheet_id = m.group(1)
 
-    season = (body.get('season') or '').strip()
-    jacket_gear = 'Windbreaker' if season.lower() == 'summer' else 'Cage Jacket'
-
     SUMMARY_GEAR_MAP = {
         'jerseys': 'Jersey', 'jersey': 'Jersey',
         'hoodies': 'Hoodie', 'hoodie': 'Hoodie',
         'tees': 'Tee', 'tee': 'Tee',
-        'jackets': jacket_gear, 'jacket': jacket_gear,
+        'jackets': 'Windbreaker', 'jacket': 'Windbreaker',
         'cage jackets': 'Cage Jacket', 'cage jacket': 'Cage Jacket',
         'windbreakers': 'Windbreaker', 'windbreaker': 'Windbreaker',
         'caps': 'Cap', 'cap': 'Cap',
@@ -3301,6 +3343,8 @@ def push_clickup():
                 continue
 
             task_id = resp.json().get('id')
+            for f in custom_fields:
+                set_clickup_field(task_id, f['id'], f['value'])
             parent_task_ids[gear_type] = task_id
             new_gear_tasks[gear_type]  = task_id
             results.append({'gear': gear_type, 'task_id': task_id,
@@ -3385,6 +3429,7 @@ def push_clickup():
             if sub_ship_ms:
                 sub_fields_map[CF_PHASE] = 3
 
+            sub_cf_list = [{'id': fid, 'value': val} for fid, val in sub_fields_map.items()]
             sresp = create_clickup_task({
                 'name':   sub_name,
                 'parent': parent_id,
@@ -3394,12 +3439,15 @@ def push_clickup():
                     f"Declared Value: {'; '.join(values)}\n"
                     f"Carrier: {carrier}"
                 ),
-                'custom_fields': [{'id': fid, 'value': val} for fid, val in sub_fields_map.items()],
+                'custom_fields': sub_cf_list,
             })
             if sresp.status_code in (200, 201):
+                sub_id = sresp.json().get('id')
+                for f in sub_cf_list:
+                    set_clickup_field(sub_id, f['id'], f['value'])
                 for r in results:
                     if r['gear'] == gear_type:
-                        r['subtasks'].append(sresp.json().get('id'))
+                        r['subtasks'].append(sub_id)
                         break
                 if letter_base is None:
                     existing_subs.append({'name': f'{base_name}{letter}'})
@@ -3563,7 +3611,13 @@ def push_clickup_order_only():
                 'custom_fields': custom_fields,
             })
             if resp.status_code in (200, 201):
-                results.append({'gear': gear_type, 'task_id': resp.json().get('id'), 'action': 'created'})
+                new_id = resp.json().get('id')
+                results.append({'gear': gear_type, 'task_id': new_id, 'action': 'created'})
+                # Set each field individually — the create payload silently drops fields
+                # that ClickUp can't validate at creation time (date fields, dropdowns, etc.)
+                all_create_fields = custom_fields[:]  # includes dates + phase + order_status etc.
+                for f in all_create_fields:
+                    set_clickup_field(new_id, f['id'], f['value'])
             else:
                 errors.append(f"{gear_type}: {resp.status_code} {resp.text[:100]}")
 
@@ -3783,18 +3837,27 @@ def aftership_csv():
         if not all_entries:
             continue
 
-        # Use first order's code as the CSV order_id field
-        first_sport    = first_order.get('sport', 'BSBL')
+        # Use first order's code as the CSV order_id field.
+        # Prefer ClickUp subtask CF_ORDER_TEXT (has letter suffix like "1B").
+        first_sport     = first_order.get('sport', 'BSBL')
         first_order_num = first_order.get('num_for_code', first_order.get('order_num', ''))
-        first_entries  = [x for x in first_order.get('manual_shipments', [])
-                          if x.get('tracking_number', '').strip() == tn]
-        first_gear     = first_entries[0].get('gear_type', '') if first_entries else ''
-        order_code     = build_order_code(market, first_sport, first_gear, order_date, first_order_num)
+        first_entries   = [x for x in first_order.get('manual_shipments', [])
+                           if x.get('tracking_number', '').strip() == tn]
+        first_gear      = first_entries[0].get('gear_type', '') if first_entries else ''
+        order_code      = build_order_code(market, first_sport, first_gear, order_date, first_order_num)
+        first_task_id   = first_order.get('gear_tasks', {}).get(first_gear)
+        if first_task_id:
+            for sub in _get_clickup_subtasks(first_task_id):
+                if _get_task_cf(sub, CF_TRACKING) == tn:
+                    sub_code = _get_task_cf(sub, CF_ORDER_TEXT)
+                    if sub_code:
+                        order_code = sub_code
+                    break
 
         # Aggregate across all orders — count physical boxes.
-        # Gears with the same non-empty notes share a physical box group;
-        # use the MAX box_count within that group (not just 1 per unique note).
-        # Gears with no notes each contribute their individual box_count.
+        # Same notes + same box_count → shared physical boxes (use count once).
+        # Same notes + different box_counts → distinct boxes per gear (sum them).
+        # No notes → each entry contributes its own box_count.
         _notes_groups: dict = {}  # notes str → list of box_counts
         _solo_boxes = 0
         for e in all_entries:
@@ -3805,7 +3868,7 @@ def aftership_csv():
             else:
                 _solo_boxes += bc
         box_count = _solo_boxes + sum(
-            max((c for c in counts if c > 0), default=1)
+            counts[0] if len(set(counts)) == 1 else sum(counts)
             for counts in _notes_groups.values()
         )
         declared_vals = [e.get('declared_value', '').strip() for e in all_entries if e.get('declared_value', '').strip()]
@@ -3839,7 +3902,12 @@ def aftership_csv():
             origin_state   = 'Shanghai'
             origin_city    = 'Shanghai'
         else:
-            shipment_type  = 'FedEx International Connect Plus'
+            # Use stored service_type from any matching manual_shipment, else default
+            stored_service = next(
+                (e.get('service_type', '') for e in all_entries if e.get('service_type')),
+                ''
+            )
+            shipment_type  = stored_service or 'FedEx International Connect Plus'
             origin_state   = 'Shandong'
             origin_city    = 'Qingdao'
 
@@ -3956,12 +4024,19 @@ def _collect_shipments(order: dict) -> list:
                 tn_info[tn]['added_at'] = m['added_at']
         gt = m.get('gear_type', '')
         if gt:
-            tn_info[tn].setdefault('gear_notes', {})[gt] = m.get('notes', '')
+            notes_str = m.get('notes', '')
+            tn_info[tn].setdefault('gear_notes', {})[gt] = notes_str
             if not has_pl:
                 try:
                     boxes = max(1, int(m.get('box_count', 1)))
                 except (TypeError, ValueError):
                     boxes = 1
+                # If box_count is still the default (1), try parsing from notes
+                # e.g. "2 Boxes", "7 boxes", "3 box"
+                if boxes == 1 and notes_str:
+                    bc_m = re.search(r'\b(\d+)\s+box(?:es)?\b', notes_str, re.IGNORECASE)
+                    if bc_m:
+                        boxes = max(1, int(bc_m.group(1)))
                 tn_info[tn]['gear_types'][gt] = tn_info[tn]['gear_types'].get(gt, 0) + boxes
 
     # For manual-only TNs (no packing list): gears sharing the same non-empty notes
@@ -4060,17 +4135,18 @@ def _build_tracking_payload():
         shipments.sort(key=lambda s: s.get('updated_at', '') or order.get('shipped_at', ''), reverse=True)
         dest = _ship_to_info(order.get('market', ''))
         result_orders.append({
-            'id':          order.get('id'),
-            'market':      order.get('market', ''),
-            'sport':       order.get('sport', ''),
-            'season':      order.get('season', ''),
-            'order_num':   order.get('num_for_code', order.get('order_num', '')),
-            'order_date':  order.get('order_date', ''),
-            'shipped_at':  order.get('shipped_at', ''),
-            'gear_tasks':  order.get('gear_tasks', {}),
-            'shipments':   shipments,
-            'dest_state':  dest.get('state', '') if dest else '',
-            'dest_city':   dest.get('city', '') if dest else '',
+            'id':           order.get('id'),
+            'market':       order.get('market', ''),
+            'sport':        order.get('sport', ''),
+            'season':       order.get('season', ''),
+            'order_num':    order.get('num_for_code', order.get('order_num', '')),
+            'order_date':   order.get('order_date', ''),
+            'shipped_at':   order.get('shipped_at', ''),
+            'gear_tasks':   order.get('gear_tasks', {}),
+            'shipments':    shipments,
+            'dest_state':   dest.get('state', '') if dest else '',
+            'dest_city':    dest.get('city', '') if dest else '',
+            'packing_docs': order.get('packing_docs', []),
         })
     return {
         'ok':              True,
@@ -4114,6 +4190,62 @@ def _build_slack_update(order: dict, tn: str, tag: str, notes: str) -> str:
         lines.append(f"*Notes:* {notes}")
     lines.append(f"\n_Updated {_fmt_cst()}_")
     return '\n'.join(lines)
+
+
+@app.route('/packing-doc/<order_id>/<filename>')
+def serve_packing_doc(order_id, filename):
+    safe     = secure_filename(filename)
+    filepath = PACKING_DOCS_FOLDER / secure_filename(order_id) / safe
+    if not filepath.exists():
+        return 'Not found', 404
+    # Look up the download_name from orders.json
+    orders   = load_orders()
+    order    = next((o for o in orders if o.get('id') == order_id), None)
+    dl_name  = filename
+    if order:
+        doc = next((d for d in order.get('packing_docs', []) if d.get('filename') == safe), None)
+        if doc and doc.get('download_name'):
+            dl_name = doc['download_name']
+    as_attachment = request.args.get('dl') == '1'
+    return send_file(str(filepath), as_attachment=as_attachment, download_name=dl_name)
+
+
+@app.route('/api/order/<order_id>/packing-doc', methods=['POST'])
+def upload_packing_doc(order_id):
+    orders = load_orders()
+    order = next((o for o in orders if o.get('id') == order_id), None)
+    if not order:
+        return jsonify({'ok': False, 'error': 'Order not found'}), 404
+    f = request.files.get('file')
+    if not f or not f.filename:
+        return jsonify({'ok': False, 'error': 'No file provided'}), 400
+    label    = request.form.get('label', '').strip()
+    filename = secure_filename(f.filename)
+    folder   = PACKING_DOCS_FOLDER / secure_filename(order_id)
+    folder.mkdir(exist_ok=True)
+    f.save(str(folder / filename))
+    doc = {'filename': filename, 'label': label or filename, 'uploaded_at': datetime.now().isoformat()}
+    order.setdefault('packing_docs', [])
+    order['packing_docs'] = [d for d in order['packing_docs'] if d['filename'] != filename]
+    order['packing_docs'].append(doc)
+    save_orders(orders)
+    return jsonify({'ok': True, 'doc': doc})
+
+
+@app.route('/api/order/<order_id>/packing-doc', methods=['DELETE'])
+def delete_packing_doc(order_id):
+    body     = request.get_json() or {}
+    filename = secure_filename(body.get('filename', ''))
+    orders   = load_orders()
+    order    = next((o for o in orders if o.get('id') == order_id), None)
+    if not order:
+        return jsonify({'ok': False, 'error': 'Order not found'}), 404
+    filepath = PACKING_DOCS_FOLDER / secure_filename(order_id) / filename
+    if filepath.exists():
+        filepath.unlink()
+    order['packing_docs'] = [d for d in order.get('packing_docs', []) if d['filename'] != filename]
+    save_orders(orders)
+    return jsonify({'ok': True})
 
 
 @app.route('/tracking')
@@ -4293,26 +4425,25 @@ def api_dashboard_reminders():
             f"{order.get('sport')} #{order.get('num_for_code', order.get('order_num'))}"
         )
 
-        # ── ETA to Zees reminder (7-day and 14-day warning) ──────────────────
-        # Skip only if every gear has been shipped AND every TN is Delivered
-        tracking_statuses = order.get('tracking_statuses', {})
+        # ── ETA to Zees reminder ─────────────────────────────────────────────
+        # Show if any gear is unshipped OR any tracking number is not yet delivered.
         gear_types = set(order.get('gear_tasks', {}).keys())
         shipped_gears = (
             {ms.get('gear_type') for ms in order.get('manual_shipments', [])} |
             {row.get('gear_type') for row in order.get('packing_list', [])}
         )
-        all_shipped   = bool(gear_types) and gear_types.issubset(shipped_gears)
+        all_shipped = bool(gear_types) and gear_types.issubset(shipped_gears)
+        tracking_statuses = order.get('tracking_statuses', {})
         all_tn_delivered = (
             bool(tracking_statuses) and
             all(v.get('tag') == 'Delivered' for v in tracking_statuses.values())
         )
-        order_fully_done = all_shipped and all_tn_delivered
         eta_zees_str = order.get('eta_to_zees', '')
-        if eta_zees_str and not order_fully_done:
+        if eta_zees_str and not (all_shipped and all_tn_delivered):
             try:
                 eta_date   = datetime.fromisoformat(eta_zees_str).date()
                 days_until = (eta_date - today).days
-                if 1 <= days_until <= 14:
+                if days_until <= 7:   # overdue or within 7 days (1 week prior)
                     reminders.append({
                         'order_id':    order.get('id'),
                         'order_label': order_label,
@@ -4352,23 +4483,38 @@ def api_dashboard_reminders():
             ship_act            = _act(CF_SHIP_DATE_ACT)
             delivery_act        = _act(CF_DELIVERY_DATE_ACT)
 
+            # Fallback: if CF_SHIP_DATE_ACT not set in ClickUp, check manual_shipments
+            if ship_act is None:
+                for ms in order.get('manual_shipments', []):
+                    if ms.get('gear_type') == gear_type and ms.get('ship_date'):
+                        try:
+                            sd = datetime.strptime(ms['ship_date'], '%Y-%m-%d')
+                            ship_act = int(sd.timestamp() * 1000)
+                        except ValueError:
+                            pass
+                        break
+
             for f in fields:
                 label = _REMINDER_CF_LABELS.get(f['id'])
                 if not label:
                     continue
 
                 milestone_date = datetime.fromtimestamp(f['value'] / 1000).date()
-                if milestone_date > today:
+                days_diff = (milestone_date - today).days
+
+                # Delivery Date: show from 7 days before until delivered
+                # All other milestones: only show if overdue
+                if label == 'Delivery Date':
+                    if days_diff > 7:
+                        continue
+                elif milestone_date > today:
                     continue
 
                 # Condition per milestone type — only show if the action hasn't happened yet
                 if label in ('Proofs Ready', 'Proofs Approved'):
-                    # Skip if proofs approved actual is set, OR if already shipped
-                    # (shipped implies proofs were done even if actual date wasn't recorded)
                     if proofs_approved_act is not None or ship_act is not None:
                         continue
                 elif label == 'Ship Date':
-                    # Skip if already shipped
                     if ship_act is not None:
                         continue
                 elif label == 'Delivery Date':
@@ -5243,8 +5389,19 @@ def api_order_sheet_teams():
 
 @app.route('/api/dashboard-data')
 def api_dashboard_data():
+    from concurrent.futures import ThreadPoolExecutor
     orders = load_display_orders()
     result = []
+
+    # Pre-fetch all ClickUp tasks in parallel to avoid sequential HTTP calls
+    all_task_ids = list({
+        tid
+        for o in orders
+        for tid in o.get('gear_tasks', {}).values()
+        if tid
+    })
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        list(ex.map(_get_clickup_task, all_task_ids))
 
     for order in orders:
         order_date_str = order.get('order_date', '')
@@ -5652,6 +5809,418 @@ def add_inventory_log():
     entries.insert(0, entry)
     _save_inv_log(entries)
     return jsonify({'ok': True, 'id': entry['id']})
+
+
+@app.route('/packing-verifier')
+def packing_verifier():
+    orders = load_display_orders()
+    return render_template('packing_verifier.html', orders=orders)
+
+
+@app.route('/api/packing-verifier-data/<order_id>')
+def api_packing_verifier_data(order_id):
+    orders = load_orders()
+    order  = next((o for o in orders if o.get('id') == order_id), None)
+    if not order:
+        return jsonify({'ok': False, 'error': 'Order not found'}), 404
+
+    gear_tasks       = order.get('gear_tasks', {})
+    manual_shipments = order.get('manual_shipments', [])
+    tracking_statuses = order.get('tracking_statuses', {})
+
+    # Index shipments by gear_type
+    shipped_by_gear = {}
+    for ms in manual_shipments:
+        g = ms.get('gear_type', '')
+        shipped_by_gear.setdefault(g, [])
+        shipped_by_gear[g].append(ms)
+
+    gear_checks = []
+    for gear in gear_tasks:
+        shipments = shipped_by_gear.get(gear, [])
+        shipped   = bool(shipments)
+        tns       = list(dict.fromkeys(s.get('tracking_number', '') for s in shipments if s.get('tracking_number')))
+        boxes     = sum(s.get('box_count', 0) or 0 for s in shipments)
+        ship_date = min((s.get('ship_date', '') for s in shipments if s.get('ship_date')), default='')
+        tags      = list(dict.fromkeys(
+            tracking_statuses.get(tn, {}).get('tag', 'Pending')
+            for tn in tns
+        ))
+        gear_checks.append({
+            'gear':             gear,
+            'shipped':          shipped,
+            'tracking_numbers': tns,
+            'box_count':        boxes if shipped else 0,
+            'ship_date':        ship_date,
+            'delivery_tags':    tags,
+        })
+
+    missing     = [g['gear'] for g in gear_checks if not g['shipped']]
+    all_shipped = len(missing) == 0 and len(gear_checks) > 0
+
+    return jsonify({
+        'ok':          True,
+        'all_shipped': all_shipped,
+        'missing':     missing,
+        'gear_checks': gear_checks,
+    })
+
+
+@app.route('/api/generate-packing-list/<order_id>', methods=['POST'])
+def api_generate_packing_list(order_id):
+    import subprocess, tempfile, html as html_lib
+
+    orders = load_orders()
+    order  = next((o for o in orders if o.get('id') == order_id), None)
+    if not order:
+        return jsonify({'ok': False, 'error': 'Order not found'}), 404
+
+    market   = order.get('market', '')
+    sport    = order.get('sport', 'BSBL')
+    season   = order.get('season', 'Summer')
+    num      = order.get('num_for_code', order.get('order_num', '1'))
+    order_date = order.get('order_date', '')
+    manual_shipments  = order.get('manual_shipments', [])
+    packing_list_rows = order.get('packing_list', [])
+    tracking_statuses = order.get('tracking_statuses', {})
+    gear_tasks        = order.get('gear_tasks', {})
+
+    # Collect unique tracking numbers in order of first appearance
+    seen_tns = []
+    for ms in manual_shipments:
+        tn = ms.get('tracking_number', '')
+        if tn and tn not in seen_tns:
+            seen_tns.append(tn)
+    # Also pick up any TNs only in packing_list
+    for row in packing_list_rows:
+        tn = row.get('tracking_number', '')
+        if tn and tn not in seen_tns:
+            seen_tns.append(tn)
+
+    # Build summary rows: one row per gear type (ordered)
+    ordered_gears = list(gear_tasks.keys()) if gear_tasks else list(
+        dict.fromkeys(ms.get('gear_type', '') for ms in manual_shipments)
+    )
+
+    shipped_by_gear = {}
+    for ms in manual_shipments:
+        g = ms.get('gear_type', '')
+        shipped_by_gear.setdefault(g, [])
+        shipped_by_gear[g].append(ms)
+
+    pl_by_tn = {}
+    for row in packing_list_rows:
+        tn = row.get('tracking_number', '')
+        pl_by_tn.setdefault(tn, [])
+        pl_by_tn[tn].append(row)
+
+    def esc(v):
+        return html_lib.escape(str(v or ''))
+
+    # ── Order Summary Table rows ──
+    summary_rows_html = ''
+    for i, gear in enumerate(ordered_gears):
+        shipments = shipped_by_gear.get(gear, [])
+        shipped   = bool(shipments)
+        tns       = list(dict.fromkeys(s.get('tracking_number', '') for s in shipments if s.get('tracking_number')))
+        boxes     = sum(s.get('box_count', 0) or 0 for s in shipments)
+        ship_dates = sorted(set(s.get('ship_date', '') for s in shipments if s.get('ship_date')))
+
+        # PL contents detail for this gear across all TNs
+        pl_gears = [r for r in packing_list_rows if r.get('gear_type') == gear]
+        detail = ''
+        if pl_gears:
+            box_labels = []
+            for r in pl_gears:
+                bnum = r.get('box_num', '')
+                cnt  = r.get('contents', '')
+                if bnum and cnt and cnt.lower() != 'see attached':
+                    box_labels.append(f"Box {bnum}: {cnt[:60]}{'…' if len(cnt) > 60 else ''}")
+                elif bnum:
+                    box_labels.append(f"Box {bnum}")
+            detail = ' &nbsp;·&nbsp; '.join(box_labels[:4])
+        if not detail and shipments:
+            notes = shipments[0].get('notes', '')
+            detail = esc(notes[:80]) if notes else ''
+
+        # Delivery status from tracking_statuses
+        tags = [tracking_statuses.get(tn, {}).get('tag', '') for tn in tns]
+        if all(t == 'Delivered' for t in tags if t):
+            status_cell = '<span style="background:#dcfce7; color:#166534; border-radius:5px; padding:2px 8px; font-size:11px; font-weight:700;">✓ Delivered</span>'
+        elif any(t in ('InTransit', 'OutForDelivery') for t in tags):
+            status_cell = '<span style="background:#fef9c3; color:#854d0e; border-radius:5px; padding:2px 8px; font-size:11px; font-weight:700;">⏳ In Transit</span>'
+        elif not shipped:
+            status_cell = '<span style="background:#fee2e2; color:#991b1b; border-radius:5px; padding:2px 8px; font-size:11px; font-weight:700;">✗ Not Shipped</span>'
+        else:
+            status_cell = '<span style="background:#dbeafe; color:#1e40af; border-radius:5px; padding:2px 8px; font-size:11px; font-weight:700;">Shipped</span>'
+
+        tn_html = '<br>'.join(esc(tn) for tn in tns) if tns else '—'
+        row_bg  = ' background:#fafafa;' if i % 2 == 1 else ''
+        ship_str = ', '.join(ship_dates) if ship_dates else '—'
+
+        summary_rows_html += f'''
+      <tr style="border-bottom:1px solid #f3f4f6;{row_bg}">
+        <td style="padding:9px 14px; font-weight:600; color:#374151;">{esc(gear)}</td>
+        <td style="padding:9px 14px; text-align:center; color:#374151;">{esc(str(boxes)) if shipped else '—'}</td>
+        <td style="padding:9px 14px; font-size:11px; color:#6b7280;">{detail or '—'}</td>
+        <td style="padding:9px 14px; font-size:11px; color:#1a2b6b; font-family:monospace;">{tn_html}</td>
+        <td style="padding:9px 14px; font-size:11px; color:#6b7280;">{esc(ship_str)}</td>
+        <td style="padding:9px 14px; text-align:center;">{status_cell}</td>
+      </tr>'''
+
+    # ── Per-tracking-number sections ──
+    tn_sections_html = ''
+    for tn in seen_tns:
+        pl_rows = pl_by_tn.get(tn, [])
+        # Find shipment meta for this TN (weight, declared, ship_date, boxes)
+        ms_for_tn = [s for s in manual_shipments if s.get('tracking_number') == tn]
+        ts_info   = tracking_statuses.get(tn, {})
+        tag       = ts_info.get('tag', '')
+        delivered_at = ts_info.get('delivered_at', '')
+
+        if tag == 'Delivered' and delivered_at:
+            status_str = f'<strong style="color:#86efac;">✓ Delivered {delivered_at}</strong>'
+        elif tag in ('InTransit', 'OutForDelivery'):
+            loc = ts_info.get('location', '') or ts_info.get('notes', '')
+            status_str = f'<strong style="color:#fcd34d;">⏳ In Transit{" — " + esc(loc) if loc else ""}</strong>'
+        else:
+            shipped_gears = [s.get('gear_type', '') for s in ms_for_tn]
+            status_str = esc(', '.join(g for g in shipped_gears if g) or 'Shipped')
+
+        ship_date_str = ''
+        all_ship_dates = sorted(set(s.get('ship_date', '') for s in ms_for_tn if s.get('ship_date')))
+        if all_ship_dates:
+            ship_date_str = f'Shipped {" / ".join(all_ship_dates)} &nbsp;·&nbsp; '
+
+        # Total physical boxes for this TN
+        total_boxes = sum(s.get('box_count', 0) or 0 for s in ms_for_tn)
+        if total_boxes == 0 and pl_rows:
+            box_nums = set(r.get('box_num') for r in pl_rows if r.get('box_num'))
+            total_boxes = len(box_nums)
+        weight_vals = list(set(s.get('weight', '') for s in ms_for_tn if s.get('weight')))
+        weight_str  = ', '.join(str(w).replace('KG', '').strip() + ' KG' for w in weight_vals if w) or ''
+
+        # Gears in this TN
+        gears_in_tn = list(dict.fromkeys(
+            s.get('gear_type', '') for s in ms_for_tn if s.get('gear_type')
+        ))
+
+        # Box contents summary line from packing list
+        contents_summary = ''
+        if pl_rows:
+            parts = []
+            for r in pl_rows:
+                bnum = r.get('box_num', '')
+                gear = r.get('gear_type', '')
+                cnt  = r.get('contents', '')
+                if cnt and cnt.lower() not in ('see attached', ''):
+                    parts.append(f'<strong>{esc(gear)} Box {bnum}</strong> — {esc(cnt[:120])}')
+                elif bnum:
+                    parts.append(f'<strong>{esc(gear)} Box {bnum}</strong>')
+            contents_summary = ' &nbsp;&nbsp; '.join(parts[:8])
+
+        # Contents table rows (team-level from packing list, grouped by team)
+        teams = {}
+        for r in pl_rows:
+            gear_t = r.get('gear_type', '')
+            cnt    = r.get('contents', '')
+            bnum   = r.get('box_num', '')
+            if cnt and cnt.lower() not in ('see attached', ''):
+                for team in cnt.split(','):
+                    team = team.strip().title()
+                    if team:
+                        teams.setdefault(team, {})[gear_t] = bnum
+
+        table_rows_html = ''
+        if teams:
+            sorted_teams = sorted(teams.keys())
+            col_gears    = list(dict.fromkeys(
+                r.get('gear_type', '') for r in pl_rows if r.get('gear_type')
+            ))
+            gear_headers = ''.join(
+                f'<th style="padding:9px 14px; text-align:center; font-size:10px; font-weight:700; letter-spacing:1px; color:#9ca3af; text-transform:uppercase; width:20%;">{esc(g)}</th>'
+                for g in col_gears
+            )
+            for ti, team in enumerate(sorted_teams):
+                row_bg2 = ' background:#fafafa;' if ti % 2 == 1 else ''
+                cols = ''
+                for g in col_gears:
+                    bnum = teams[team].get(g)
+                    if bnum:
+                        cols += f'<td style="padding:7px 14px; text-align:center; font-size:11.5px; color:#374151; font-weight:600;">Box {bnum}</td>'
+                    else:
+                        cols += '<td style="padding:7px 14px; text-align:center; color:#d1d5db; font-size:13px;">—</td>'
+                table_rows_html += f'<tr style="border-bottom:1px solid #f3f4f6;{row_bg2}"><td style="padding:7px 14px; color:#374151; font-weight:500;">{esc(team)}</td>{cols}</tr>'
+
+            table_html = f'''
+    <table style="width:100%; border-collapse:collapse; font-size:12.5px; border:1px solid #e5e7eb; border-top:none;">
+      <thead>
+        <tr style="background:#f8fafc; border-bottom:2px solid #e5e7eb;">
+          <th style="padding:9px 14px; text-align:left; font-size:10px; font-weight:700; letter-spacing:1px; color:#9ca3af; text-transform:uppercase; width:35%;">School / Team</th>
+          {gear_headers}
+        </tr>
+      </thead>
+      <tbody>{table_rows_html}</tbody>
+    </table>'''
+        elif gears_in_tn:
+            table_html = f'<div style="background:#f9fafb; border:1px solid #e5e7eb; border-top:none; border-radius:0 0 10px 10px; padding:12px 14px; font-size:12.5px; color:#374151;">{esc(", ".join(gears_in_tn))}</div>'
+        else:
+            table_html = ''
+
+        meta_parts = [ship_date_str, status_str]
+        if total_boxes:
+            meta_parts.append(f'&nbsp;·&nbsp; {total_boxes} box{"es" if total_boxes != 1 else ""}')
+        if weight_str:
+            meta_parts.append(f'&nbsp;·&nbsp; {esc(weight_str)}')
+
+        contents_bar = ''
+        if contents_summary:
+            contents_bar = f'<div style="background:#eff6ff; border-left:3px solid #3b82f6; padding:9px 14px; font-size:12px; color:#1e40af; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; line-height:2;">{contents_summary}</div>'
+
+        tn_sections_html += f'''
+  <div class="tracking-section" style="margin-bottom:32px;">
+    <div style="background:#1a2b6b; color:#fff; border-radius:10px 10px 0 0; padding:12px 16px; display:flex; justify-content:space-between; align-items:center;">
+      <div>
+        <span style="font-size:10px; font-weight:700; letter-spacing:1.5px; opacity:0.7; text-transform:uppercase;">Tracking</span>
+        <span style="font-family:monospace; font-size:15px; font-weight:700; margin-left:8px;">{esc(tn)}</span>
+      </div>
+      <div style="font-size:12px; opacity:0.8; text-align:right;">
+        {''.join(meta_parts)}
+      </div>
+    </div>
+    {contents_bar}
+    {table_html}
+  </div>'''
+
+    # Format order date nicely
+    try:
+        from datetime import datetime as _dt
+        od = _dt.strptime(order_date, '%Y-%m-%d').strftime('%B %-d, %Y') if order_date else ''
+    except Exception:
+        od = order_date
+
+    # Collect unique ship dates for the header
+    all_dates = sorted(set(s.get('ship_date', '') for s in manual_shipments if s.get('ship_date')))
+    try:
+        from datetime import datetime as _dt2
+        date_strs = [_dt2.strptime(d, '%Y-%m-%d').strftime('%B %-d, %Y') for d in all_dates]
+    except Exception:
+        date_strs = all_dates
+    ship_dates_display = ' – '.join(date_strs) if date_strs else ''
+
+    title = f'{esc(market)} {esc(sport)} {esc(season)} Order #{esc(str(num))}'
+
+    html_content = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title} — Packing List</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }}
+    @media print {{
+      .no-print {{ display: none !important; }}
+      body {{ background: white !important; padding: 0 !important; }}
+      .doc {{ box-shadow: none !important; border-radius: 0 !important; margin: 0 !important; }}
+      .tracking-section {{ page-break-inside: avoid; }}
+    }}
+    td, th {{ vertical-align: middle; }}
+  </style>
+</head>
+<body class="bg-gray-100 min-h-screen py-8 px-4">
+
+<div class="no-print max-w-5xl mx-auto mb-5 bg-white rounded-xl shadow-sm border border-gray-100 p-4 flex justify-end">
+  <button onclick="window.print()"
+          class="bg-[#8B1A1A] text-white text-sm font-semibold px-5 py-2.5 rounded-lg hover:bg-[#7a1515] transition">
+    Print / Save PDF
+  </button>
+</div>
+
+<div class="doc max-w-5xl mx-auto bg-white rounded-2xl shadow-lg p-10 mb-8">
+
+  <!-- Header -->
+  <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:22px;">
+    <div>
+      <div style="font-size:22px; font-weight:800; color:#1a2b6b; letter-spacing:-0.5px;">Middle School Matchup</div>
+      <div style="font-size:12px; color:#6b7280; margin-top:3px;">gear@middleschoolmatchup.com</div>
+    </div>
+    <div style="text-align:right;">
+      <div style="font-size:26px; font-weight:800; color:#8B1A1A; letter-spacing:1px;">PACKING LIST</div>
+      <div style="margin-top:5px; line-height:1.9;">
+        <div style="font-size:13px; font-weight:700; color:#1a2b6b;">{title}</div>
+        {'<div style="font-size:12px; color:#6b7280;">Order Date: <strong style="color:#111827;">' + od + '</strong></div>' if od else ''}
+        {'<div style="font-size:12px; color:#6b7280;">Ship Date: <strong style="color:#111827;">' + esc(ship_dates_display) + '</strong></div>' if ship_dates_display else ''}
+      </div>
+    </div>
+  </div>
+
+  <div style="border-top:2px solid #1a2b6b; margin-bottom:24px;"></div>
+
+  <!-- Order Summary -->
+  <div style="font-size:10px; font-weight:700; letter-spacing:1.5px; color:#9ca3af; text-transform:uppercase; margin-bottom:12px;">Order Summary</div>
+
+  <table style="width:100%; border-collapse:collapse; font-size:12.5px; margin-bottom:24px; border:1px solid #e5e7eb; border-radius:10px; overflow:hidden;">
+    <thead>
+      <tr style="background:#1a2b6b; color:#fff;">
+        <th style="padding:10px 14px; text-align:left; font-weight:700; letter-spacing:0.5px; width:18%;">GEAR</th>
+        <th style="padding:10px 14px; text-align:center; font-weight:700; letter-spacing:0.5px; width:8%;">BOXES</th>
+        <th style="padding:10px 14px; text-align:left; font-weight:700; letter-spacing:0.5px;">CONTENTS</th>
+        <th style="padding:10px 14px; text-align:left; font-weight:700; letter-spacing:0.5px; width:22%;">TRACKING</th>
+        <th style="padding:10px 14px; text-align:left; font-weight:700; letter-spacing:0.5px; width:12%;">SHIP DATE</th>
+        <th style="padding:10px 14px; text-align:center; font-weight:700; letter-spacing:0.5px; width:10%;">STATUS</th>
+      </tr>
+    </thead>
+    <tbody>{summary_rows_html}</tbody>
+  </table>
+
+  <!-- Tracking Sections -->
+  {tn_sections_html}
+
+  <!-- Footer -->
+  <div style="border-top:1px solid #e5e7eb; padding-top:14px; font-size:11px; color:#9ca3af; text-align:center;">
+    Middle School Matchup &nbsp;·&nbsp; gear@middleschoolmatchup.com
+  </div>
+
+</div>
+</body>
+</html>'''
+
+    # Save to temp file
+    tmp_path = Path(tempfile.gettempdir()) / f'{order_id}-packing-list.html'
+    tmp_path.write_text(html_content, encoding='utf-8')
+
+    # Build order key for register_packing_list.py
+    order_key   = f'{market} {sport} {season} {num}'
+    label       = f'{market} {sport} {season} Order #{num}'
+    script_path = Path(__file__).parent / 'register_packing_list.py'
+    venv_python = Path(__file__).parent / '.venv' / 'bin' / 'python3'
+    python_exe  = str(venv_python) if venv_python.exists() else 'python3'
+
+    result = subprocess.run(
+        [python_exe, str(script_path), str(tmp_path), order_key, label],
+        capture_output=True, text=True, timeout=60,
+        cwd=str(Path(__file__).parent),
+    )
+
+    if result.returncode != 0:
+        app.logger.error('register_packing_list failed: %s', result.stderr)
+        return jsonify({'ok': False, 'error': result.stderr.strip() or 'PDF generation failed'}), 500
+
+    # Re-read orders to find the registered doc
+    orders_fresh = load_orders()
+    order_fresh  = next((o for o in orders_fresh if o.get('id') == order_id), None)
+    docs         = order_fresh.get('packing_docs', []) if order_fresh else []
+    doc          = next((d for d in reversed(docs) if d.get('label') == label), docs[-1] if docs else None)
+
+    if not doc:
+        return jsonify({'ok': False, 'error': 'PDF created but not found in registry'}), 500
+
+    pdf_name  = doc['filename']
+    view_url  = f'/packing-doc/{order_id}/{pdf_name}'
+    dl_url    = f'/packing-doc/{order_id}/{pdf_name}'
+
+    return jsonify({'ok': True, 'view_url': view_url, 'download_url': dl_url, 'filename': pdf_name})
 
 
 if __name__ == '__main__':
