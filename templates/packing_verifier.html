@@ -271,16 +271,9 @@
         ? `<span class="font-medium">${g.ordered_qty.toLocaleString()}</span>`
         : '<span class="text-gray-300">—</span>';
 
-      let packQtyHtml;
-      if (g.packed_qty && g.packed_estimated) {
-        packQtyHtml = `<span class="text-gray-400" title="Estimated from order sheet — upload packing list to confirm">${g.packed_qty.toLocaleString()} <span class="text-gray-300 text-xs">~est</span></span>`;
-      } else if (g.packed_qty) {
-        packQtyHtml = `<span class="font-medium">${g.packed_qty.toLocaleString()}</span>`;
-      } else if (g.shipped) {
-        packQtyHtml = `<span class="text-gray-400 text-xs">see boxes</span>`;
-      } else {
-        packQtyHtml = '<span class="text-gray-300">—</span>';
-      }
+      const packQtyHtml = g.packed_qty
+        ? `<span class="font-medium">${g.packed_qty.toLocaleString()}</span>`
+        : '<span class="text-gray-300">—</span>';
 
       return `<tr class="hover:bg-blue-50 transition-colors ${bg}">
         <td class="px-4 py-2.5 font-semibold text-gray-800 text-sm">${g.gear}</td>
@@ -315,14 +308,21 @@
     }
 
     // Show/hide upload vs replace sections
-    const replaceEl = document.getElementById('replace-section');
+    const replaceEl   = document.getElementById('replace-section');
+    const uploadEl    = document.getElementById('upload-section');
     if (data.has_packing_list) {
-      document.getElementById('upload-section').classList.add('hidden');
+      uploadEl.classList.add('hidden');
       replaceEl.classList.remove('hidden');
       replaceEl.innerHTML = `<span>Supplier packing list on file.</span>
         <button onclick="showReplaceUI()" class="underline hover:text-gray-600 transition-colors ml-1">Upload a new one to replace it →</button>`;
+    } else if (data.has_msm_packing_list) {
+      // MSM PDF already generated — supplier PL is optional, show a softer prompt
+      uploadEl.classList.add('hidden');
+      replaceEl.classList.remove('hidden');
+      replaceEl.innerHTML = `<span class="text-gray-400">No supplier packing list on file.</span>
+        <button onclick="showReplaceUI()" class="underline hover:text-gray-500 transition-colors ml-1">Upload TG packing list →</button>`;
     } else {
-      document.getElementById('upload-section').classList.remove('hidden');
+      uploadEl.classList.remove('hidden');
       replaceEl.classList.add('hidden');
     }
 

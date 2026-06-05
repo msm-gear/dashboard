@@ -4714,6 +4714,9 @@ def _ordered_gear_types(sheet_url: str) -> dict | None:
                 gear_gid = str(tab['properties']['sheetId'])
                 break
 
+        # Gear types without per-row size breakdowns — their tabs have only 1 summary row
+        _SINGLE_ROW_OK = {'Cap', 'Ring', 'Hypechain', 'Name Banner', 'Park Banner', 'Awards'}
+
         if gear_gid is None:
             confirmed[gear_type] = qty
             continue
@@ -4725,7 +4728,8 @@ def _ordered_gear_types(sheet_url: str) -> dict | None:
                 timeout=15,
             )
             gr.raise_for_status()
-            if _count_numeric_rows(gr.text) >= 2:
+            min_rows = 1 if gear_type in _SINGLE_ROW_OK else 2
+            if _count_numeric_rows(gr.text) >= min_rows:
                 confirmed[gear_type] = qty
         except Exception:
             confirmed[gear_type] = qty  # on fetch error, trust home page
@@ -6156,7 +6160,24 @@ def api_generate_packing_list(order_id):
                     for bn, tc in sorted(box_team_ct.items()) if tc > 0
                 )
             elif gear in _ITEM_COUNT_GEARS:
-                # Item-count gear: ring-78, necklace-5, namebanner-1, parkbanner-5
+                # Check if this gear shares a box with a primary gear (e.g. Name Banner in Tee Box 3)
+                shared_context = ''
+                for r in pl_gears:
+                    tn   = r.get('tracking_number', '')
+                    bnum = r.get('box_num')
+                    if not tn or bnum is None:
+                        continue
+                    for other_r in packing_list_rows:
+                        if other_r.get('tracking_number') == tn \
+                           and other_r.get('box_num') == bnum \
+                           and other_r.get('gear_type') != gear \
+                           and other_r.get('gear_type') in {'Jersey', 'Hoodie', 'Tee', 'Windbreaker', 'Cage Jacket'}:
+                            shared_context = f'In {other_r.get("gear_type")} Box {bnum}'
+                            break
+                    if shared_context:
+                        break
+
+                # Extract item counts with optional descriptor label
                 kws   = _ITEM_KWS.get(gear, ())
                 found = []
                 seen_f = set()
@@ -6166,7 +6187,6 @@ def api_generate_packing_list(order_id):
                         for m in re.finditer(rf'([a-zA-Z]+\s+)?{re.escape(kw)}s?[\s\-](\d+)', cnt, re.I):
                             qty    = m.group(2)
                             prefix = (m.group(1) or '').strip()
-                            # Use prefix as a descriptor label only if it's a pure word (not a size code)
                             if prefix and re.match(r'^[a-zA-Z]{3,}$', prefix) \
                                       and not re.match(r'^(?:YXS|YS|YM|YL|YXL|AS|AM|AL|AXL|AXXL)$', prefix, re.I):
                                 label = f'{prefix.capitalize()} ×{qty}'
@@ -6175,8 +6195,14 @@ def api_generate_packing_list(order_id):
                             if label not in seen_f:
                                 seen_f.add(label)
                                 found.append(label)
-                if found:
-                    detail = ' · '.join(found[:4])
+
+                item_str = ' · '.join(found[:4]) if found else ''
+                if shared_context and item_str:
+                    detail = f'{shared_context} &nbsp;·&nbsp; {item_str}'
+                elif shared_context:
+                    detail = shared_context
+                elif item_str:
+                    detail = item_str
             elif box_sizes:
                 # Size-breakdown gear (Tee, Windbreaker, Cage Jacket)
                 all_sz = []
@@ -6184,9 +6210,24 @@ def api_generate_packing_list(order_id):
                     all_sz.extend(box_sizes[bn])
                 detail = ' · '.join(all_sz)
 
-        if not detail and shipments:
-            notes = shipments[0].get('notes', '')
-            detail = esc(notes[:80]) if notes else ''
+        if not detail:
+            # Use tracking status as detail for gear without packing list data
+            for tn in tns:
+                ts = tracking_statuses.get(tn, {})
+                tag = ts.get('tag', '')
+                loc = ts.get('location', '') or ts.get('notes', '')
+                delivered_at = ts.get('delivered_at', '')
+                if tag == 'Delivered' and delivered_at:
+                    detail = f'Delivered {esc(delivered_at)}{(" — " + esc(loc)) if loc else ""}'
+                elif tag in ('OutForDelivery', 'InTransit') and loc:
+                    detail = f'{"Out for Delivery" if tag == "OutForDelivery" else "In Transit"} — {esc(loc)}'
+                if detail:
+                    break
+            # Last resort: notes (only if meaningful — not just "N box(es)")
+            if not detail and shipments:
+                notes = (shipments[0].get('notes') or '').strip()
+                if notes and not re.match(r'^\d+ boxe?s?$', notes, re.I):
+                    detail = esc(notes[:80])
 
         # team_count only meaningful for team-based gears
         if gear not in {'Jersey', 'Hoodie'}:
