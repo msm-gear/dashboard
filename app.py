@@ -6318,51 +6318,85 @@ def api_generate_packing_list(order_id):
                     parts.append(f'<strong>{esc(gear)} Box {bnum}</strong>')
             contents_summary = ' &nbsp;&nbsp; '.join(parts[:8])
 
-        # Contents table rows (team-level from packing list, grouped by team)
-        teams = {}
+        # School / team table — ONLY from team-based gears (Jersey, Hoodie)
+        # Size tokens and gear labels must not appear as school names
+        _TEAM_GEAR_TYPES = {'Jersey', 'Hoodie'}
+        _GEAR_ABBR_TN    = {'Jersey': 'J', 'Hoodie': 'H'}
+        _SIZE_TOK_RE     = re.compile(r'^(?:YXS|YS|YM|YL|YXL|AS|AM|AL|AXL|AXXL)[\s\-]?\d+$', re.I)
+        _SKIP_TOKEN_RE   = re.compile(
+            r'\b(?:jersey|hoodie|jacket|windbreaker|tee|cap|ring|necklace|hypechain|'
+            r'banner|champion|finalist|soccer|bsbl|7v7|sbl|fsh|dfw|hou|dal|sfl|aus|tpa|'
+            r'msmhouston|msm|see attached)\b', re.I
+        )
+
+        teams       = {}   # school_name → {gear_type: box_num}
+        team_gears  = []   # ordered list of team-based gear types present in this TN
+
         for r in pl_rows:
             gear_t = r.get('gear_type', '')
             cnt    = r.get('contents', '')
             bnum   = r.get('box_num', '')
-            if cnt and cnt.lower() not in ('see attached', ''):
-                for team in cnt.split(','):
-                    team = team.strip().title()
-                    if team:
-                        teams.setdefault(team, {})[gear_t] = bnum
+
+            if gear_t not in _TEAM_GEAR_TYPES:
+                continue
+            if not cnt or cnt.lower() == 'see attached':
+                continue
+            if gear_t not in team_gears:
+                team_gears.append(gear_t)
+
+            for tok in cnt.split(','):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                if _SIZE_TOK_RE.match(tok):
+                    continue
+                if _SKIP_TOKEN_RE.search(tok):
+                    continue
+                # Skip tokens that are dominated by size data (no space-split alphabetic word ≥ 3 chars)
+                if not re.search(r'[a-zA-Z]{3,}', tok):
+                    continue
+                school = tok.title()
+                teams.setdefault(school, {})[gear_t] = bnum
 
         table_rows_html = ''
-        if teams:
-            sorted_teams = sorted(teams.keys())
-            col_gears    = list(dict.fromkeys(
-                r.get('gear_type', '') for r in pl_rows if r.get('gear_type')
-            ))
-            gear_headers = ''.join(
-                f'<th style="padding:9px 14px; text-align:center; font-size:10px; font-weight:700; letter-spacing:1px; color:#9ca3af; text-transform:uppercase; width:20%;">{esc(g)}</th>'
-                for g in col_gears
+        if teams and team_gears:
+            sorted_schools = sorted(teams.keys())
+            gear_headers   = ''.join(
+                f'<th style="padding:9px 14px; text-align:center; font-size:10px; font-weight:700; '
+                f'letter-spacing:1px; color:#9ca3af; text-transform:uppercase; width:20%;">{esc(g)}</th>'
+                for g in team_gears
             )
-            for ti, team in enumerate(sorted_teams):
+            for ti, school in enumerate(sorted_schools):
                 row_bg2 = ' background:#fafafa;' if ti % 2 == 1 else ''
                 cols = ''
-                for g in col_gears:
-                    bnum = teams[team].get(g)
-                    if bnum:
-                        cols += f'<td style="padding:7px 14px; text-align:center; font-size:11.5px; color:#374151; font-weight:600;">Box {bnum}</td>'
+                for g in team_gears:
+                    bnum = teams[school].get(g)
+                    abbr = _GEAR_ABBR_TN.get(g, g[:1])
+                    if bnum is not None:
+                        cols += (f'<td style="padding:7px 14px; text-align:center;">'
+                                 f'<span style="display:inline-block; background:#dbeafe; color:#1e40af; '
+                                 f'border:1px solid #bfdbfe; border-radius:5px; padding:2px 8px; '
+                                 f'font-size:11px; font-weight:700;">{abbr}-{bnum}</span></td>')
                     else:
                         cols += '<td style="padding:7px 14px; text-align:center; color:#d1d5db; font-size:13px;">—</td>'
-                table_rows_html += f'<tr style="border-bottom:1px solid #f3f4f6;{row_bg2}"><td style="padding:7px 14px; color:#374151; font-weight:500;">{esc(team)}</td>{cols}</tr>'
+                table_rows_html += (f'<tr style="border-bottom:1px solid #f3f4f6;{row_bg2}">'
+                                    f'<td style="padding:7px 14px; color:#374151; font-weight:500;">{esc(school)}</td>'
+                                    f'{cols}</tr>')
 
             table_html = f'''
     <table style="width:100%; border-collapse:collapse; font-size:12.5px; border:1px solid #e5e7eb; border-top:none;">
       <thead>
         <tr style="background:#f8fafc; border-bottom:2px solid #e5e7eb;">
-          <th style="padding:9px 14px; text-align:left; font-size:10px; font-weight:700; letter-spacing:1px; color:#9ca3af; text-transform:uppercase; width:35%;">School / Team</th>
+          <th style="padding:9px 14px; text-align:left; font-size:10px; font-weight:700; letter-spacing:1px; color:#9ca3af; text-transform:uppercase; width:40%;">School / Team</th>
           {gear_headers}
         </tr>
       </thead>
       <tbody>{table_rows_html}</tbody>
     </table>'''
         elif gears_in_tn:
-            table_html = f'<div style="background:#f9fafb; border:1px solid #e5e7eb; border-top:none; border-radius:0 0 10px 10px; padding:12px 14px; font-size:12.5px; color:#374151;">{esc(", ".join(gears_in_tn))}</div>'
+            table_html = (f'<div style="background:#f9fafb; border:1px solid #e5e7eb; border-top:none; '
+                          f'border-radius:0 0 10px 10px; padding:12px 14px; font-size:12.5px; color:#374151;">'
+                          f'{esc(", ".join(gears_in_tn))}</div>')
         else:
             table_html = ''
 
