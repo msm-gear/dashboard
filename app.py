@@ -6211,23 +6211,24 @@ def api_generate_packing_list(order_id):
                 detail = ' · '.join(all_sz)
 
         if not detail:
-            # Use tracking status as detail for gear without packing list data
-            for tn in tns:
-                ts = tracking_statuses.get(tn, {})
-                tag = ts.get('tag', '')
-                loc = ts.get('location', '') or ts.get('notes', '')
-                delivered_at = ts.get('delivered_at', '')
-                if tag == 'Delivered' and delivered_at:
-                    detail = f'Delivered {esc(delivered_at)}{(" — " + esc(loc)) if loc else ""}'
-                elif tag in ('OutForDelivery', 'InTransit') and loc:
-                    detail = f'{"Out for Delivery" if tag == "OutForDelivery" else "In Transit"} — {esc(loc)}'
-                if detail:
-                    break
-            # Last resort: notes (only if meaningful — not just "N box(es)")
-            if not detail and shipments:
+            # Prefer shipment notes — they describe what's in the box
+            if shipments:
                 notes = (shipments[0].get('notes') or '').strip()
                 if notes and not re.match(r'^\d+ boxe?s?$', notes, re.I):
                     detail = esc(notes[:80])
+            # Fallback: tracking delivery status (useful for Cap/Ring in transit)
+            if not detail:
+                for tn in tns:
+                    ts = tracking_statuses.get(tn, {})
+                    tag = ts.get('tag', '')
+                    loc = ts.get('location', '') or ts.get('notes', '')
+                    delivered_at = ts.get('delivered_at', '')
+                    if tag == 'Delivered' and delivered_at and loc:
+                        detail = f'Delivered {esc(delivered_at)} — {esc(loc)}'
+                    elif tag in ('OutForDelivery', 'InTransit') and loc:
+                        detail = f'{"Out for Delivery" if tag == "OutForDelivery" else "In Transit"} — {esc(loc)}'
+                    if detail:
+                        break
 
         # team_count only meaningful for team-based gears
         if gear not in {'Jersey', 'Hoodie'}:
