@@ -6217,8 +6217,8 @@ def api_generate_packing_list(order_id):
         return jsonify({'ok': False, 'error': 'PDF created but not found in registry'}), 500
 
     pdf_name  = doc['filename']
-    view_url  = f'/packing-doc/{order_id}/{pdf_name}'
-    dl_url    = f'/packing-doc/{order_id}/{pdf_name}'
+    view_url = f'/packing-doc/{order_id}/{pdf_name}'
+    dl_url   = f'/packing-doc/{order_id}/{pdf_name}?dl=1'
 
     return jsonify({'ok': True, 'view_url': view_url, 'download_url': dl_url, 'filename': pdf_name})
 

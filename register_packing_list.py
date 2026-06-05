@@ -91,8 +91,9 @@ def register(html_path: str, order_key: str, label: str = None):
         num = order.get('num_for_code', order.get('order_num',''))
         label = f'{m} {sp} {se} Order #{num}'
 
-    # Build PDF filename from label (matches what user sees)
-    pdf_name = label.replace(' ', '-') + '.pdf'
+    # Build PDF filename — strip chars that break secure_filename (e.g. #)
+    import re as _re
+    pdf_name = _re.sub(r'[^\w.\-]', '', label.replace(' ', '-')) + '.pdf'
     folder   = PACKING_DOCS_FOLDER / order_id
     folder.mkdir(parents=True, exist_ok=True)
     pdf_path = folder / pdf_name
