@@ -5391,6 +5391,103 @@ def api_order_sheet_teams():
     return jsonify({'ok': False, 'error': f'No teams with quantities in "{best["name"]}"'})
 
 
+_qty_per_team_cache: dict = {}
+_QTY_TEAM_TTL = 600  # 10 min
+
+def _order_sheet_qty_per_team(sheet_url: str, gear_type: str, order_num: str, num_for_code: str) -> dict:
+    """Return {team_name_lower: total_qty} from the Google Sheet for a gear type."""
+    if not sheet_url:
+        return {}
+    m = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', sheet_url)
+    if not m:
+        return {}
+    sheet_id = m.group(1)
+    cache_key = f'{sheet_id}:{gear_type}:{num_for_code}'
+    cached = _qty_per_team_cache.get(cache_key)
+    if cached and (time.time() - cached['ts']) < _QTY_TEAM_TTL:
+        return cached['data']
+
+    gkey = os.getenv('GOOGLE_API_KEY', '')
+    if not gkey:
+        return {}
+
+    GEAR_KEYWORDS = {
+        'Jersey': ['jersey', 'jerseys'], 'Hoodie': ['hoodie', 'hoodies'],
+        'Tee': ['tourney', 'tee', 'tees'],
+    }
+    keywords = GEAR_KEYWORDS.get(gear_type, [gear_type.lower()])
+
+    try:
+        tab_resp = requests.get(
+            f'https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}',
+            params={'key': gkey, 'fields': 'sheets.properties'}, timeout=15,
+        )
+        tab_resp.raise_for_status()
+        all_tabs = [{'name': s['properties']['title'],
+                     'gid':  str(s['properties']['sheetId'])}
+                    for s in tab_resp.json().get('sheets', [])]
+    except Exception:
+        return {}
+
+    matching = [t for t in all_tabs if any(kw in t['name'].lower() for kw in keywords)]
+    if not matching:
+        return {}
+
+    raw_num = str(order_num).strip()
+    nc      = str(num_for_code).strip()
+    def _score(tab):
+        name = tab['name'].lower()
+        if raw_num and not raw_num.isdigit() and raw_num.lower() in name:
+            return 10
+        if nc.isdigit() and f'# {nc}' in name:
+            return 5
+        return 0
+    matching.sort(key=_score, reverse=True)
+
+    try:
+        csv_resp = requests.get(
+            f'https://docs.google.com/spreadsheets/d/{sheet_id}/export',
+            params={'format': 'csv', 'gid': matching[0]['gid']}, timeout=20,
+        )
+        csv_resp.raise_for_status()
+    except Exception:
+        return {}
+
+    rows = list(csv.reader(StringIO(csv_resp.text)))
+    SIZE_CODES = {'ym','yl','yxl','ys','as','am','al','axl','axxl','xs','s','m','l','xl','xxl'}
+
+    header_idx = None
+    for i, row in enumerate(rows[:30]):
+        cells = [c.strip().lower() for c in row]
+        if sum(1 for c in cells if c in SIZE_CODES) >= 2:
+            header_idx = i
+            break
+    if header_idx is None:
+        return {}
+
+    headers = rows[header_idx]
+    team_col = next((i for i, h in enumerate(headers) if 'TEAM NAME' in h.upper()), 1)
+    size_cols = [i for i, h in enumerate(headers) if h.strip().lower() in SIZE_CODES]
+
+    STOP = {'total', 'grand total', 'thank you', '', 'middle school', 'hs/ms', 'team'}
+    result = {}
+    for row in rows[header_idx + 1:]:
+        if len(row) <= team_col:
+            continue
+        name = row[team_col].strip()
+        if not name or name.lower() in STOP:
+            continue
+        qty = sum(
+            int(row[ci].strip()) for ci in size_cols
+            if ci < len(row) and row[ci].strip().isdigit()
+        )
+        if qty > 0:
+            result[name.lower()] = qty
+
+    _qty_per_team_cache[cache_key] = {'ts': time.time(), 'data': result}
+    return result
+
+
 @app.route('/api/dashboard-data')
 def api_dashboard_data():
     from concurrent.futures import ThreadPoolExecutor
@@ -6318,6 +6415,13 @@ def api_generate_packing_list(order_id):
                     parts.append(f'<strong>{esc(gear)} Box {bnum}</strong>')
             contents_summary = ' &nbsp;&nbsp; '.join(parts[:8])
 
+        # Fetch per-school ordered quantities from the Google Sheet (for pill labels)
+        _sheet_qty: dict[str, dict] = {}  # gear_type → {school_lower: qty}
+        for _tg in ('Jersey', 'Hoodie'):
+            _sqmap = _order_sheet_qty_per_team(sheet_url, _tg, order.get('order_num',''), str(num))
+            if _sqmap:
+                _sheet_qty[_tg] = _sqmap
+
         # School / team table — ONLY from team-based gears (Jersey, Hoodie)
         # Size tokens and gear labels must not appear as school names
         _TEAM_GEAR_TYPES = {'Jersey', 'Hoodie'}
@@ -6360,12 +6464,27 @@ def api_generate_packing_list(order_id):
 
         table_rows_html = ''
         if teams and team_gears:
+            # Jersey always before Hoodie to match DFW column order
+            _GEAR_ORDER = ['Jersey', 'Hoodie']
+            team_gears  = sorted(team_gears, key=lambda g: _GEAR_ORDER.index(g) if g in _GEAR_ORDER else 99)
             sorted_schools = sorted(teams.keys())
             gear_headers   = ''.join(
                 f'<th style="padding:9px 14px; text-align:center; font-size:10px; font-weight:700; '
                 f'letter-spacing:1px; color:#9ca3af; text-transform:uppercase; width:20%;">{esc(g)}</th>'
                 for g in team_gears
             )
+            # Pill colors per box number — matches DFW hand-crafted format
+            _JERSEY_COLORS = {
+                1: ('background:#dbeafe; color:#1e40af; border:1px solid #bfdbfe;'),
+                2: ('background:#e0e7ff; color:#3730a3; border:1px solid #c7d2fe;'),
+                3: ('background:#eff6ff; color:#1d4ed8; border:1px solid #93c5fd;'),
+            }
+            _HOODIE_COLORS = {
+                1: ('background:#f3e8ff; color:#6b21a8; border:1px solid #d8b4fe;'),
+                2: ('background:#fae8ff; color:#86198f; border:1px solid #e879f9;'),
+            }
+            _PILL_COLORS = {'Jersey': _JERSEY_COLORS, 'Hoodie': _HOODIE_COLORS}
+
             for ti, school in enumerate(sorted_schools):
                 row_bg2 = ' background:#fafafa;' if ti % 2 == 1 else ''
                 cols = ''
@@ -6373,10 +6492,16 @@ def api_generate_packing_list(order_id):
                     bnum = teams[school].get(g)
                     abbr = _GEAR_ABBR_TN.get(g, g[:1])
                     if bnum is not None:
+                        color_map = _PILL_COLORS.get(g, {})
+                        color_css = color_map.get(int(bnum) if str(bnum).isdigit() else 1,
+                                                  'background:#dbeafe; color:#1e40af; border:1px solid #bfdbfe;')
+                        # Add per-school qty from sheet if available
+                        qty = (_sheet_qty.get(g, {})).get(school.lower(), 0)
+                        pill_text = f'{abbr}-{bnum} &nbsp;·&nbsp; {qty}' if qty else f'{abbr}-{bnum}'
                         cols += (f'<td style="padding:7px 14px; text-align:center;">'
-                                 f'<span style="display:inline-block; background:#dbeafe; color:#1e40af; '
-                                 f'border:1px solid #bfdbfe; border-radius:5px; padding:2px 8px; '
-                                 f'font-size:11px; font-weight:700;">{abbr}-{bnum}</span></td>')
+                                 f'<span style="display:inline-block; {color_css} border-radius:5px; '
+                                 f'padding:2px 8px; font-size:11px; font-weight:700; white-space:nowrap;">'
+                                 f'{pill_text}</span></td>')
                     else:
                         cols += '<td style="padding:7px 14px; text-align:center; color:#d1d5db; font-size:13px;">—</td>'
                 table_rows_html += (f'<tr style="border-bottom:1px solid #f3f4f6;{row_bg2}">'
