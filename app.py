@@ -6393,10 +6393,45 @@ def api_generate_packing_list(order_id):
       </thead>
       <tbody>{table_rows_html}</tbody>
     </table>'''
-        elif gears_in_tn:
-            table_html = (f'<div style="background:#f9fafb; border:1px solid #e5e7eb; border-top:none; '
-                          f'border-radius:0 0 10px 10px; padding:12px 14px; font-size:12.5px; color:#374151;">'
-                          f'{esc(", ".join(gears_in_tn))}</div>')
+        elif ms_for_tn:
+            # No packing list — build box breakdown from manual_shipment notes
+            # Same notes = same physical box
+            box_groups: dict[str, list] = {}
+            for ms in ms_for_tn:
+                g     = ms.get('gear_type', '')
+                qty   = ordered_qty_map.get(g, 0) or 0
+                notes = (ms.get('notes') or '').strip()
+                # Normalise note as box key; fall back to gear name
+                key   = notes.lower() if notes and not re.match(r'^\d+ boxe?s?$', notes, re.I) else g.lower()
+                box_groups.setdefault(key, []).append({'gear': g, 'qty': qty, 'notes': notes})
+
+            box_rows_html = ''
+            box_letter    = 65  # 'A'
+            for key, items in box_groups.items():
+                label   = chr(box_letter)
+                box_letter += 1
+                contents = ' + '.join(
+                    f'{it["gear"]}{" (" + str(it["qty"]) + ")" if it["qty"] else ""}'
+                    for it in items
+                )
+                box_rows_html += (
+                    f'<tr style="border-bottom:1px solid #f3f4f6;">'
+                    f'<td style="padding:8px 14px; font-weight:600; color:#1a2b6b; font-size:11.5px; '
+                    f'white-space:nowrap;">Box {label}</td>'
+                    f'<td style="padding:8px 14px; font-size:12px; color:#374151;">{esc(contents)}</td>'
+                    f'</tr>'
+                )
+
+            table_html = f'''
+    <table style="width:100%; border-collapse:collapse; font-size:12.5px; border:1px solid #e5e7eb; border-top:none;">
+      <thead>
+        <tr style="background:#f8fafc; border-bottom:2px solid #e5e7eb;">
+          <th style="padding:8px 14px; text-align:left; font-size:10px; font-weight:700; letter-spacing:1px; color:#9ca3af; text-transform:uppercase; width:12%;">BOX</th>
+          <th style="padding:8px 14px; text-align:left; font-size:10px; font-weight:700; letter-spacing:1px; color:#9ca3af; text-transform:uppercase;">CONTENTS &amp; QTY</th>
+        </tr>
+      </thead>
+      <tbody>{box_rows_html}</tbody>
+    </table>'''
         else:
             table_html = ''
 
