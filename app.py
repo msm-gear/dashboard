@@ -6364,6 +6364,62 @@ def api_generate_packing_list(order_id):
         <td style="padding:9px 14px; text-align:center;">{status_cell}</td>
       </tr>'''
 
+    # ── Pill color maps (shared by legend + school table) ──
+    _PL_JERSEY_COLORS = {
+        1: 'background:#dbeafe; color:#1e40af; border:1px solid #bfdbfe;',
+        2: 'background:#e0e7ff; color:#3730a3; border:1px solid #c7d2fe;',
+        3: 'background:#eff6ff; color:#1d4ed8; border:1px solid #93c5fd;',
+    }
+    _PL_HOODIE_COLORS = {
+        1: 'background:#f3e8ff; color:#6b21a8; border:1px solid #d8b4fe;',
+        2: 'background:#fae8ff; color:#86198f; border:1px solid #e879f9;',
+    }
+    _PL_GEAR_COLORS   = {'Jersey': _PL_JERSEY_COLORS, 'Hoodie': _PL_HOODIE_COLORS}
+    _PL_GEAR_ABBR     = {'Jersey': 'J', 'Hoodie': 'H'}
+
+    # ── Legend (after summary table) ──
+    legend_entries = []
+    seen_leg = set()
+    for r in packing_list_rows:
+        g    = r.get('gear_type', '')
+        bnum = r.get('box_num')
+        if g not in ('Jersey', 'Hoodie') or bnum is None:
+            continue
+        bint = int(bnum) if str(bnum).isdigit() else 1
+        key  = (g, bint)
+        if key in seen_leg:
+            continue
+        seen_leg.add(key)
+        abbr      = _PL_GEAR_ABBR.get(g, g[:1])
+        color_css = _PL_GEAR_COLORS.get(g, {}).get(bint, _PL_JERSEY_COLORS[1])
+        legend_entries.append((g, bint, abbr, color_css))
+    # If order sheet data but no PL, add box-1 entries for any team gears shipped
+    if not legend_entries:
+        for g in ('Jersey', 'Hoodie'):
+            if any(ms.get('gear_type') == g for ms in manual_shipments):
+                abbr = _PL_GEAR_ABBR[g]
+                color_css = _PL_GEAR_COLORS[g][1]
+                legend_entries.append((g, 1, abbr, color_css))
+    legend_entries.sort(key=lambda x: (0 if x[0] == 'Jersey' else 1, x[1]))
+
+    def _pill_span(color_css, text):
+        return (f'<span style="display:inline-block; {color_css} border-radius:5px; '
+                f'padding:2px 8px; font-size:11px; font-weight:700; white-space:nowrap;">{text}</span>')
+
+    legend_parts = [
+        f'<span>{_pill_span(color_css, abbr + "-" + str(bint) + " · qty")} '
+        f'{"Jersey" if g == "Jersey" else "Hoodie"} Box {bint}</span>'
+        for g, bint, abbr, color_css in legend_entries
+    ]
+    _warn_css = 'background:#fef3c7; color:#92400e; border:1px solid #fcd34d;'
+    legend_parts.append(f'<span>{_pill_span(_warn_css, "⚠ #")} Not in packing list</span>')
+    _sep = ' <span style="color:#d1d5db;">·</span> '
+    legend_html = (
+        f'<div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:20px; '
+        f'font-size:11px; color:#6b7280;">{_sep.join(legend_parts)}</div>'
+        if legend_entries else ''
+    )
+
     # ── Per-tracking-number sections ──
     tn_sections_html = ''
     for tn in seen_tns:
@@ -6482,7 +6538,6 @@ def api_generate_packing_list(order_id):
 
         table_rows_html = ''
         if teams and team_gears:
-            # Jersey always before Hoodie to match DFW column order
             _GEAR_ORDER = ['Jersey', 'Hoodie']
             team_gears  = sorted(team_gears, key=lambda g: _GEAR_ORDER.index(g) if g in _GEAR_ORDER else 99)
             sorted_schools = sorted(teams.keys())
@@ -6491,40 +6546,56 @@ def api_generate_packing_list(order_id):
                 f'letter-spacing:1px; color:#9ca3af; text-transform:uppercase; width:20%;">{esc(g)}</th>'
                 for g in team_gears
             )
-            # Pill colors per box number — matches DFW hand-crafted format
-            _JERSEY_COLORS = {
-                1: ('background:#dbeafe; color:#1e40af; border:1px solid #bfdbfe;'),
-                2: ('background:#e0e7ff; color:#3730a3; border:1px solid #c7d2fe;'),
-                3: ('background:#eff6ff; color:#1d4ed8; border:1px solid #93c5fd;'),
-            }
-            _HOODIE_COLORS = {
-                1: ('background:#f3e8ff; color:#6b21a8; border:1px solid #d8b4fe;'),
-                2: ('background:#fae8ff; color:#86198f; border:1px solid #e879f9;'),
-            }
-            _PILL_COLORS = {'Jersey': _JERSEY_COLORS, 'Hoodie': _HOODIE_COLORS}
+
+            # Track per-gear per-box subtotals
+            box_subtotals: dict[str, dict] = {g: {} for g in team_gears}
 
             for ti, school in enumerate(sorted_schools):
                 row_bg2 = ' background:#fafafa;' if ti % 2 == 1 else ''
                 cols = ''
                 for g in team_gears:
                     bnum = teams[school].get(g)
-                    abbr = _GEAR_ABBR_TN.get(g, g[:1])
+                    abbr = _PL_GEAR_ABBR.get(g, g[:1])
                     if bnum is not None:
-                        color_map = _PILL_COLORS.get(g, {})
-                        color_css = color_map.get(int(bnum) if str(bnum).isdigit() else 1,
-                                                  'background:#dbeafe; color:#1e40af; border:1px solid #bfdbfe;')
-                        # Add per-school qty from sheet if available
+                        color_css = _PL_GEAR_COLORS.get(g, {}).get(
+                            int(bnum) if str(bnum).isdigit() else 1,
+                            _PL_JERSEY_COLORS[1]
+                        )
                         qty = (_sheet_qty.get(g, {})).get(school.lower(), 0)
                         pill_text = f'{abbr}-{bnum} &nbsp;·&nbsp; {qty}' if qty else f'{abbr}-{bnum}'
                         cols += (f'<td style="padding:7px 14px; text-align:center;">'
                                  f'<span style="display:inline-block; {color_css} border-radius:5px; '
                                  f'padding:2px 8px; font-size:11px; font-weight:700; white-space:nowrap;">'
                                  f'{pill_text}</span></td>')
+                        # Accumulate subtotal
+                        bkey = int(bnum) if str(bnum).isdigit() else 1
+                        box_subtotals[g][bkey] = box_subtotals[g].get(bkey, 0) + qty
                     else:
                         cols += '<td style="padding:7px 14px; text-align:center; color:#d1d5db; font-size:13px;">—</td>'
                 table_rows_html += (f'<tr style="border-bottom:1px solid #f3f4f6;{row_bg2}">'
                                     f'<td style="padding:7px 14px; color:#374151; font-weight:500;">{esc(school)}</td>'
                                     f'{cols}</tr>')
+
+            # Subtotals footer row
+            sub_cols = ''
+            for g in team_gears:
+                abbr   = _PL_GEAR_ABBR.get(g, g[:1])
+                color  = '#1e40af' if g == 'Jersey' else '#6b21a8'
+                totals = box_subtotals.get(g, {})
+                if totals:
+                    parts = ' &nbsp;·&nbsp; '.join(
+                        f'{abbr}-{bn}: {tot}' for bn, tot in sorted(totals.items()) if tot
+                    )
+                    sub_cols += (f'<td style="padding:8px 14px; text-align:center; font-size:11.5px; '
+                                 f'color:{color}; font-weight:700;">{parts}</td>')
+                else:
+                    sub_cols += '<td></td>'
+            subtotals_tfoot = (
+                f'<tfoot><tr style="background:#f8fafc; border-top:2px solid #e5e7eb;">'
+                f'<td style="padding:8px 14px; font-size:11px; font-weight:700; color:#6b7280; '
+                f'text-transform:uppercase; letter-spacing:0.5px;">Subtotals</td>'
+                f'{sub_cols}</tr></tfoot>'
+            ) if sub_cols.strip() else ''
 
             table_html = f'''
     <table style="width:100%; border-collapse:collapse; font-size:12.5px; border:1px solid #e5e7eb; border-top:none;">
@@ -6535,6 +6606,7 @@ def api_generate_packing_list(order_id):
         </tr>
       </thead>
       <tbody>{table_rows_html}</tbody>
+      {subtotals_tfoot}
     </table>'''
         elif ms_for_tn:
             # No packing list — build box breakdown from manual_shipment notes
@@ -6693,6 +6765,9 @@ def api_generate_packing_list(order_id):
       </tr>
     </tfoot>
   </table>
+
+  <!-- Legend -->
+  {legend_html}
 
   <!-- Tracking Sections -->
   {tn_sections_html}
