@@ -5828,6 +5828,7 @@ def api_packing_verifier_data(order_id):
     manual_shipments  = order.get('manual_shipments', [])
     tracking_statuses = order.get('tracking_statuses', {})
     packing_list_rows = order.get('packing_list', [])
+    has_packing_list  = bool(packing_list_rows)
 
     ordered_qty_map = _ordered_gear_types(order.get('order_sheet_url', '')) or {}
 
@@ -5839,38 +5840,156 @@ def api_packing_verifier_data(order_id):
 
     gear_checks = []
     for gear in gear_tasks:
-        shipments  = shipped_by_gear.get(gear, [])
-        shipped    = bool(shipments)
-        tns        = list(dict.fromkeys(s.get('tracking_number', '') for s in shipments if s.get('tracking_number')))
-        boxes      = sum(s.get('box_count', 0) or 0 for s in shipments)
-        ship_date  = min((s.get('ship_date', '') for s in shipments if s.get('ship_date')), default='')
-        tags       = list(dict.fromkeys(
+        shipments   = shipped_by_gear.get(gear, [])
+        shipped     = bool(shipments)
+        tns         = list(dict.fromkeys(s.get('tracking_number', '') for s in shipments if s.get('tracking_number')))
+        boxes       = sum(s.get('box_count', 0) or 0 for s in shipments)
+        ship_date   = min((s.get('ship_date', '') for s in shipments if s.get('ship_date')), default='')
+        tags        = list(dict.fromkeys(
             tracking_statuses.get(tn, {}).get('tag', 'Pending')
             for tn in tns
         ))
-        pl_for_gear = [r for r in packing_list_rows if r.get('gear_type') == gear]
-        ordered_qty = ordered_qty_map.get(gear, 0)
-        packed_qty  = _qty_from_packing_contents(gear, pl_for_gear)
+        pl_for_gear   = [r for r in packing_list_rows if r.get('gear_type') == gear]
+        ordered_qty   = ordered_qty_map.get(gear, 0)
+        parsed_qty    = _qty_from_packing_contents(gear, pl_for_gear)
+        # When no packing list data for this gear but it's shipped, use ordered qty as packed qty
+        packed_estimated = shipped and not pl_for_gear
+        packed_qty    = parsed_qty if pl_for_gear else (ordered_qty if shipped else 0)
+
         gear_checks.append({
-            'gear':             gear,
-            'shipped':          shipped,
-            'tracking_numbers': tns,
-            'box_count':        boxes if shipped else 0,
-            'ship_date':        ship_date,
-            'delivery_tags':    tags,
-            'ordered_qty':      ordered_qty,
-            'packed_qty':       packed_qty,
+            'gear':              gear,
+            'shipped':           shipped,
+            'tracking_numbers':  tns,
+            'box_count':         boxes if shipped else 0,
+            'ship_date':         ship_date,
+            'delivery_tags':     tags,
+            'ordered_qty':       ordered_qty,
+            'packed_qty':        packed_qty,
+            'packed_estimated':  packed_estimated,
         })
 
     missing     = [g['gear'] for g in gear_checks if not g['shipped']]
     all_shipped = len(missing) == 0 and len(gear_checks) > 0
 
     return jsonify({
-        'ok':          True,
-        'all_shipped': all_shipped,
-        'missing':     missing,
-        'gear_checks': gear_checks,
+        'ok':              True,
+        'all_shipped':     all_shipped,
+        'missing':         missing,
+        'gear_checks':     gear_checks,
+        'has_packing_list': has_packing_list,
     })
+
+
+@app.route('/api/downloads-xl-files')
+def api_downloads_xl_files():
+    """Return .xlsx/.xls files from ~/Downloads sorted newest first."""
+    downloads = Path.home() / 'Downloads'
+    files = []
+    for ext in ('*.xlsx', '*.xls'):
+        for f in downloads.glob(ext):
+            try:
+                files.append({'name': f.name, 'path': str(f), 'mtime': f.stat().st_mtime})
+            except Exception:
+                pass
+    files.sort(key=lambda x: x['mtime'], reverse=True)
+    return jsonify({'ok': True, 'files': files[:30]})
+
+
+@app.route('/api/packing-verifier-parse/<order_id>', methods=['POST'])
+def api_packing_verifier_parse(order_id):
+    """Parse a packing list Excel (from filepath or upload) and return rows matching this order."""
+    orders = load_orders()
+    order  = next((o for o in orders if o.get('id') == order_id), None)
+    if not order:
+        return jsonify({'ok': False, 'error': 'Order not found'}), 404
+
+    filepath = request.form.get('filepath', '').strip()
+    tmp_created = False
+
+    if filepath:
+        # Security: must be inside ~/Downloads
+        allowed_root = str(Path.home() / 'Downloads')
+        if not filepath.startswith(allowed_root) or not Path(filepath).exists():
+            return jsonify({'ok': False, 'error': 'File not found in Downloads'}), 400
+    else:
+        f = request.files.get('file')
+        if not f:
+            return jsonify({'ok': False, 'error': 'No file provided'}), 400
+        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+            f.save(tmp.name)
+            filepath = tmp.name
+            tmp_created = True
+
+    try:
+        all_rows = parse_packing_list(filepath)
+    except Exception as e:
+        if tmp_created:
+            try: os.unlink(filepath)
+            except Exception: pass
+        return jsonify({'ok': False, 'error': str(e)}), 400
+    finally:
+        if tmp_created:
+            try: os.unlink(filepath)
+            except Exception: pass
+
+    # Filter to rows that belong to this order:
+    # 1. Tracking number matches a manual_shipment TN
+    # 2. OR market + order_num match (for TNs not yet entered)
+    order_tns     = {ms.get('tracking_number', '') for ms in order.get('manual_shipments', [])}
+    order_market  = order.get('market', '').lower()
+    order_num_str = str(order.get('num_for_code', order.get('order_num', ''))).lower()
+
+    relevant = []
+    for r in all_rows:
+        tn         = r.get('tracking_number', '')
+        row_market = r.get('market', '').lower()
+        row_num    = str(r.get('order_num', '')).lower()
+
+        if tn and order_tns and tn in order_tns:
+            relevant.append(r)
+        elif order_market and order_market in row_market and order_num_str == row_num:
+            relevant.append(r)
+
+    return jsonify({
+        'ok':        True,
+        'rows':      relevant,
+        'total_all': len(all_rows),
+        'matched':   len(relevant),
+    })
+
+
+@app.route('/api/packing-verifier-save/<order_id>', methods=['POST'])
+def api_packing_verifier_save(order_id):
+    """Replace the order's packing_list with the provided rows."""
+    body   = request.get_json(force=True)
+    rows   = body.get('rows', [])
+
+    orders = load_orders()
+    order  = next((o for o in orders if o.get('id') == order_id), None)
+    if not order:
+        return jsonify({'ok': False, 'error': 'Order not found'}), 404
+
+    for r in rows:
+        if not r.get('id'):
+            r['id'] = str(uuid.uuid4())
+
+    order['packing_list'] = rows
+
+    # Back-fill missing weight / declared_value on matching manual_shipments
+    for ms in order.get('manual_shipments', []):
+        tn       = ms.get('tracking_number', '')
+        tn_rows  = [r for r in rows if r.get('tracking_number') == tn]
+        if not ms.get('weight'):
+            w = next((r.get('weight') for r in tn_rows if r.get('weight')), '')
+            if w:
+                ms['weight'] = w
+        if not ms.get('declared_value'):
+            dv = next((r.get('declared_value') for r in tn_rows if r.get('declared_value')), '')
+            if dv:
+                ms['declared_value'] = dv
+
+    save_orders(orders)
+    return jsonify({'ok': True, 'saved': len(rows)})
 
 
 @app.route('/api/generate-packing-list/<order_id>', methods=['POST'])
