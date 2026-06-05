@@ -5852,9 +5852,13 @@ def api_packing_verifier_data(order_id):
         pl_for_gear   = [r for r in packing_list_rows if r.get('gear_type') == gear]
         ordered_qty   = ordered_qty_map.get(gear, 0)
         parsed_qty    = _qty_from_packing_contents(gear, pl_for_gear)
-        # When no packing list data for this gear but it's shipped, use ordered qty as packed qty
-        packed_estimated = shipped and not pl_for_gear
-        packed_qty    = parsed_qty if pl_for_gear else (ordered_qty if shipped else 0)
+        # Cap parsed qty at ordered qty — duplicate content strings can inflate the sum
+        if ordered_qty and parsed_qty > ordered_qty:
+            parsed_qty = ordered_qty
+        # Use ordered qty as fallback when: no PL rows, or PL rows have no parseable qty (team names only)
+        has_confirmed_qty = pl_for_gear and parsed_qty > 0
+        packed_estimated  = shipped and not has_confirmed_qty
+        packed_qty = parsed_qty if has_confirmed_qty else (ordered_qty if shipped else 0)
 
         gear_checks.append({
             'gear':              gear,
@@ -5871,12 +5875,27 @@ def api_packing_verifier_data(order_id):
     missing     = [g['gear'] for g in gear_checks if not g['shipped']]
     all_shipped = len(missing) == 0 and len(gear_checks) > 0
 
+    has_msm_packing_list = bool(order.get('packing_docs'))
+
+    # Include registered packing docs so the verifier can show View/Download immediately
+    packing_docs = [
+        {
+            'label':    d.get('label', d.get('filename', '')),
+            'view_url': f'/packing-doc/{order["id"]}/{d["filename"]}',
+            'dl_url':   f'/packing-doc/{order["id"]}/{d["filename"]}?dl=1',
+        }
+        for d in order.get('packing_docs', [])
+        if d.get('filename')
+    ]
+
     return jsonify({
-        'ok':              True,
-        'all_shipped':     all_shipped,
-        'missing':         missing,
-        'gear_checks':     gear_checks,
-        'has_packing_list': has_packing_list,
+        'ok':                  True,
+        'all_shipped':         all_shipped,
+        'missing':             missing,
+        'gear_checks':         gear_checks,
+        'has_packing_list':    has_packing_list,
+        'has_msm_packing_list': has_msm_packing_list,
+        'packing_docs':        packing_docs,
     })
 
 
@@ -6065,7 +6084,6 @@ def api_generate_packing_list(order_id):
         total_packed  += packed_qty
 
         ordered_cell = f'{ordered_qty:,}' if ordered_qty else '—'
-        packed_cell  = f'{packed_qty:,}' if packed_qty else ('—' if not shipped else f'{boxes} box{"es" if boxes != 1 else ""}')
 
         # Build detail string matching DFW format:
         # Tees (size breakdown): "YL 177 · YXL 74 · YM 82"
@@ -6077,46 +6095,112 @@ def api_generate_packing_list(order_id):
             'Hypechain': 'HC', 'Park Banner': 'PB', 'Name Banner': 'NB',
             'Drawstring Bag': 'DB', 'Awards': 'AWD',
         }
-        abbr   = _GEAR_ABBR.get(gear, gear[:2].upper())
-        detail = ''
+        abbr       = _GEAR_ABBR.get(gear, gear[:2].upper())
+        detail     = ''
+        team_count = 0
+        # Gears where each team gets a custom item (per-team breakdown meaningful)
+        _TEAM_GEARS = {'Jersey', 'Hoodie'}
+        _SIZE_RE    = re.compile(r'\b(YXS|YS|YM|YL|YXL|AS|AM|AL|AXL|AXXL)[^\d]*(\d+)\b', re.I)
+        _SIZE_TOK   = re.compile(r'^(?:YXS|YS|YM|YL|YXL|AS|AM|AL|AXL|AXXL)[\s\-×]?\d+$', re.I)
+        _GEAR_WORD  = re.compile(
+            r'\b(?:jersey|hoodie|jacket|windbreaker|tee|cap|ring|rings|necklace|hypechain|'
+            r'namebanner|parkbanner|parkbannner|banner|champion|finalist|soccer|bsbl|7v7|sbl|'
+            r'fsh|dfw|hou|dal|sfl|aus|tpa|msmhouston|msm)\b', re.I
+        )
+
         if pl_gears:
-            # Try size breakdown (e.g. Tees)
-            size_parts = []
+            all_teams   = set()
+            box_team_ct = {}
+            box_sizes   = {}
+
             for r in pl_gears:
-                cnt = (r.get('contents') or '').strip()
-                matches = re.findall(r'\b(YXS|YS|YM|YL|YXL|AS|AM|AL|AXL|AXXL|S|M|L|XL|XXL)[^\d]*(\d+)', cnt, re.I)
-                for sz, qty in matches:
-                    size_parts.append(f'{sz.upper()} {qty}')
-            if size_parts:
-                detail = ' · '.join(size_parts)
-            else:
-                # Try explicit item counts (rings-78, necklace-30 etc.)
-                item_counts = []
+                bnum = r.get('box_num', '')
+                cnt  = (r.get('contents') or '').strip()
+                if not cnt or cnt.lower() == 'see attached':
+                    continue
+
+                # Scan full content for sizes (works without commas: "YL-177 YXL-74")
+                sz_matches = _SIZE_RE.findall(cnt)
+                if sz_matches and bnum:
+                    box_sizes[bnum] = [f'{sz.upper()} {qty}' for sz, qty in sz_matches]
+
+                # Count team names ONLY for team-based gears (Jersey, Hoodie)
+                if gear in _TEAM_GEARS:
+                    for tok in cnt.split(','):
+                        tok = tok.strip()
+                        if not tok or _SIZE_TOK.match(tok) or _GEAR_WORD.search(tok):
+                            continue
+                        # Skip tokens that are dominated by size data (no comma → probably size line)
+                        if not re.search(r'[a-zA-Z]{3,}', tok) or (sz_matches and ',' not in cnt):
+                            continue
+                        all_teams.add(tok.lower())
+                        box_team_ct[bnum] = box_team_ct.get(bnum, 0) + 1
+
+            team_count = len(all_teams)
+
+            # Gears where item counts take priority over size data
+            _ITEM_COUNT_GEARS = {'Ring', 'Hypechain', 'Park Banner', 'Name Banner', 'Drawstring Bag', 'Awards'}
+            _ITEM_KWS = {
+                'Ring': ('ring', 'champion', 'finalist'),
+                'Hypechain': ('necklace', 'hypechain'),
+                'Park Banner': ('parkbanner', 'parkbannner', 'park banner'),
+                'Name Banner': ('namebanner', 'name banner'),
+                'Cap': ('cap',),
+                'Drawstring Bag': ('bag',),
+            }
+
+            if team_count > 0 and gear in _TEAM_GEARS:
+                # Show per-box team counts: "J-1: 16 teams · J-2: 13 teams"
+                detail = ' · '.join(
+                    f'{abbr}-{bn}: {tc} team{"s" if tc != 1 else ""}'
+                    for bn, tc in sorted(box_team_ct.items()) if tc > 0
+                )
+            elif gear in _ITEM_COUNT_GEARS:
+                # Item-count gear: ring-78, necklace-5, namebanner-1, parkbanner-5
+                kws   = _ITEM_KWS.get(gear, ())
+                found = []
+                seen_f = set()
                 for r in pl_gears:
                     cnt = (r.get('contents') or '').strip()
-                    for kw in ('ring', 'necklace', 'hypechain', 'namebanner', 'parkbanner',
-                               'parkbannner', 'cap', 'bag'):
-                        for m in re.finditer(rf'{re.escape(kw)}s?[\s\-](\d+)', cnt, re.I):
-                            item_counts.append(m.group(1))
-                if item_counts:
-                    detail = ' · '.join(f'×{q}' for q in item_counts[:4])
-                else:
-                    # Team-name contents: show "{abbr}-{box}: N teams" per box
-                    box_map = {}
-                    for r in pl_gears:
-                        bnum = r.get('box_num', '')
-                        cnt  = (r.get('contents') or '').strip()
-                        if bnum and cnt and cnt.lower() not in ('see attached', ''):
-                            teams_list = [t.strip() for t in cnt.split(',') if t.strip()]
-                            box_map[bnum] = len(teams_list)
-                    if box_map:
-                        detail = ' · '.join(
-                            f'{abbr}-{bn}: {cnt} team{"s" if cnt != 1 else ""}'
-                            for bn, cnt in sorted(box_map.items())
-                        )
+                    for kw in kws:
+                        for m in re.finditer(rf'([a-zA-Z]+\s+)?{re.escape(kw)}s?[\s\-](\d+)', cnt, re.I):
+                            qty    = m.group(2)
+                            prefix = (m.group(1) or '').strip()
+                            # Use prefix as a descriptor label only if it's a pure word (not a size code)
+                            if prefix and re.match(r'^[a-zA-Z]{3,}$', prefix) \
+                                      and not re.match(r'^(?:YXS|YS|YM|YL|YXL|AS|AM|AL|AXL|AXXL)$', prefix, re.I):
+                                label = f'{prefix.capitalize()} ×{qty}'
+                            else:
+                                label = f'×{qty}'
+                            if label not in seen_f:
+                                seen_f.add(label)
+                                found.append(label)
+                if found:
+                    detail = ' · '.join(found[:4])
+            elif box_sizes:
+                # Size-breakdown gear (Tee, Windbreaker, Cage Jacket)
+                all_sz = []
+                for bn in sorted(box_sizes):
+                    all_sz.extend(box_sizes[bn])
+                detail = ' · '.join(all_sz)
+
         if not detail and shipments:
             notes = shipments[0].get('notes', '')
             detail = esc(notes[:80]) if notes else ''
+
+        # team_count only meaningful for team-based gears
+        if gear not in {'Jersey', 'Hoodie'}:
+            team_count = 0
+
+        # PACKED cell: add "(N teams)" annotation for team-based gear, matching DFW format
+        if packed_qty and team_count:
+            packed_cell = f'{packed_qty:,} <span style="font-weight:400; font-size:11px;">({team_count} teams)</span>'
+        elif packed_qty:
+            packed_cell = f'{packed_qty:,}'
+        elif not shipped:
+            packed_cell = '—'
+        else:
+            packed_cell = f'{boxes} box{"es" if boxes != 1 else ""}'
 
         tags = [tracking_statuses.get(tn, {}).get('tag', '') for tn in tns]
         if all(t == 'Delivered' for t in tags if t):
@@ -6135,7 +6219,7 @@ def api_generate_packing_list(order_id):
       <tr style="border-bottom:1px solid #f3f4f6;{row_bg}">
         <td style="padding:9px 14px; font-weight:600; color:#374151;">{esc(gear)}</td>
         <td style="padding:9px 14px; text-align:center; color:#374151;">{esc(ordered_cell)}</td>
-        <td style="padding:9px 14px; text-align:center; color:#374151;">{esc(packed_cell)}</td>
+        <td style="padding:9px 14px; text-align:center; color:#374151;">{packed_cell}</td>
         <td style="padding:9px 14px; font-size:11px; color:#6b7280;">{esc(detail) if detail else '—'}</td>
         <td style="padding:9px 14px; font-size:11px; color:#1a2b6b; font-family:monospace;">{tn_html}</td>
         <td style="padding:9px 14px; text-align:center;">{status_cell}</td>

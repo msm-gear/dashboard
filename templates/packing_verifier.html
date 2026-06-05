@@ -88,7 +88,7 @@
         <div>
           <div class="font-semibold text-gray-800 text-sm">No Packing List on File</div>
           <div class="text-xs text-gray-500 mt-0.5">
-            Quantities above are estimated from the order sheet. Upload the supplier packing list to confirm packed quantities and box contents.
+            Quantities above are estimated from the order sheet. Upload the supplier (TG) packing list Excel to confirm packed quantities and box contents.
           </div>
         </div>
       </div>
@@ -176,6 +176,11 @@
           </button>
         </div>
       </div>
+
+      <!-- Existing registered docs -->
+      <div id="existing-docs" class="hidden mt-3 pt-3 border-t border-gray-100 space-y-1.5"></div>
+
+      <!-- Newly generated doc -->
       <div id="pl-download" class="hidden mt-3 pt-3 border-t border-gray-100">
         <div class="flex items-center gap-2">
           <span class="text-green-600 font-semibold text-xs">✓ Created and registered on tracking page</span>
@@ -236,8 +241,10 @@
 
     // Source badge
     const sourceBadge = document.getElementById('pl-source-badge');
-    if (data.has_packing_list) {
-      sourceBadge.innerHTML = `<span class="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded font-semibold">📋 Packing list verified</span>`;
+    if (data.has_msm_packing_list) {
+      sourceBadge.innerHTML = `<span class="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded font-semibold">📋 MSM packing list created</span>`;
+    } else if (data.has_packing_list) {
+      sourceBadge.innerHTML = `<span class="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded font-semibold">📦 Supplier PL on file</span>`;
     } else {
       sourceBadge.innerHTML = `<span class="text-xs px-2 py-0.5 bg-amber-100 text-amber-700 rounded font-semibold">📊 Using order sheet qty</span>`;
     }
@@ -287,13 +294,36 @@
       </tr>`;
     }).join('');
 
+    // Existing packing docs
+    const existingDocsEl = document.getElementById('existing-docs');
+    const docs = data.packing_docs || [];
+    if (docs.length) {
+      existingDocsEl.innerHTML = docs.map(d => `
+        <div class="flex items-center gap-2">
+          <svg class="w-3.5 h-3.5 text-[#1a2b6b] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+          </svg>
+          <span class="text-xs text-gray-600 font-medium truncate flex-1">${d.label}</span>
+          <a href="${d.view_url}" target="_blank"
+             class="text-xs px-2.5 py-1 bg-blue-50 hover:bg-blue-100 rounded text-blue-700 font-medium transition-all flex-shrink-0">View PDF</a>
+          <a href="${d.dl_url}" target="_blank"
+             class="text-xs px-2.5 py-1 bg-gray-100 hover:bg-gray-200 rounded text-gray-700 font-medium transition-all flex-shrink-0">Download</a>
+        </div>`).join('');
+      existingDocsEl.classList.remove('hidden');
+    } else {
+      existingDocsEl.classList.add('hidden');
+    }
+
     // Show/hide upload vs replace sections
+    const replaceEl = document.getElementById('replace-section');
     if (data.has_packing_list) {
       document.getElementById('upload-section').classList.add('hidden');
-      document.getElementById('replace-section').classList.remove('hidden');
+      replaceEl.classList.remove('hidden');
+      replaceEl.innerHTML = `<span>Supplier packing list on file.</span>
+        <button onclick="showReplaceUI()" class="underline hover:text-gray-600 transition-colors ml-1">Upload a new one to replace it →</button>`;
     } else {
       document.getElementById('upload-section').classList.remove('hidden');
-      document.getElementById('replace-section').classList.add('hidden');
+      replaceEl.classList.add('hidden');
     }
 
     document.getElementById('verifier-panel').classList.remove('hidden');
