@@ -8,17 +8,29 @@
     <h1 class="text-2xl font-bold text-gray-900">Saved Orders</h1>
     <p class="text-gray-500 text-sm mt-1">{{ orders|length }} order(s) on file</p>
   </div>
+  <div class="flex items-center gap-3">
+    <button id="cu-sync-btn" onclick="syncFromClickUp()"
+            class="flex items-center gap-2 px-4 py-2 rounded-xl border border-gray-300 text-sm font-semibold text-gray-600 hover:border-blue-400 hover:text-blue-700 transition-all">
+      <span id="cu-sync-icon">↻</span> Sync from ClickUp
+    </button>
+    <span id="cu-sync-result" class="text-sm hidden"></span>
+  </div>
 </div>
 
 <!-- ── Pending Orders Summary ─────────────────────────────────────────── -->
 <div id="ord-summary-wrap" class="bg-white rounded-2xl border border-gray-200 shadow-sm mb-6 overflow-hidden">
-  <div class="px-5 py-3 flex items-center justify-between bg-gray-50 border-b border-gray-100 cursor-pointer select-none"
-       onclick="toggleOrdSummary()">
-    <div class="flex items-center gap-3">
+  <div class="px-5 py-3 flex items-center justify-between bg-gray-50 border-b border-gray-100">
+    <div class="flex items-center gap-3 cursor-pointer select-none flex-1" onclick="toggleOrdSummary()">
       <span class="font-semibold text-gray-800 text-sm">Order Summary</span>
       <span id="ord-summary-count" class="text-xs text-gray-400">Loading…</span>
     </div>
-    <span id="ord-summary-chevron" class="text-gray-400 text-sm rotate-180">▼</span>
+    <div class="flex items-center gap-3">
+      <button onclick="loadOrdSummary()" id="summary-refresh-btn"
+              class="text-xs text-gray-400 hover:text-purple-600 flex items-center gap-1 transition-colors">
+        <span id="summary-refresh-icon">↻</span> Refresh
+      </button>
+      <span class="cursor-pointer select-none text-gray-400 text-sm rotate-180" onclick="toggleOrdSummary()" id="ord-summary-chevron">▼</span>
+    </div>
   </div>
   <div id="ord-summary-body">
     <div class="px-5 py-6 text-center text-gray-400 text-sm">
@@ -106,6 +118,16 @@
         <input type="number" id="ship-boxes-{{ order_id }}-{{ gear }}"
                min="1" value="1"
                class="w-full border border-blue-300 rounded-lg px-3 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400">
+      </div>
+      <div class="flex-1 min-w-40">
+        <label class="text-xs text-blue-600 font-medium block mb-1">FedEx Service Type</label>
+        <select id="ship-service-{{ order_id }}-{{ gear }}"
+                class="w-full border border-blue-300 rounded-lg px-3 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400">
+          <option value="FedEx International Connect Plus">Intl Connect Plus</option>
+          <option value="FedEx International Priority">Intl Priority</option>
+          <option value="FedEx International Economy">Intl Economy</option>
+          <option value="FedEx International Ground">Intl Ground</option>
+        </select>
       </div>
       <div class="flex-1 min-w-32">
         <label class="text-xs text-blue-600 font-medium block mb-1">Declared Value ($)</label>
@@ -209,7 +231,7 @@
         {% endif %}
       </div>
       <div class="flex flex-wrap gap-1.5 mt-2">
-        {% for gear in order.gear_tasks.keys() %}
+        {% for gear in order.display_gears %}
         <span class="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{{ gear | gear_display }}</span>
         {% endfor %}
       </div>
@@ -435,6 +457,7 @@
     const notes        = document.getElementById(`ship-notes-${orderId}-${gear}`)?.value.trim() || '';
     const declaredValue = document.getElementById(`ship-declared-${orderId}-${gear}`)?.value.trim() || '';
     const boxCount     = parseInt(document.getElementById(`ship-boxes-${orderId}-${gear}`)?.value || '1', 10) || 1;
+    const serviceType  = document.getElementById(`ship-service-${orderId}-${gear}`)?.value || '';
 
     if (!tn) { alert('Enter a tracking number.'); return; }
 
@@ -450,7 +473,7 @@
       const resp = await fetch('/push/update-ship', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ order_id: orderId, gear_type: gear, tracking_number: tn, ship_date: shipDate, notes, declared_value: declaredValue, box_count: boxCount }),
+        body: JSON.stringify({ order_id: orderId, gear_type: gear, tracking_number: tn, ship_date: shipDate, notes, declared_value: declaredValue, box_count: boxCount, service_type: serviceType }),
       });
       const data = await resp.json();
       result.classList.remove('hidden');
@@ -939,6 +962,38 @@
       loadSupplier(orderId);
     });
   });
+
+  async function syncFromClickUp() {
+    const btn    = document.getElementById('cu-sync-btn');
+    const icon   = document.getElementById('cu-sync-icon');
+    const result = document.getElementById('cu-sync-result');
+    btn.disabled = true;
+    icon.innerHTML = SPINNER;
+    result.classList.add('hidden');
+    try {
+      const resp = await fetch('/api/refresh-from-clickup', { method: 'POST' });
+      const data = await resp.json();
+      result.classList.remove('hidden');
+      if (data.ok) {
+        const parts = [];
+        if (data.added)         parts.push(`${data.added} new order${data.added !== 1 ? 's' : ''} added`);
+        if (data.dates_updated) parts.push(`${data.dates_updated} order${data.dates_updated !== 1 ? 's' : ''} updated`);
+        result.textContent = parts.length ? '✓ ' + parts.join(', ') : '✓ Already up to date';
+        result.className = 'text-sm text-green-700';
+        if (data.added) setTimeout(() => location.reload(), 1200);
+      } else {
+        result.textContent = '✗ ' + (data.error || 'Sync failed');
+        result.className = 'text-sm text-red-600';
+      }
+    } catch (e) {
+      result.classList.remove('hidden');
+      result.textContent = '✗ Network error';
+      result.className = 'text-sm text-red-600';
+    } finally {
+      btn.disabled = false;
+      icon.textContent = '↻';
+    }
+  }
 </script>
 
 <script>
@@ -971,6 +1026,10 @@ function toggleOrdSummary() {
 }
 
 async function loadOrdSummary() {
+  const btn  = document.getElementById('summary-refresh-btn');
+  const icon = document.getElementById('summary-refresh-icon');
+  if (btn)  btn.disabled = true;
+  if (icon) icon.innerHTML = '<svg class="spin w-3 h-3 inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>';
   try {
     const resp = await fetch('/api/orders-summary');
     const data = await resp.json();
@@ -1064,6 +1123,9 @@ async function loadOrdSummary() {
 
   } catch (e) {
     renderOrdSummaryEmpty('Error: ' + e.message);
+  } finally {
+    if (btn)  btn.disabled = false;
+    if (icon) icon.textContent = '↻';
   }
 }
 

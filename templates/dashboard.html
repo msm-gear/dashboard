@@ -338,16 +338,53 @@
   }
 
   function pctError(arr) {
-    const remadeTotal = arr.reduce((s, o) => s + (o.remake_qty || 0), 0);
-    const orderedTotal = arr.reduce((s, o) => s + (o.order_jersey_qty || 0), 0);
+    let errorPcs = 0, orderedTotal = 0;
+    arr.forEach(o => {
+      const denom = o.total_gear_qty || o.order_jersey_qty || 0;
+      if (!denom) return;
+      const detailQty = (o.error_details || []).reduce((s, d) => s + (d.qty || 0), 0);
+      const remQty    = o.remake_qty || 0;
+      const hasErrors = (o.error_count || 0) > 0 || remQty > 0;
+      const knowsQty  = detailQty > 0 || remQty > 0;
+      // If order has errors but qty is unknown, exclude entirely — adding 0/denom deflates %
+      if (hasErrors && !knowsQty) return;
+      errorPcs     += detailQty + remQty;
+      orderedTotal += denom;
+    });
     if (!orderedTotal) return null;
-    return remadeTotal / orderedTotal * 100;
+    return errorPcs / orderedTotal * 100;
+  }
+
+  function errorPcsTotal(arr) {
+    return arr.reduce((s, o) => {
+      const detailQty = (o.error_details || []).reduce((s2, d) => s2 + (d.qty || 0), 0);
+      return s + detailQty + (o.remake_qty || 0);
+    }, 0);
   }
 
   function errorTip(arr) {
-    const remakes = arr.filter(o => (o.remake_qty || 0) > 0);
-    if (!remakes.length) return '';
-    return remakes.map(o => `${o.label}  —  ${o.remake_qty} remakes`).join('\n');
+    const lines = [];
+    arr.forEach(o => {
+      const parts = [];
+      if ((o.remake_qty || 0) > 0) parts.push(`${o.remake_qty} remake${o.remake_qty !== 1 ? 's' : ''}`);
+      if ((o.error_count || 0) > 0) {
+        const details = o.error_details || [];
+        if (details.length) {
+          details.forEach(d => {
+            const gear = d.gear || 'gear';
+            if (d.qty != null) {
+              parts.push(`${d.qty} ${gear}${d.qty !== 1 ? 's' : ''} incorrect`);
+            } else {
+              parts.push(`${gear} incorrect`);
+            }
+          });
+        } else {
+          parts.push(`${o.error_count} gear type${o.error_count !== 1 ? 's' : ''} incorrect`);
+        }
+      }
+      if (parts.length) lines.push(`${o.label}  —  ${parts.join(', ')}`);
+    });
+    return lines.join('\n');
   }
 
   function fmtDays(v) {
@@ -459,7 +496,6 @@
     const avgDelivery      = avg(data, 'days_to_delivery');
     const avgShipToDel     = avg(data, 'days_ship_to_delivery');
     const delayPct         = pctDelayed(data);
-    const errorPct         = pctError(data);
 
     document.getElementById('card-proofs').textContent          = fmtDays(avgProofs);
     document.getElementById('card-ship').textContent            = fmtDays(avgShip);
@@ -470,10 +506,11 @@
     delayEl.textContent = fmtPct(delayPct);
     delayEl.className   = 'text-2xl font-bold ' + delayClass(delayPct);
 
-    const errorEl = document.getElementById('card-error');
-    errorEl.textContent  = fmtPct(errorPct);
-    errorEl.className    = 'text-2xl font-bold cursor-help ' + errorClass(errorPct);
-    errorEl.dataset.tip  = errorTip(data);
+    // NOTE: #card-error is intentionally NOT updated here. It's owned by
+    // renderGearStatus() (fed by /api/shipment-status), which reflects actual
+    // flagged gear-task issues (CF_RECEIVING + reason, e.g. "Incorrect Team Name
+    // print issue") — finer-grained than this order-level remake_qty metric, which
+    // is null for most orders and was clobbering the real tooltip when this ran last.
 
     renderStatusBreakdown(data);
 
@@ -498,8 +535,10 @@
         const md  = avg(rows, 'days_to_delivery');
         const msd = avg(rows, 'days_ship_to_delivery');
         const dp  = pctDelayed(rows);
-        const ep  = pctError(rows);
-        const et  = errorTip(rows);
+        const ep   = pctError(rows);
+        const epcs = errorPcsTotal(rows);
+        const et   = errorTip(rows);
+        const epDisplay = ep !== null ? fmtPct(ep) : (epcs > 0 ? `${epcs.toLocaleString()} pcs` : '—');
         return `<tr class="hover:bg-gray-50">
           <td class="px-6 py-3 font-semibold text-gray-800">${market}</td>
           <td class="px-4 py-3 text-center text-gray-500">${rows.length}</td>
@@ -508,7 +547,7 @@
           <td class="px-4 py-3 text-center text-gray-700">${fmtDays(md)}</td>
           <td class="px-4 py-3 text-center text-gray-700">${fmtDays(msd)}</td>
           <td class="px-4 py-3 text-center ${delayClass(dp)}">${fmtPct(dp)}</td>
-          <td class="px-4 py-3 text-center ${errorClass(ep)}${et ? ' cursor-help' : ''}"${et ? ` data-tip="${et.replace(/"/g,'&quot;')}"` : ''}>${fmtPct(ep)}</td>
+          <td class="px-4 py-3 text-center ${errorClass(ep || (epcs > 0 ? 100 : null))}${et ? ' cursor-help' : ''}"${et ? ` data-tip="${et.replace(/"/g,'&quot;')}"` : ''}>${epDisplay}</td>
         </tr>`;
       }).join('');
   }
@@ -736,6 +775,38 @@
 
   function renderGearStatus(markets) {
     _lastGearData = markets;
+
+    // Update KPI cards first — before body.innerHTML so they always render
+    let totArr = 0, totShp = 0, totPrd = 0, totAll = 0, totErr = 0;
+    for (const d of Object.values(markets)) {
+      totArr += d.arrived;
+      totShp += d.shipped;
+      totPrd += d.in_production;
+      totAll += d.total;
+      totErr += d.error;
+    }
+    const fmtP = (n, t) => t ? Math.round(n / t * 100) + '%' : '—';
+    const el = id => document.getElementById(id);
+    if (el('card-gear-arrived'))    el('card-gear-arrived').textContent    = fmtP(totArr, totAll);
+    if (el('card-gear-shipped'))    el('card-gear-shipped').textContent    = fmtP(totShp, totAll);
+    if (el('card-gear-production')) el('card-gear-production').textContent = fmtP(totPrd, totAll);
+
+    // Update % Error card using real gear pcs — error pcs / total gear pcs ordered
+    if (totErr > 0 || totAll > 0) {
+      const errPct = (totAll + totErr) ? Math.round(totErr / (totAll + totErr) * 100) : 0;
+      const errEl = el('card-error');
+      if (errEl) {
+        errEl.textContent = errPct + '%';
+        errEl.className   = 'text-2xl font-bold cursor-help ' + (errPct > 0 ? 'text-red-600' : 'text-green-600');
+        // Build a complete tooltip from every market's flagged gear items so the
+        // hover always matches the % currently shown.
+        const allErrLines = Object.values(markets)
+          .flatMap(d => d.gear || [])
+          .flatMap(g => (g.error_items || []).map(fmtErrorItem));
+        errEl.dataset.tip = allErrLines.length ? allErrLines.join('\n') : 'No flagged issues';
+      }
+    }
+
     const body = document.getElementById('gear-status-body');
     const keys  = Object.keys(markets);
     if (!keys.length) {
@@ -744,26 +815,11 @@
     }
     body.innerHTML = keys
       .sort((a, b) => markets[b].arrived_pct - markets[a].arrived_pct)
-      .map(m => gearStatusHTML(m, markets[m]))
+      .map(m => {
+        try { return gearStatusHTML(m, markets[m]); }
+        catch (e) { return `<div class="border border-red-200 rounded-xl p-4 text-xs text-red-400">${m}: ${e.message}</div>`; }
+      })
       .join('');
-
-    // Update overall gear KPI cards
-    let totArr = 0, totShp = 0, totPrd = 0, totAll = 0;
-    for (const d of Object.values(markets)) {
-      totArr += d.arrived;
-      totShp += d.shipped;
-      totPrd += d.in_production;
-      totAll += d.total;
-    }
-    const el = id => document.getElementById(id);
-    if (totAll) {
-      const pArr = Math.floor(totArr / totAll * 100);
-      const pShp = Math.round(totShp / totAll * 100);
-      const pPrd = 100 - pArr - pShp;   // remainder ensures sum = 100%
-      if (el('card-gear-arrived'))    el('card-gear-arrived').textContent    = pArr + '%';
-      if (el('card-gear-shipped'))    el('card-gear-shipped').textContent    = pShp + '%';
-      if (el('card-gear-production')) el('card-gear-production').textContent = pPrd + '%';
-    }
   }
 
   async function loadGearStatus() {
@@ -781,6 +837,7 @@
   // ── Tooltip ──────────────────────────────────────────────────────────────────
   (function () {
     const tip = document.getElementById('gear-tip');
+    if (!tip) return;
     let cur = null;
 
     document.addEventListener('mouseover', e => {

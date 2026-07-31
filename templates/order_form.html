@@ -91,7 +91,8 @@
     <label class="block text-xs font-medium text-gray-500 mb-2 uppercase tracking-wide">Gear Included in This Order</label>
     <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
       {% for gear in gear_types %}
-      <label class="flex items-center gap-2 cursor-pointer p-2 rounded-lg border border-gray-200 hover:border-purple-300 hover:bg-purple-50 transition-colors has-[:checked]:border-purple-500 has-[:checked]:bg-purple-50">
+      <label class="flex items-center gap-2 cursor-pointer p-2 rounded-lg border border-gray-200 hover:border-purple-300 hover:bg-purple-50 transition-colors has-[:checked]:border-purple-500 has-[:checked]:bg-purple-50"
+             {% if gear == 'Cage Jacket' %}data-season-only="Fall"{% elif gear == 'Windbreaker' %}data-season-only="Summer"{% endif %}>
         <input type="checkbox" name="gear" value="{{ gear }}" class="accent-purple-600 w-4 h-4">
         <span class="text-sm text-gray-700">{{ gear }}{% if gear == 'Awards' %} <span class="text-xs text-gray-400">(Rings + Hype Chains)</span>{% endif %}</span>
       </label>
@@ -324,8 +325,19 @@
     document.getElementById(id).addEventListener('change', updatePreview);
   });
 
+  function updateJacketVisibility() {
+    const season = document.getElementById('season').value;
+    document.querySelectorAll('label[data-season-only]').forEach(label => {
+      const hidden = label.dataset.seasonOnly !== season;
+      label.style.display = hidden ? 'none' : '';
+      if (hidden) label.querySelector('input[type="checkbox"]').checked = false;
+    });
+  }
+  updateJacketVisibility();
+
   // Re-fetch gear when season changes (jackets mapping differs by season)
   document.getElementById('season').addEventListener('change', () => {
+    updateJacketVisibility();
     const url = document.getElementById('orderSheetUrl').value;
     if (url.includes('/spreadsheets/d/')) fetchGearFromSheet(url);
   });

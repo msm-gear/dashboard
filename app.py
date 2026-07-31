@@ -1,5 +1,5 @@
 from __future__ import annotations
-from flask import Flask, render_template, request, session, jsonify, redirect, url_for, send_file
+from flask import Flask, render_template, request, session, jsonify, redirect, url_for, send_file, send_from_directory
 import openpyxl
 import re
 import difflib
@@ -102,6 +102,7 @@ def block_external_admin():
             request.path == '/public/orders-login' or
             request.path == '/public/orders-logout' or
             request.path.startswith('/api/order-sheet') or
+            request.path.startswith('/public/logos/') or
             request.path.startswith('/static/')
         )
         if not allowed:
@@ -1362,7 +1363,7 @@ def _sync_clickup_tasks() -> dict:
     skipped = 0
 
     # Only consider tasks created on/after the display cutoff (April 2026)
-    _cutoff_ms = 1743465600000  # 2026-04-01 00:00 UTC in ms
+    _cutoff_ms = 1775001600000  # 2026-04-01 00:00 UTC in ms
 
     for task in all_tasks:
         task_id = str(task.get('id', ''))
@@ -1430,7 +1431,7 @@ def _sync_clickup_tasks() -> dict:
 
         # Reload inside loop so concurrent syncs don't stomp each other
         orders = load_orders()
-        existing = find_order(market, order_num, sport)
+        existing = find_order(market, order_num, sport, season)
 
         def _add_tracking_to_order(order, gear_type, tn, ship_dt, notes=''):
             """Upsert a manual_shipments entry for this gear+TN if not already there."""
@@ -1457,8 +1458,20 @@ def _sync_clickup_tasks() -> dict:
                 })
 
         if existing:
-            # Never modify existing orders — they're managed by the app
-            skipped += 1
+            # Never touch orders managed through the app's own UI. But a stub order
+            # created by this same sync can still be missing gear_task keys — e.g.
+            # "... Jersey 7" and "... Ring 7" are separate ClickUp tasks created
+            # together; whichever one this loop reaches first creates the order
+            # stub, and without this branch every gear task after the first was
+            # silently dropped forever (the order already "existing" hid them).
+            if existing.get('synced_from_clickup') and gear not in existing.get('gear_tasks', {}):
+                existing.setdefault('gear_tasks', {})[gear] = task_id
+                _add_tracking_to_order(existing, gear, tracking, ship_date, cu_notes)
+                upsert_order(existing)
+                tracked_ids.add(task_id)
+                added += 1
+            else:
+                skipped += 1
         else:
             # Brand-new stub order — safe to pull tracking from ClickUp
             new_order = {
@@ -1682,8 +1695,8 @@ def save_orders(orders: list):
     ORDER_REGISTRY.write_text(json.dumps(orders, indent=2))
 
 
-def find_order(market: str, order_num: str, sport: str = None):
-    """Find a saved order by market, order number, and optionally sport.
+def find_order(market: str, order_num: str, sport: str = None, season: str = None):
+    """Find a saved order by market, order number, and optionally sport/season.
     When sport is provided, only returns an order whose sport matches exactly.
     Houston BSBL, Houston SOC, and Houston GLF are treated as separate orders.
     """
@@ -1694,6 +1707,8 @@ def find_order(market: str, order_num: str, sport: str = None):
         if str(o['order_num']) != str(order_num):
             continue
         if sport is not None and o.get('sport', '').upper() != sport.upper():
+            continue
+        if season is not None and o.get('season', '').lower() != season.lower():
             continue
         return o
     return None
@@ -1708,6 +1723,20 @@ def upsert_order(order: dict):
             return
     orders.append(order)
     save_orders(orders)
+
+
+def _auto_generate_packing_list(order_id: str):
+    """Regenerate the MSM packing list for an order in a background thread."""
+    import threading
+    def _run():
+        try:
+            with app.test_request_context(
+                f'/api/generate-packing-list/{order_id}', method='POST'
+            ):
+                api_generate_packing_list(order_id)
+        except Exception as e:
+            app.logger.error('Auto packing list generation failed for %s: %s', order_id, e)
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def save_data(rows: list, meta: dict = None) -> str:
@@ -1748,13 +1777,13 @@ def clickup_headers():
 def create_clickup_task(payload: dict):
     list_id = get_settings()['clickup_list_id']
     url = f"https://api.clickup.com/api/v2/list/{list_id}/task"
-    return requests.post(url, headers=clickup_headers(), json=payload, timeout=10)
+    return requests.post(url, headers=clickup_headers(), json=payload, timeout=25)
 
 
 def set_clickup_field(task_id: str, field_id: str, value):
     return requests.post(
         f"https://api.clickup.com/api/v2/task/{task_id}/field/{field_id}",
-        headers=clickup_headers(), json={'value': value}, timeout=10,
+        headers=clickup_headers(), json={'value': value}, timeout=25,
     )
 
 
@@ -1771,20 +1800,46 @@ def update_task_for_shipment(task_id: str, tracking_str: str, ship_date_ms):
 _clickup_task_cache: dict = {}  # task_id -> (fetched_at, task)
 _CLICKUP_CACHE_TTL = 300  # seconds (5 min)
 
-def _get_clickup_task(task_id: str):
+def _get_clickup_task(task_id: str, force: bool = False):
     import time
     now = time.time()
-    if task_id in _clickup_task_cache:
+    if not force and task_id in _clickup_task_cache:
         fetched_at, task = _clickup_task_cache[task_id]
         if now - fetched_at < _CLICKUP_CACHE_TTL:
             return task
-    resp = requests.get(
-        f"https://api.clickup.com/api/v2/task/{task_id}",
-        headers=clickup_headers(), timeout=10,
-    )
-    task = resp.json() if resp.status_code == 200 else None
+    try:
+        resp = requests.get(
+            f"https://api.clickup.com/api/v2/task/{task_id}",
+            headers=clickup_headers(), timeout=6,
+        )
+        task = resp.json() if resp.status_code == 200 else None
+    except Exception:
+        # ClickUp slow/unreachable — serve stale cache rather than blow up the request
+        if task_id in _clickup_task_cache:
+            return _clickup_task_cache[task_id][1]
+        # No prior cache at all — cache the miss too (short-lived) so repeated
+        # lookups of this same task later in the same request don't retry and
+        # stack up more timeouts on top of this one.
+        _clickup_task_cache[task_id] = (now - _CLICKUP_CACHE_TTL + 20, None)
+        return None
     _clickup_task_cache[task_id] = (now, task)
     return task
+
+
+def _clickup_task_confirmed_deleted(task_id: str) -> bool:
+    """Authoritative check for whether ClickUp has actually deleted a task.
+    Returns True ONLY on a confirmed 404 -- never on a network blip/timeout,
+    which _get_clickup_task's cache can otherwise conflate with "deleted".
+    Callers use this before auto-recreating a "missing" task; we'd rather skip
+    that safety net on an ambiguous failure than risk creating a duplicate."""
+    try:
+        resp = requests.get(
+            f"https://api.clickup.com/api/v2/task/{task_id}",
+            headers=clickup_headers(), timeout=25,
+        )
+    except requests.exceptions.RequestException:
+        return False
+    return resp.status_code == 404
 
 
 def _next_subtask_letter(subtasks: list) -> str:
@@ -2429,32 +2484,49 @@ def orders_list():
         o['shipments'] = _collect_shipments(o)
         shipped_gears = {g['gear'] for s in o['shipments'] for g in s['gear_summary']}
         o['unshipped_gears'] = [g for g in o.get('gear_tasks', {}).keys() if g not in shipped_gears]
+        # All gear types across gear_tasks + manual_shipments (for display pills)
+        all_gears = list(o.get('gear_tasks', {}).keys())
+        for m in o.get('manual_shipments', []):
+            gt = m.get('gear_type', '')
+            if gt and gt not in all_gears:
+                all_gears.append(gt)
+        o['display_gears'] = all_gears
 
-    # Build flat list of unique (order, tn) pairs across all manual shipments
+    # Build flat list of unique (order, individual-tn) pairs — one row per tracking number
     manual_tns = []
+    seen_tns: set = set()
     for o in orders_sorted:
         statuses = o.get('tracking_statuses', {})
-        tns_map: dict = {}
-        for m in o.get('manual_shipments', []):
-            tn = m.get('tracking_number', '').strip()
-            if not tn:
-                continue
-            if statuses.get(tn, {}).get('tag') == 'Delivered':
-                continue
-            gt = m.get('gear_type', '')
-            if tn not in tns_map:
-                tns_map[tn] = []
-            if gt and gt not in tns_map[tn]:
-                tns_map[tn].append(gt)
         market = o.get('market', '')
         sport  = o.get('sport', '')
         onum   = o.get('num_for_code', o.get('order_num', ''))
-        for tn, gears in tns_map.items():
+        order_label = f"{market} {sport} #{onum}"
+
+        # Collect gear labels per individual TN for this order
+        tn_gears: dict = {}  # individual_tn -> set of gear labels
+        for m in o.get('manual_shipments', []):
+            raw_tn = m.get('tracking_number', '').strip()
+            if not raw_tn:
+                continue
+            gt = m.get('gear_type', '')
+            for single_tn in [t.strip() for t in raw_tn.split(',') if t.strip()]:
+                tn_gears.setdefault(single_tn, set())
+                if gt:
+                    tn_gears[single_tn].add(gt)
+
+        for single_tn, gears in tn_gears.items():
+            # Skip if already delivered
+            if statuses.get(single_tn, {}).get('tag') == 'Delivered':
+                continue
+            # Skip global duplicates (same TN on multiple orders)
+            if single_tn in seen_tns:
+                continue
+            seen_tns.add(single_tn)
             manual_tns.append({
                 'order_id':    o['id'],
-                'order_label': f"{market} {sport} #{onum}",
-                'tn':          tn,
-                'gears':       ', '.join(gears) if gears else '',
+                'order_label': order_label,
+                'tn':          single_tn,
+                'gears':       ', '.join(sorted(gears)),
             })
 
     return render_template('orders.html', orders=orders_sorted, phase_labels=PHASE_LABELS, manual_tns=manual_tns)
@@ -2467,8 +2539,10 @@ _ORDERS_SUMMARY_TTL = 300  # 5 minutes
 @app.route('/api/orders-summary')
 def api_orders_summary():
     """Return phase + dates for all orders (for the pending summary table)."""
+    from concurrent.futures import ThreadPoolExecutor
     global _orders_summary_cache
-    if _orders_summary_cache['data'] and (time.time() - _orders_summary_cache['ts']) < _ORDERS_SUMMARY_TTL:
+    force = request.args.get('force') == '1'
+    if not force and _orders_summary_cache['data'] and (time.time() - _orders_summary_cache['ts']) < _ORDERS_SUMMARY_TTL:
         return jsonify(_orders_summary_cache['data'])
 
     def _ms_to_date(val):
@@ -2482,12 +2556,17 @@ def api_orders_summary():
     orders = load_display_orders()
     result = []
 
+    # Pre-fetch all ClickUp tasks in parallel to avoid a serial stampede of HTTP calls
+    all_task_ids = list({tid for o in orders for tid in o.get('gear_tasks', {}).values() if tid})
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        list(ex.map(lambda tid: _get_clickup_task(tid, force=force), all_task_ids))
+
     for order in orders:
         gear_tasks = order.get('gear_tasks', {})
         if not gear_tasks:
             continue
 
-        # Fetch first task for shared date fields
+        # Fetch first task for shared date fields (already warm from the prefetch above)
         first_task = _get_clickup_task(next(iter(gear_tasks.values())))
         if not first_task:
             continue
@@ -2503,7 +2582,7 @@ def api_orders_summary():
         ship_act            = _ms_to_date(_cf(CF_SHIP_DATE_ACT))
         delivery_act        = _ms_to_date(_cf(CF_DELIVERY_DATE_ACT))
 
-        # Per-gear phases
+        # Per-gear phases (from gear_tasks ClickUp data) — already warm from the prefetch above
         gear_phases = {}
         for gear, task_id in gear_tasks.items():
             task = first_task if task_id == next(iter(gear_tasks.values())) else _get_clickup_task(task_id)
@@ -2515,6 +2594,14 @@ def api_orders_summary():
                     gear_phases[gear] = None
             else:
                 gear_phases[gear] = None
+
+        # Add gear types from manual_shipments not in gear_tasks — inherit phase from
+        # the primary gear_task (same shipment, same phase).
+        primary_phase = next((v for v in gear_phases.values() if v is not None), None)
+        for m in order.get('manual_shipments', []):
+            gt = m.get('gear_type', '')
+            if gt and gt not in gear_phases:
+                gear_phases[gt] = primary_phase
 
         # Skip if all gears are delivered (phase ≥ 4)
         phases = [p for p in gear_phases.values() if p is not None]
@@ -2607,49 +2694,52 @@ def push_update_phase():
     errors  = []
     updated = 0
     for gear, task_id in gear_tasks.items():
-        r = set_clickup_field(task_id, CF_PHASE, phase)
-        if r.status_code not in (200, 201):
-            errors.append(f"{gear}: {r.status_code}")
-            continue
-        updated += 1
-
-        order_status_val = None
-        if proofs_actual_ms is not None:
-            set_clickup_field(task_id, CF_PROOFS_APPROVED_ACT, proofs_actual_ms)
-            task_data = _get_clickup_task(task_id)
-            if task_data:
-                try:
-                    est_ms = int(_get_task_cf(task_data, CF_PROOFS_APPROVED) or 0) or None
-                except (TypeError, ValueError):
-                    est_ms = None
-                order_status_val = _delivery_order_status(est_ms, proofs_actual_ms)
-                set_clickup_field(task_id, CF_ORDER_STATUS, order_status_val)
-
-        if rcv_orderindex is not None:
-            set_clickup_field(task_id, CF_RECEIVING, rcv_orderindex)
-            if qty_note:
-                requests.post(
-                    f"https://api.clickup.com/api/v2/task/{task_id}/comment",
-                    headers=clickup_headers(), json={"comment_text": f"Qty note: {qty_note}"}, timeout=10,
-                )
-
-        # Update matching subtasks
-        for sub in _get_clickup_subtasks(task_id):
-            if tracking_number and _get_task_cf(sub, CF_TRACKING) != tracking_number:
+        try:
+            r = set_clickup_field(task_id, CF_PHASE, phase)
+            if r.status_code not in (200, 201):
+                errors.append(f"{gear}: {r.status_code}")
                 continue
-            sub_id = sub['id']
-            set_clickup_field(sub_id, CF_PHASE, phase)
+            updated += 1
+
+            order_status_val = None
             if proofs_actual_ms is not None:
-                set_clickup_field(sub_id, CF_PROOFS_APPROVED_ACT, proofs_actual_ms)
-                if order_status_val is not None:
-                    set_clickup_field(sub_id, CF_ORDER_STATUS, order_status_val)
+                set_clickup_field(task_id, CF_PROOFS_APPROVED_ACT, proofs_actual_ms)
+                task_data = _get_clickup_task(task_id)
+                if task_data:
+                    try:
+                        est_ms = int(_get_task_cf(task_data, CF_PROOFS_APPROVED) or 0) or None
+                    except (TypeError, ValueError):
+                        est_ms = None
+                    order_status_val = _delivery_order_status(est_ms, proofs_actual_ms)
+                    set_clickup_field(task_id, CF_ORDER_STATUS, order_status_val)
+
             if rcv_orderindex is not None:
-                set_clickup_field(sub_id, CF_RECEIVING, rcv_orderindex)
+                set_clickup_field(task_id, CF_RECEIVING, rcv_orderindex)
                 if qty_note:
                     requests.post(
-                        f"https://api.clickup.com/api/v2/task/{sub_id}/comment",
-                        headers=clickup_headers(), json={"comment_text": f"Qty note: {qty_note}"}, timeout=10,
+                        f"https://api.clickup.com/api/v2/task/{task_id}/comment",
+                        headers=clickup_headers(), json={"comment_text": f"Qty note: {qty_note}"}, timeout=25,
                     )
+
+            # Update matching subtasks
+            for sub in _get_clickup_subtasks(task_id):
+                if tracking_number and _get_task_cf(sub, CF_TRACKING) != tracking_number:
+                    continue
+                sub_id = sub['id']
+                set_clickup_field(sub_id, CF_PHASE, phase)
+                if proofs_actual_ms is not None:
+                    set_clickup_field(sub_id, CF_PROOFS_APPROVED_ACT, proofs_actual_ms)
+                    if order_status_val is not None:
+                        set_clickup_field(sub_id, CF_ORDER_STATUS, order_status_val)
+                if rcv_orderindex is not None:
+                    set_clickup_field(sub_id, CF_RECEIVING, rcv_orderindex)
+                    if qty_note:
+                        requests.post(
+                            f"https://api.clickup.com/api/v2/task/{sub_id}/comment",
+                            headers=clickup_headers(), json={"comment_text": f"Qty note: {qty_note}"}, timeout=25,
+                        )
+        except requests.exceptions.RequestException:
+            errors.append(f"{gear}: ClickUp was slow responding — verify task {task_id} in ClickUp before retrying.")
 
     if errors:
         return jsonify({'ok': False, 'error': '; '.join(errors), 'updated': updated})
@@ -2718,166 +2808,170 @@ def push_update_ship():
     errors  = []
     updated = 0
     for gear, task_id in gear_tasks.items():
-        r = set_clickup_field(task_id, CF_PHASE, 3)
-        if r.status_code not in (200, 201):
-            errors.append(f"{gear}: {r.status_code}"); continue
+        try:
+            r = set_clickup_field(task_id, CF_PHASE, 3)
+            if r.status_code not in (200, 201):
+                errors.append(f"{gear}: {r.status_code}"); continue
 
-        # Fetch parent BEFORE updating CF_TRACKING so we can detect the old TN for subtask split
-        parent_task     = _get_clickup_task(task_id)
-        old_parent_tn   = (_get_task_cf(parent_task, CF_TRACKING) if parent_task else None) or None
+            # Fetch parent BEFORE updating CF_TRACKING so we can detect the old TN for subtask split
+            parent_task     = _get_clickup_task(task_id)
+            old_parent_tn   = (_get_task_cf(parent_task, CF_TRACKING) if parent_task else None) or None
 
-        set_clickup_field(task_id, CF_TRACKING, tracking_number)
-        if ship_date_ms:
-            set_clickup_field(task_id, CF_SHIP_DATE_ACT, ship_date_ms)
-
-        order_status_val = None
-        if ship_date_ms and parent_task:
-            try:
-                est_ms = int(_get_task_cf(parent_task, CF_SHIP_DATE) or 0) or None
-            except (TypeError, ValueError):
-                est_ms = None
-            order_status_val = _ship_order_status(ship_date_ms, est_ms)
-            set_clickup_field(task_id, CF_ORDER_STATUS, order_status_val)
-
-        requests.post(
-            f"https://api.clickup.com/api/v2/task/{task_id}/comment",
-            headers=clickup_headers(), json={"comment_text": comment_text}, timeout=10,
-        )
-        updated += 1
-
-        subtasks = _get_clickup_subtasks(task_id)
-        matched_sub = False
-        for sub in subtasks:
-            existing_tn = _get_task_cf(sub, CF_TRACKING)
-            if existing_tn and existing_tn != tracking_number:
-                continue
-            sub_id = sub['id']
-            set_clickup_field(sub_id, CF_PHASE, 3)
-            set_clickup_field(sub_id, CF_TRACKING, tracking_number)
+            set_clickup_field(task_id, CF_TRACKING, tracking_number)
             if ship_date_ms:
-                set_clickup_field(sub_id, CF_SHIP_DATE_ACT, ship_date_ms)
-            if order_status_val is not None:
-                set_clickup_field(sub_id, CF_ORDER_STATUS, order_status_val)
+                set_clickup_field(task_id, CF_SHIP_DATE_ACT, ship_date_ms)
+
+            order_status_val = None
+            if ship_date_ms and parent_task:
+                try:
+                    est_ms = int(_get_task_cf(parent_task, CF_SHIP_DATE) or 0) or None
+                except (TypeError, ValueError):
+                    est_ms = None
+                order_status_val = _ship_order_status(ship_date_ms, est_ms)
+                set_clickup_field(task_id, CF_ORDER_STATUS, order_status_val)
+
             requests.post(
-                f"https://api.clickup.com/api/v2/task/{sub_id}/comment",
-                headers=clickup_headers(), json={"comment_text": comment_text}, timeout=10,
+                f"https://api.clickup.com/api/v2/task/{task_id}/comment",
+                headers=clickup_headers(), json={"comment_text": comment_text}, timeout=25,
             )
-            matched_sub = True
+            updated += 1
 
-        # Existing subtasks present but none matched this TN → create a new subtask
-        if subtasks and not matched_sub:
-            letter      = _next_subtask_letter(subtasks)
-            parent_name = (parent_task or {}).get('name', '') or \
-                          f"{order.get('market','')} {order.get('season','')} {order.get('sport','')} {gear} {order.get('num_for_code', order.get('order_num',''))}"
-            parent_code = (_get_task_cf(parent_task, CF_ORDER_TEXT) if parent_task else '') or ''
-            sub_name    = f"{parent_name}{letter}"
-            sub_code    = f"{parent_code}{letter}" if parent_code else ''
+            subtasks = _get_clickup_subtasks(task_id)
+            matched_sub = False
+            for sub in subtasks:
+                existing_tn = _get_task_cf(sub, CF_TRACKING)
+                if existing_tn and existing_tn != tracking_number:
+                    continue
+                sub_id = sub['id']
+                set_clickup_field(sub_id, CF_PHASE, 3)
+                set_clickup_field(sub_id, CF_TRACKING, tracking_number)
+                if ship_date_ms:
+                    set_clickup_field(sub_id, CF_SHIP_DATE_ACT, ship_date_ms)
+                if order_status_val is not None:
+                    set_clickup_field(sub_id, CF_ORDER_STATUS, order_status_val)
+                requests.post(
+                    f"https://api.clickup.com/api/v2/task/{sub_id}/comment",
+                    headers=clickup_headers(), json={"comment_text": comment_text}, timeout=25,
+                )
+                matched_sub = True
 
-            sub_fields_map = {}
-            if parent_task:
-                for cf in parent_task.get('custom_fields', []):
-                    val = cf.get('value')
-                    if val is not None and cf['id'] not in _FORMULA_FIELD_IDS:
-                        sub_fields_map[cf['id']] = val
-            # Subtask-specific overrides
-            sub_fields_map[CF_TRACKING] = tracking_number
-            sub_fields_map[CF_PHASE]    = 3
-            if ship_date_ms:
-                sub_fields_map[CF_SHIP_DATE_ACT] = ship_date_ms
-            if order_status_val is not None:
-                sub_fields_map[CF_ORDER_STATUS] = order_status_val
-            if sub_code:
-                sub_fields_map[CF_ORDER_TEXT] = sub_code
-            sub_fields_map.pop(CF_RECEIVING, None)  # never set receiving on new subtask
+            # Existing subtasks present but none matched this TN → create a new subtask
+            if subtasks and not matched_sub:
+                letter      = _next_subtask_letter(subtasks)
+                parent_name = (parent_task or {}).get('name', '') or \
+                              f"{order.get('market','')} {order.get('season','')} {order.get('sport','')} {gear} {order.get('num_for_code', order.get('order_num',''))}"
+                parent_code = (_get_task_cf(parent_task, CF_ORDER_TEXT) if parent_task else '') or ''
+                sub_name    = f"{parent_name}{letter}"
+                sub_code    = f"{parent_code}{letter}" if parent_code else ''
 
-            desc = f"Gear: {gear}\nTracking: {tracking_number}"
-            if declared_value:
-                desc += f"\nDeclared Value: ${declared_value}"
-            if notes:
-                desc += f"\nNotes: {notes}"
+                sub_fields_map = {}
+                if parent_task:
+                    for cf in parent_task.get('custom_fields', []):
+                        val = cf.get('value')
+                        if val is not None and cf['id'] not in _FORMULA_FIELD_IDS:
+                            sub_fields_map[cf['id']] = val
+                # Subtask-specific overrides
+                sub_fields_map[CF_TRACKING] = tracking_number
+                sub_fields_map[CF_PHASE]    = 3
+                if ship_date_ms:
+                    sub_fields_map[CF_SHIP_DATE_ACT] = ship_date_ms
+                if order_status_val is not None:
+                    sub_fields_map[CF_ORDER_STATUS] = order_status_val
+                if sub_code:
+                    sub_fields_map[CF_ORDER_TEXT] = sub_code
+                sub_fields_map.pop(CF_RECEIVING, None)  # never set receiving on new subtask
 
-            sub_cf_ship = [{'id': fid, 'value': val} for fid, val in sub_fields_map.items()]
-            sresp = create_clickup_task({
-                'name':         sub_name,
-                'parent':       task_id,
-                'description':  desc,
-                'custom_fields': sub_cf_ship,
-            })
-            if sresp.status_code in (200, 201):
-                new_sub_id = sresp.json().get('id', '')
-                if new_sub_id:
-                    for f in sub_cf_ship:
-                        set_clickup_field(new_sub_id, f['id'], f['value'])
-                    requests.post(
-                        f"https://api.clickup.com/api/v2/task/{new_sub_id}/comment",
-                        headers=clickup_headers(), json={"comment_text": comment_text}, timeout=10,
-                    )
-            else:
-                errors.append(f"{gear} new subtask: {sresp.status_code}")
+                desc = f"Gear: {gear}\nTracking: {tracking_number}"
+                if declared_value:
+                    desc += f"\nDeclared Value: ${declared_value}"
+                if notes:
+                    desc += f"\nNotes: {notes}"
 
-        elif not subtasks:
-            # No subtasks yet — if parent had a different TN before this push, split into A + B
-            if old_parent_tn and old_parent_tn != tracking_number:
-                # Build comment for subtask A using the old shipment's stored data
-                old_ms = next((m for m in order.get('manual_shipments', [])
-                               if m.get('tracking_number') == old_parent_tn
-                               and m.get('gear_type') == gear), None)
-                old_comment = f"📦 Shipped\nTracking: {old_parent_tn}"
-                if old_ms:
-                    if old_ms.get('ship_date'):
-                        old_comment += f"\nShip Date: {old_ms['ship_date']}"
-                    if old_ms.get('declared_value'):
-                        old_comment += f"\nDeclared Value: ${old_ms['declared_value']}"
-                    if old_ms.get('notes'):
-                        old_comment += f"\nNotes: {old_ms['notes']}"
+                sub_cf_ship = [{'id': fid, 'value': val} for fid, val in sub_fields_map.items()]
+                sresp = create_clickup_task({
+                    'name':         sub_name,
+                    'parent':       task_id,
+                    'description':  desc,
+                    'custom_fields': sub_cf_ship,
+                })
+                if sresp.status_code in (200, 201):
+                    new_sub_id = sresp.json().get('id', '')
+                    if new_sub_id:
+                        for f in sub_cf_ship:
+                            set_clickup_field(new_sub_id, f['id'], f['value'])
+                        requests.post(
+                            f"https://api.clickup.com/api/v2/task/{new_sub_id}/comment",
+                            headers=clickup_headers(), json={"comment_text": comment_text}, timeout=25,
+                        )
+                else:
+                    errors.append(f"{gear} new subtask: {sresp.status_code}")
 
-                # Create subtask A (old TN, parent's existing ship fields)
-                # then subtask B (new TN, new ship fields)
-                for i, (sub_tn, override_ship_ms, override_status, sub_comment) in enumerate([
-                    (old_parent_tn,      None,         None,              old_comment),
-                    (tracking_number,   ship_date_ms,  order_status_val,  comment_text),
-                ]):
-                    letter      = chr(ord('A') + i)
-                    parent_name = (parent_task or {}).get('name', '') or \
-                                  f"{order.get('market','')} {order.get('season','')} {order.get('sport','')} {gear} {order.get('num_for_code', order.get('order_num',''))}"
-                    parent_code = (_get_task_cf(parent_task, CF_ORDER_TEXT) if parent_task else '') or ''
-                    sub_name    = f"{parent_name}{letter}"
-                    sub_code    = f"{parent_code}{letter}" if parent_code else ''
+            elif not subtasks:
+                # No subtasks yet — if parent had a different TN before this push, split into A + B
+                if old_parent_tn and old_parent_tn != tracking_number:
+                    # Build comment for subtask A using the old shipment's stored data
+                    old_ms = next((m for m in order.get('manual_shipments', [])
+                                   if m.get('tracking_number') == old_parent_tn
+                                   and m.get('gear_type') == gear), None)
+                    old_comment = f"📦 Shipped\nTracking: {old_parent_tn}"
+                    if old_ms:
+                        if old_ms.get('ship_date'):
+                            old_comment += f"\nShip Date: {old_ms['ship_date']}"
+                        if old_ms.get('declared_value'):
+                            old_comment += f"\nDeclared Value: ${old_ms['declared_value']}"
+                        if old_ms.get('notes'):
+                            old_comment += f"\nNotes: {old_ms['notes']}"
 
-                    sfm = {}
-                    if parent_task:
-                        for cf in parent_task.get('custom_fields', []):
-                            val = cf.get('value')
-                            if val is not None and cf['id'] not in _FORMULA_FIELD_IDS:
-                                sfm[cf['id']] = val
-                    sfm[CF_TRACKING] = sub_tn
-                    sfm[CF_PHASE]    = 3
-                    if override_ship_ms:
-                        sfm[CF_SHIP_DATE_ACT] = override_ship_ms
-                    if override_status is not None:
-                        sfm[CF_ORDER_STATUS] = override_status
-                    if sub_code:
-                        sfm[CF_ORDER_TEXT] = sub_code
-                    sfm.pop(CF_RECEIVING, None)
+                    # Create subtask A (old TN, parent's existing ship fields)
+                    # then subtask B (new TN, new ship fields)
+                    for i, (sub_tn, override_ship_ms, override_status, sub_comment) in enumerate([
+                        (old_parent_tn,      None,         None,              old_comment),
+                        (tracking_number,   ship_date_ms,  order_status_val,  comment_text),
+                    ]):
+                        letter      = chr(ord('A') + i)
+                        parent_name = (parent_task or {}).get('name', '') or \
+                                      f"{order.get('market','')} {order.get('season','')} {order.get('sport','')} {gear} {order.get('num_for_code', order.get('order_num',''))}"
+                        parent_code = (_get_task_cf(parent_task, CF_ORDER_TEXT) if parent_task else '') or ''
+                        sub_name    = f"{parent_name}{letter}"
+                        sub_code    = f"{parent_code}{letter}" if parent_code else ''
 
-                    sfm_list = [{'id': fid, 'value': val} for fid, val in sfm.items()]
-                    sresp = create_clickup_task({
-                        'name':          sub_name,
-                        'parent':        task_id,
-                        'description':   f"Gear: {gear}\nTracking: {sub_tn}",
-                        'custom_fields': sfm_list,
-                    })
-                    if sresp.status_code in (200, 201):
-                        new_sub_id = sresp.json().get('id', '')
-                        if new_sub_id:
-                            for f in sfm_list:
-                                set_clickup_field(new_sub_id, f['id'], f['value'])
-                            requests.post(
-                                f"https://api.clickup.com/api/v2/task/{new_sub_id}/comment",
-                                headers=clickup_headers(), json={"comment_text": sub_comment}, timeout=10,
-                            )
-                    else:
-                        errors.append(f"{gear} subtask {letter}: {sresp.status_code}")
+                        sfm = {}
+                        if parent_task:
+                            for cf in parent_task.get('custom_fields', []):
+                                val = cf.get('value')
+                                if val is not None and cf['id'] not in _FORMULA_FIELD_IDS:
+                                    sfm[cf['id']] = val
+                        sfm[CF_TRACKING] = sub_tn
+                        sfm[CF_PHASE]    = 3
+                        if override_ship_ms:
+                            sfm[CF_SHIP_DATE_ACT] = override_ship_ms
+                        if override_status is not None:
+                            sfm[CF_ORDER_STATUS] = override_status
+                        if sub_code:
+                            sfm[CF_ORDER_TEXT] = sub_code
+                        sfm.pop(CF_RECEIVING, None)
+
+                        sfm_list = [{'id': fid, 'value': val} for fid, val in sfm.items()]
+                        sresp = create_clickup_task({
+                            'name':          sub_name,
+                            'parent':        task_id,
+                            'description':   f"Gear: {gear}\nTracking: {sub_tn}",
+                            'custom_fields': sfm_list,
+                        })
+                        if sresp.status_code in (200, 201):
+                            new_sub_id = sresp.json().get('id', '')
+                            if new_sub_id:
+                                for f in sfm_list:
+                                    set_clickup_field(new_sub_id, f['id'], f['value'])
+                                requests.post(
+                                    f"https://api.clickup.com/api/v2/task/{new_sub_id}/comment",
+                                    headers=clickup_headers(), json={"comment_text": sub_comment}, timeout=25,
+                                )
+                        else:
+                            errors.append(f"{gear} subtask {letter}: {sresp.status_code}")
+
+        except requests.exceptions.RequestException:
+            errors.append(f"{gear}: ClickUp was slow responding -- verify task {task_id} in ClickUp before retrying.")
 
     if not errors:
         # Save to order registry so shipment appears in the shipments view
@@ -2904,6 +2998,7 @@ def push_update_ship():
         if not order.get('shipped_at'):
             order['shipped_at'] = datetime.now().isoformat()
         upsert_order(order)
+        _auto_generate_packing_list(order['id'])
 
     if errors:
         return jsonify({'ok': False, 'error': '; '.join(errors), 'updated': updated})
@@ -3224,7 +3319,7 @@ def push_clickup():
     order_date_ms    = to_ms(order_date)
     actual_ship_ms   = to_ms(ship_date)
 
-    saved_order = find_order(market, order_num)
+    saved_order = find_order(market, order_num, sport, season)
     if saved_order is None:
         # Fallback: find order by matching any TN from packing list rows to manual_shipments.
         # Packing list market names (e.g. "SOCCER") may differ from the stored order market ("Houston").
@@ -3272,6 +3367,7 @@ def push_clickup():
 
     results           = []
     errors            = []
+    warnings          = []
     parent_task_ids   = {}   # gear_type → clickup task id
     gear_task_names   = {}   # gear_type → task name string
     gear_order_codes  = {}   # gear_type → order code string
@@ -3281,74 +3377,86 @@ def push_clickup():
 
     # ── PASS 1: create / update one parent task per gear type ────────────────
     for gear_type, boxes in sorted(by_gear.items()):
-        gear_trackings = list({b['tracking_number'] for b in boxes if b['tracking_number']})
-        tracking_str   = ', '.join(gear_trackings)
-        has_tracking   = bool(gear_trackings)
-        owned_tns      = [tn for tn in gear_trackings if t2primary.get(tn) == gear_type]
+        try:
+            gear_trackings = list({b['tracking_number'] for b in boxes if b['tracking_number']})
+            tracking_str   = ', '.join(gear_trackings)
+            has_tracking   = bool(gear_trackings)
+            owned_tns      = [tn for tn in gear_trackings if t2primary.get(tn) == gear_type]
 
-        task_name  = build_task_name(market, season, sport, gear_type, num_for_code)
-        order_code = build_order_code(market, sport, gear_type, order_date, num_for_code)
-        gear_task_names[gear_type]  = task_name
-        gear_order_codes[gear_type] = order_code
+            task_name  = build_task_name(market, season, sport, gear_type, num_for_code)
+            order_code = build_order_code(market, sport, gear_type, order_date, num_for_code)
+            gear_task_names[gear_type]  = task_name
+            gear_order_codes[gear_type] = order_code
 
-        estimated_ship_ms = _get_estimated_ship_ms(gear_type, order_date)
-        order_status      = _ship_order_status(
-            actual_ship_ms if has_tracking else None, estimated_ship_ms)
-        gear_order_status[gear_type] = order_status
+            estimated_ship_ms = _get_estimated_ship_ms(gear_type, order_date)
+            order_status      = _ship_order_status(
+                actual_ship_ms if has_tracking else None, estimated_ship_ms)
+            gear_order_status[gear_type] = order_status
 
-        existing_task_id = saved_gear_tasks.get(gear_type)
+            existing_task_id = saved_gear_tasks.get(gear_type)
+            if existing_task_id and _clickup_task_confirmed_deleted(existing_task_id):
+                # Registry points at a task ClickUp no longer has (deleted directly
+                # in ClickUp) — don't silently no-op updates against nothing.
+                warnings.append(
+                    f"{gear_type}: task {existing_task_id} no longer exists in "
+                    f"ClickUp (deleted) — recreating it."
+                )
+                existing_task_id = None
 
-        if existing_task_id:
-            # Capture state BEFORE any writes so Pass 2 can detect TN changes
-            _par = _get_clickup_task(existing_task_id)
-            _old_tn_raw = (_get_task_cf(_par, CF_TRACKING) if _par else '') or ''
-            old_parent_tns[gear_type]    = _old_tn_raw.split(',')[0].strip()
-            parent_subs_before[gear_type] = _get_clickup_subtasks(existing_task_id)
+            if existing_task_id:
+                # Capture state BEFORE any writes so Pass 2 can detect TN changes
+                _par = _get_clickup_task(existing_task_id)
+                _old_tn_raw = (_get_task_cf(_par, CF_TRACKING) if _par else '') or ''
+                old_parent_tns[gear_type]    = _old_tn_raw.split(',')[0].strip()
+                parent_subs_before[gear_type] = _get_clickup_subtasks(existing_task_id)
 
-            set_clickup_field(existing_task_id, CF_ORDER_STATUS,  order_status)
-            set_clickup_field(existing_task_id, CF_TRACKING,      tracking_str)
-            gear_ship_ms = _gear_ship_ms(owned_tns or gear_trackings, tn_ship_date, actual_ship_ms)
-            if has_tracking and gear_ship_ms:
-                set_clickup_field(existing_task_id, CF_SHIP_DATE_ACT, gear_ship_ms)
-                set_clickup_field(existing_task_id, CF_PHASE,         3)
-            parent_task_ids[gear_type] = existing_task_id
-            results.append({'gear': gear_type, 'task_id': existing_task_id,
-                            'subtasks': [], 'action': 'updated'})
-        else:
-            desc_lines = [f"Total Boxes: {len(boxes)}"]
-            if order_sheet:
-                desc_lines.append(f"Order Sheet: {order_sheet}")
+                set_clickup_field(existing_task_id, CF_ORDER_STATUS,  order_status)
+                set_clickup_field(existing_task_id, CF_TRACKING,      tracking_str)
+                gear_ship_ms = _gear_ship_ms(owned_tns or gear_trackings, tn_ship_date, actual_ship_ms)
+                if has_tracking and gear_ship_ms:
+                    set_clickup_field(existing_task_id, CF_SHIP_DATE_ACT, gear_ship_ms)
+                    set_clickup_field(existing_task_id, CF_PHASE,         3)
+                parent_task_ids[gear_type] = existing_task_id
+                results.append({'gear': gear_type, 'task_id': existing_task_id,
+                                'subtasks': [], 'action': 'updated'})
+            else:
+                desc_lines = [f"Total Boxes: {len(boxes)}"]
+                if order_sheet:
+                    desc_lines.append(f"Order Sheet: {order_sheet}")
 
-            custom_fields = [
-                {'id': CF_ORDER_STATUS, 'value': order_status},
-                {'id': CF_ORDER_TEXT,   'value': order_code},
-                {'id': CF_TRACKING,     'value': tracking_str},
-            ]
-            if order_date_ms:
-                custom_fields.append({'id': CF_ORDER_DATE, 'value': order_date_ms})
-            gear_ship_ms = _gear_ship_ms(owned_tns or gear_trackings, tn_ship_date, actual_ship_ms)
-            if has_tracking and gear_ship_ms:
-                custom_fields.append({'id': CF_SHIP_DATE_ACT, 'value': gear_ship_ms})
-                custom_fields.append({'id': CF_PHASE,         'value': 3})
-            custom_fields.extend(calc_gear_dates(gear_type, order_date))
+                custom_fields = [
+                    {'id': CF_ORDER_STATUS, 'value': order_status},
+                    {'id': CF_ORDER_TEXT,   'value': order_code},
+                    {'id': CF_TRACKING,     'value': tracking_str},
+                ]
+                if order_date_ms:
+                    custom_fields.append({'id': CF_ORDER_DATE, 'value': order_date_ms})
+                gear_ship_ms = _gear_ship_ms(owned_tns or gear_trackings, tn_ship_date, actual_ship_ms)
+                if has_tracking and gear_ship_ms:
+                    custom_fields.append({'id': CF_SHIP_DATE_ACT, 'value': gear_ship_ms})
+                    custom_fields.append({'id': CF_PHASE,         'value': 3})
+                custom_fields.extend(calc_gear_dates(gear_type, order_date))
 
-            resp = create_clickup_task({
-                'name': task_name,
-                'description': '\n'.join(desc_lines),
-                'status': 'to do',
-                'custom_fields': custom_fields,
-            })
-            if resp.status_code not in (200, 201):
-                errors.append(f"{gear_type}: {resp.status_code} {resp.text[:120]}")
-                continue
+                resp = create_clickup_task({
+                    'name': task_name,
+                    'description': '\n'.join(desc_lines),
+                    'status': 'to do',
+                    'custom_fields': custom_fields,
+                })
+                if resp.status_code not in (200, 201):
+                    errors.append(f"{gear_type}: {resp.status_code} {resp.text[:120]}")
+                    continue
 
-            task_id = resp.json().get('id')
-            for f in custom_fields:
-                set_clickup_field(task_id, f['id'], f['value'])
-            parent_task_ids[gear_type] = task_id
-            new_gear_tasks[gear_type]  = task_id
-            results.append({'gear': gear_type, 'task_id': task_id,
-                            'subtasks': [], 'action': 'created'})
+                task_id = resp.json().get('id')
+                for f in custom_fields:
+                    set_clickup_field(task_id, f['id'], f['value'])
+                parent_task_ids[gear_type] = task_id
+                new_gear_tasks[gear_type]  = task_id
+                results.append({'gear': gear_type, 'task_id': task_id,
+                                'subtasks': [], 'action': 'created'})
+
+        except requests.exceptions.RequestException:
+            errors.append(f"{gear_type}: ClickUp was slow responding -- some fields may not have applied; verify in ClickUp before retrying.")
 
     # ── PASS 2: subtasks — same split logic as manual tracking entry ──────────
     _FORMULA_FIELD_IDS = {
@@ -3394,65 +3502,69 @@ def push_clickup():
         parent_task_data = _get_clickup_task(parent_id)
 
         for i, sub_tn in enumerate(tns_to_create):
-            if letter_base is not None:
-                letter = chr(ord('A') + letter_base + i)
-            else:
-                letter = _next_subtask_letter(existing_subs)
+            try:
+                if letter_base is not None:
+                    letter = chr(ord('A') + letter_base + i)
+                else:
+                    letter = _next_subtask_letter(existing_subs)
 
-            shipment_rows = t2rows.get(sub_tn, [])
-            gear_types_in = sorted({r['gear_type'] for r in shipment_rows}) if shipment_rows else [gear_type]
-            contents_desc = ', '.join(gear_types_in)
-            weights       = [r['weight'] for r in shipment_rows if r.get('weight')]
-            values        = [r['declared_value'] for r in shipment_rows if r.get('declared_value')]
-            carrier       = shipment_rows[0].get('carrier', 'fedex').upper() if shipment_rows else 'FEDEX'
+                shipment_rows = t2rows.get(sub_tn, [])
+                gear_types_in = sorted({r['gear_type'] for r in shipment_rows}) if shipment_rows else [gear_type]
+                contents_desc = ', '.join(gear_types_in)
+                weights       = [r['weight'] for r in shipment_rows if r.get('weight')]
+                values        = [r['declared_value'] for r in shipment_rows if r.get('declared_value')]
+                carrier       = shipment_rows[0].get('carrier', 'fedex').upper() if shipment_rows else 'FEDEX'
 
-            base_name = gear_task_names.get(gear_type, f"{market} {season} {sport} {gear_type} {num_for_code}")
-            base_code = gear_order_codes.get(gear_type, num_for_code)
-            sub_name  = f"{base_name}{letter}"
-            sub_code  = f"{base_code}{letter}"
+                base_name = gear_task_names.get(gear_type, f"{market} {season} {sport} {gear_type} {num_for_code}")
+                base_code = gear_order_codes.get(gear_type, num_for_code)
+                sub_name  = f"{base_name}{letter}"
+                sub_code  = f"{base_code}{letter}"
 
-            sub_fields_map = {}
-            if parent_task_data:
-                for cf in parent_task_data.get('custom_fields', []):
-                    val = cf.get('value')
-                    if val is not None and cf['id'] not in _FORMULA_FIELD_IDS:
-                        sub_fields_map[cf['id']] = val
+                sub_fields_map = {}
+                if parent_task_data:
+                    for cf in parent_task_data.get('custom_fields', []):
+                        val = cf.get('value')
+                        if val is not None and cf['id'] not in _FORMULA_FIELD_IDS:
+                            sub_fields_map[cf['id']] = val
 
-            sub_fields_map[CF_TRACKING]   = sub_tn
-            sub_fields_map[CF_ORDER_TEXT] = sub_code
-            sub_ship_ms = tn_ship_date.get(sub_tn) or actual_ship_ms
-            if shipment_rows and sub_ship_ms:
-                sub_fields_map[CF_SHIP_DATE_ACT] = sub_ship_ms
-            os_val = gear_order_status.get(gear_type)
-            if os_val is not None:
-                sub_fields_map[CF_ORDER_STATUS] = os_val
-            if sub_ship_ms:
-                sub_fields_map[CF_PHASE] = 3
+                sub_fields_map[CF_TRACKING]   = sub_tn
+                sub_fields_map[CF_ORDER_TEXT] = sub_code
+                sub_ship_ms = tn_ship_date.get(sub_tn) or actual_ship_ms
+                if shipment_rows and sub_ship_ms:
+                    sub_fields_map[CF_SHIP_DATE_ACT] = sub_ship_ms
+                os_val = gear_order_status.get(gear_type)
+                if os_val is not None:
+                    sub_fields_map[CF_ORDER_STATUS] = os_val
+                if sub_ship_ms:
+                    sub_fields_map[CF_PHASE] = 3
 
-            sub_cf_list = [{'id': fid, 'value': val} for fid, val in sub_fields_map.items()]
-            sresp = create_clickup_task({
-                'name':   sub_name,
-                'parent': parent_id,
-                'description': (
-                    f"Gear: {contents_desc}\n"
-                    f"Weight: {'; '.join(weights)}\n"
-                    f"Declared Value: {'; '.join(values)}\n"
-                    f"Carrier: {carrier}"
-                ),
-                'custom_fields': sub_cf_list,
-            })
-            if sresp.status_code in (200, 201):
-                sub_id = sresp.json().get('id')
-                for f in sub_cf_list:
-                    set_clickup_field(sub_id, f['id'], f['value'])
-                for r in results:
-                    if r['gear'] == gear_type:
-                        r['subtasks'].append(sub_id)
-                        break
-                if letter_base is None:
-                    existing_subs.append({'name': f'{base_name}{letter}'})
-            else:
-                errors.append(f"  Shipment {order_num}{letter}: {sresp.status_code}")
+                sub_cf_list = [{'id': fid, 'value': val} for fid, val in sub_fields_map.items()]
+                sresp = create_clickup_task({
+                    'name':   sub_name,
+                    'parent': parent_id,
+                    'description': (
+                        f"Gear: {contents_desc}\n"
+                        f"Weight: {'; '.join(weights)}\n"
+                        f"Declared Value: {'; '.join(values)}\n"
+                        f"Carrier: {carrier}"
+                    ),
+                    'custom_fields': sub_cf_list,
+                })
+                if sresp.status_code in (200, 201):
+                    sub_id = sresp.json().get('id')
+                    for f in sub_cf_list:
+                        set_clickup_field(sub_id, f['id'], f['value'])
+                    for r in results:
+                        if r['gear'] == gear_type:
+                            r['subtasks'].append(sub_id)
+                            break
+                    if letter_base is None:
+                        existing_subs.append({'name': f'{base_name}{letter}'})
+                else:
+                    errors.append(f"  Shipment {order_num}{letter}: {sresp.status_code}")
+
+            except requests.exceptions.RequestException:
+                errors.append(f"  Shipment {order_num}: ClickUp was slow responding creating subtask for {sub_tn} -- verify in ClickUp before retrying.")
 
     # ── PASS 3: push sub-orders (Freshman, Remake, …) ───────────────────────
     # Rows whose market is not a known MARKET_CODES key (and not the parent market
@@ -3468,7 +3580,7 @@ def push_clickup():
             sub_label_rows[r['market'].strip()].append(r)
 
     for label, sub_rows in sub_label_rows.items():
-        sub_saved = find_order(market, label)
+        sub_saved = find_order(market, label, sport, season)
         if not sub_saved or not sub_saved.get('gear_tasks'):
             continue
 
@@ -3477,20 +3589,30 @@ def push_clickup():
             sub_by_gear[r['gear_type']].append(r)
 
         for gear_type, boxes in sub_by_gear.items():
-            task_id = sub_saved['gear_tasks'].get(gear_type)
-            if not task_id:
-                continue
-            gear_trackings = list({b['tracking_number'] for b in boxes if b['tracking_number']})
-            if not gear_trackings:
-                continue
-            tracking_str = ', '.join(gear_trackings)
-            gear_ship_ms = _gear_ship_ms(gear_trackings, tn_ship_date, actual_ship_ms)
-            set_clickup_field(task_id, CF_TRACKING, tracking_str)
-            if gear_ship_ms:
-                set_clickup_field(task_id, CF_SHIP_DATE_ACT, gear_ship_ms)
-                set_clickup_field(task_id, CF_PHASE, 3)
-            results.append({'gear': f'{label} {gear_type}', 'task_id': task_id,
-                            'subtasks': [], 'action': 'updated'})
+            try:
+                task_id = sub_saved['gear_tasks'].get(gear_type)
+                if not task_id:
+                    continue
+                gear_trackings = list({b['tracking_number'] for b in boxes if b['tracking_number']})
+                if not gear_trackings:
+                    continue
+                tracking_str = ', '.join(gear_trackings)
+                gear_ship_ms = _gear_ship_ms(gear_trackings, tn_ship_date, actual_ship_ms)
+                r = set_clickup_field(task_id, CF_TRACKING, tracking_str)
+                if r.status_code == 404:
+                    # Task deleted directly in ClickUp — no sensible way to recreate
+                    # a sub-order task from this loop's context, so surface it loudly
+                    # instead of silently reporting "updated".
+                    errors.append(f"{label} {gear_type}: task {task_id} no longer exists in ClickUp (deleted).")
+                    continue
+                if gear_ship_ms:
+                    set_clickup_field(task_id, CF_SHIP_DATE_ACT, gear_ship_ms)
+                    set_clickup_field(task_id, CF_PHASE, 3)
+                results.append({'gear': f'{label} {gear_type}', 'task_id': task_id,
+                                'subtasks': [], 'action': 'updated'})
+
+            except requests.exceptions.RequestException:
+                errors.append(f"{label} {gear_type}: ClickUp was slow responding -- verify task {task_id} in ClickUp before retrying.")
 
     # ── Persist to registry ───────────────────────────────────────────────────
     order_record = {
@@ -3518,6 +3640,7 @@ def push_clickup():
     if created:   parts.append(f"Created {len(created)} task(s)")
     sub_count = sum(len(r['subtasks']) for r in results)
     if sub_count: parts.append(f"{sub_count} shipment subtask(s) added")
+    if warnings:  parts.append(f"⚠ {'; '.join(warnings)}")
     if errors:    parts.append(f"Errors: {'; '.join(errors)}")
 
     return jsonify({'ok': ok, 'message': '. '.join(parts) or 'Done.', 'results': results})
@@ -3552,11 +3675,12 @@ def push_clickup_order_only():
     _m = re.search(r'(\d+)$', order_num.strip())
     num_for_code = order_num.strip() if order_num.strip().isdigit() else (_m.group(1) if _m else '1')
 
-    saved_order = find_order(market, order_num, sport)
+    saved_order = find_order(market, order_num, sport, season)
     saved_gear_tasks = saved_order.get('gear_tasks', {}) if saved_order else {}
 
-    results = []
-    errors  = []
+    results  = []
+    errors   = []
+    warnings = []
 
     for gear_type in gear_types:
         task_name   = build_task_name(market, season, sport, gear_type, num_for_code)
@@ -3565,26 +3689,44 @@ def push_clickup_order_only():
 
         existing_task_id = saved_gear_tasks.get(gear_type)
 
+        if existing_task_id and _clickup_task_confirmed_deleted(existing_task_id):
+            # Registry points at a task ClickUp no longer has (deleted directly in
+            # ClickUp) — don't silently no-op a field update against nothing.
+            # Fall through to recreate it instead.
+            warnings.append(
+                f"{gear_type}: task {existing_task_id} no longer exists in ClickUp "
+                f"(deleted) — recreating it."
+            )
+            existing_task_id = None
+
         if existing_task_id:
             # ── UPDATE existing task ──────────────────────────────────────────
-            fields_to_set = [
-                {'id': CF_ORDER_STATUS, 'value': 1},
-            ]
-            if order_date_ms:
-                fields_to_set.append({'id': CF_ORDER_DATE, 'value': order_date_ms})
-            if eta_zees_ms:
-                fields_to_set.append({'id': CF_ETA_ZEES, 'value': eta_zees_ms})
-            if order_sheet:
-                # update description
-                requests.put(
-                    f"https://api.clickup.com/api/v2/task/{existing_task_id}",
-                    headers=clickup_headers(),
-                    json={'description': f"Order Sheet: {order_sheet}"},
-                    timeout=10,
+            # The task already exists, so even if a call below times out we still
+            # know the task_id — just flag that some fields may not have applied.
+            try:
+                fields_to_set = [
+                    {'id': CF_ORDER_STATUS, 'value': 1},
+                ]
+                if order_date_ms:
+                    fields_to_set.append({'id': CF_ORDER_DATE, 'value': order_date_ms})
+                if eta_zees_ms:
+                    fields_to_set.append({'id': CF_ETA_ZEES, 'value': eta_zees_ms})
+                if order_sheet:
+                    # update description
+                    requests.put(
+                        f"https://api.clickup.com/api/v2/task/{existing_task_id}",
+                        headers=clickup_headers(),
+                        json={'description': f"Order Sheet: {order_sheet}"},
+                        timeout=25,
+                    )
+                fields_to_set.extend(date_fields)
+                for f in fields_to_set:
+                    set_clickup_field(existing_task_id, f['id'], f['value'])
+            except requests.exceptions.RequestException:
+                warnings.append(
+                    f"{gear_type}: ClickUp was slow responding — please verify task "
+                    f"{existing_task_id} in ClickUp before retrying."
                 )
-            fields_to_set.extend(date_fields)
-            for f in fields_to_set:
-                set_clickup_field(existing_task_id, f['id'], f['value'])
             results.append({'gear': gear_type, 'task_id': existing_task_id, 'action': 'updated'})
 
         else:
@@ -3604,12 +3746,22 @@ def push_clickup_order_only():
                 custom_fields.append({'id': CF_ETA_ZEES, 'value': eta_zees_ms})
             custom_fields.extend(date_fields)
 
-            resp = create_clickup_task({
-                'name': task_name,
-                'description': '\n'.join(desc_lines),
-                'status': 'to do',
-                'custom_fields': custom_fields,
-            })
+            try:
+                resp = create_clickup_task({
+                    'name': task_name,
+                    'description': '\n'.join(desc_lines),
+                    'status': 'to do',
+                    'custom_fields': custom_fields,
+                })
+            except requests.exceptions.RequestException:
+                # We genuinely don't know if ClickUp created the task before timing
+                # out — don't retry silently (would risk a duplicate). Surface it.
+                errors.append(
+                    f"{gear_type}: ClickUp timed out responding — check ClickUp manually "
+                    f"for a possible duplicate '{task_name}' task before retrying."
+                )
+                continue
+
             if resp.status_code in (200, 201):
                 new_id = resp.json().get('id')
                 results.append({'gear': gear_type, 'task_id': new_id, 'action': 'created'})
@@ -3617,12 +3769,26 @@ def push_clickup_order_only():
                 # that ClickUp can't validate at creation time (date fields, dropdowns, etc.)
                 all_create_fields = custom_fields[:]  # includes dates + phase + order_status etc.
                 for f in all_create_fields:
-                    set_clickup_field(new_id, f['id'], f['value'])
+                    try:
+                        set_clickup_field(new_id, f['id'], f['value'])
+                    except requests.exceptions.RequestException:
+                        warnings.append(
+                            f"{gear_type}: created, but ClickUp was slow setting some "
+                            f"fields — please verify task {new_id} in ClickUp."
+                        )
             else:
                 errors.append(f"{gear_type}: {resp.status_code} {resp.text[:100]}")
 
+    # Re-check for an existing order right before persisting. Creating the ClickUp
+    # tasks above can take several seconds; if the background sync (_sync_clickup_tasks,
+    # every 30 min) discovers one of the tasks we just created before we've saved our
+    # own registry entry, it creates a stub order for it. Without this re-check we'd
+    # create a second, duplicate order record instead of merging into that stub.
+    if not saved_order:
+        saved_order = find_order(market, order_num, sport, season)
+
     # Persist task IDs to local registry
-    all_gear_tasks = dict(saved_gear_tasks)
+    all_gear_tasks = dict(saved_order.get('gear_tasks', {})) if saved_order else {}
     all_gear_tasks.update({r['gear']: r['task_id'] for r in results})
     if saved_order:
         saved_order.update({
@@ -3648,9 +3814,10 @@ def push_clickup_order_only():
     updated = [r for r in results if r.get('action') == 'updated']
     ok  = len(errors) == 0
     parts = []
-    if created: parts.append(f"Created {len(created)} task(s)")
-    if updated: parts.append(f"Updated {len(updated)} existing task(s)")
-    if errors:  parts.append(f"Errors: {'; '.join(errors)}")
+    if created:  parts.append(f"Created {len(created)} task(s)")
+    if updated:  parts.append(f"Updated {len(updated)} existing task(s)")
+    if warnings: parts.append(f"⚠ {'; '.join(warnings)}")
+    if errors:   parts.append(f"Errors: {'; '.join(errors)}")
 
     return jsonify({'ok': ok, 'message': '. '.join(parts) or 'Done.'})
 
@@ -3664,9 +3831,10 @@ def _build_aftership_items(rows: list, meta: dict) -> list:
     market     = sample['market']
     order_num  = sample['order_num']
     sport      = meta.get('sport', 'BSBL')
+    season     = meta.get('season', '') or 'Summer'
     order_date = meta.get('order_date', '')
 
-    _so = find_order(market, order_num, sport)
+    _so = find_order(market, order_num, sport, season)
     _nfc = _so.get('num_for_code', '') if _so else ''
     if not _nfc:
         _m2 = re.search(r'(\d+)$', order_num.strip())
@@ -3820,9 +3988,13 @@ def aftership_csv():
         # User uploads one TN to AfterShip; custom fields must reflect everything in that shipment.
         all_entries = []
         order_labels = []
+        def _tn_in_shipment(shipment, needle):
+            raw = shipment.get('tracking_number', '').strip()
+            return needle in [t.strip() for t in raw.split(',') if t.strip()]
+
         for order in orders_all:
             entries = [x for x in order.get('manual_shipments', [])
-                       if x.get('tracking_number', '').strip() == tn]
+                       if _tn_in_shipment(x, tn)]
             if not entries:
                 continue
             all_entries.extend(entries)
@@ -3842,7 +4014,7 @@ def aftership_csv():
         first_sport     = first_order.get('sport', 'BSBL')
         first_order_num = first_order.get('num_for_code', first_order.get('order_num', ''))
         first_entries   = [x for x in first_order.get('manual_shipments', [])
-                           if x.get('tracking_number', '').strip() == tn]
+                           if _tn_in_shipment(x, tn)]
         first_gear      = first_entries[0].get('gear_type', '') if first_entries else ''
         order_code      = build_order_code(market, first_sport, first_gear, order_date, first_order_num)
         first_task_id   = first_order.get('gear_tasks', {}).get(first_gear)
@@ -4003,9 +4175,13 @@ def _collect_shipments(order: dict) -> list:
     # Merge manual shipments (entered via update panel).
     # When packing_list already covers a TN, skip box_count (avoid double-counting);
     # still merge notes, ship_date, and carrier for display.
+
     for m in order.get('manual_shipments', []):
         tn = m.get('tracking_number', '').strip()
         if not tn:
+            continue
+        # Never process combined/multiple tracking numbers (e.g. "123, 456")
+        if ',' in tn:
             continue
         has_pl = tn in tn_boxes  # True only if packing_list covers this TN
         if tn not in tn_info:
@@ -4617,7 +4793,7 @@ def _qty_from_packing_contents(gear_type: str, pl_rows: list) -> int:
     return total
 
 
-def _ordered_gear_types(sheet_url: str) -> dict | None:
+def _ordered_gear_types(sheet_url: str, force: bool = False) -> dict | None:
     """Return {gear_type: qty} for confirmed gear orders on the sheet, or None on error.
 
     A gear type is 'confirmed' when:
@@ -4633,7 +4809,7 @@ def _ordered_gear_types(sheet_url: str) -> dict | None:
     sheet_id = m.group(1)
 
     cached = _sheet_cache.get(sheet_id)
-    if cached and (time.time() - cached['ts']) < _SHEET_CACHE_TTL:
+    if not force and cached and (time.time() - cached['ts']) < _SHEET_CACHE_TTL:
         return cached['gear_types'] or None
 
     gkey = os.getenv('GOOGLE_API_KEY', '')
@@ -4649,6 +4825,9 @@ def _ordered_gear_types(sheet_url: str) -> dict | None:
         meta.raise_for_status()
         tabs = meta.json().get('sheets', [])
     except Exception:
+        # Sheets API slow/unreachable — serve stale cache rather than fail outright
+        if cached:
+            return cached['gear_types'] or None
         return None
 
     home_gid   = None
@@ -4739,23 +4918,25 @@ def _ordered_gear_types(sheet_url: str) -> dict | None:
 
 
 _cu_task_cache: dict = {}
-_CU_TASK_TTL = 1800  # 30 minutes
+_CU_TASK_TTL = 300  # 5 minutes
 
 _ERROR_KW       = ('remake', 'redo', 're-order', 'reorder', 'replacement')
 _CU_AUTO_PREFIXES = ('📦 Shipped', '📬', 'Tracking:', 'Shipped\n', '✅')
 
 
-def _get_task_error_info(task_id: str) -> dict | None:
-    """Return {'is_error': bool, 'reason': str|None} for a ClickUp task.
+def _get_task_error_info(task_id: str, force: bool = False) -> dict | None:
+    """Return {'is_error': bool, 'reason': str|None, 'comment_qty': int|None} for a ClickUp task.
 
-    'is_error' is True only when the task name contains a remake/redo keyword.
+    'is_error' is True when the task name contains a remake/redo keyword OR when the
+    CF_RECEIVING custom field is set to a non-accurate condition (0=Incorrect, 1=Missing,
+    2=Off Colors).  Index 3 (Accurate) and blank are not errors.
     'reason' is the first non-shipping comment text (first line only).
     Returns None on fetch error.
     """
     if not task_id:
         return None
     cached = _cu_task_cache.get(task_id)
-    if cached is not None and (time.time() - cached['ts']) < _CU_TASK_TTL:
+    if not force and cached is not None and (time.time() - cached['ts']) < _CU_TASK_TTL:
         return cached.get('info')
 
     cu_token = os.getenv('CLICKUP_TOKEN', '')
@@ -4766,15 +4947,35 @@ def _get_task_error_info(task_id: str) -> dict | None:
         task_resp = requests.get(
             f'https://api.clickup.com/api/v2/task/{task_id}',
             headers={'Authorization': cu_token},
-            timeout=10,
+            timeout=6,
         )
         task_resp.raise_for_status()
-        name = task_resp.json().get('name', '')
+        task_json = task_resp.json()
+        name = task_json.get('name', '')
     except Exception:
-        _cu_task_cache[task_id] = {'ts': time.time(), 'info': None}
+        # ClickUp slow/unreachable — serve stale cache rather than clobber it with None
+        if cached is not None:
+            return cached.get('info')
+        # No prior cache — cache the miss too (short-lived) so repeated lookups of
+        # this same task later in the same request don't retry and stack up timeouts
+        _cu_task_cache[task_id] = {'ts': time.time() - _CU_TASK_TTL + 20, 'info': None}
         return None
 
-    is_error = any(kw in name.lower() for kw in _ERROR_KW)
+    is_error_by_name = any(kw in name.lower() for kw in _ERROR_KW)
+
+    # Also flag as error if CF_RECEIVING is set to a non-accurate condition
+    rcv_idx = None
+    for cf in (task_json.get('custom_fields') or []):
+        if cf.get('id') == CF_RECEIVING:
+            v = cf.get('value')
+            if v is not None:
+                try:
+                    rcv_idx = int(v) if not isinstance(v, dict) else int(v.get('orderindex', 3))
+                except (TypeError, ValueError):
+                    pass
+            break
+
+    is_error = is_error_by_name or (rcv_idx is not None and rcv_idx != 3)
 
     reason      = None
     comment_qty = None
@@ -4782,7 +4983,7 @@ def _get_task_error_info(task_id: str) -> dict | None:
         comm_resp = requests.get(
             f'https://api.clickup.com/api/v2/task/{task_id}/comment',
             headers={'Authorization': cu_token},
-            timeout=10,
+            timeout=6,
         )
         comm_resp.raise_for_status()
         for comment in comm_resp.json().get('comments', []):
@@ -4808,6 +5009,11 @@ def _get_task_error_info(task_id: str) -> dict | None:
     except Exception:
         pass
 
+    # Fall back to CF_RECEIVING label when no comment reason found
+    if is_error and reason is None and rcv_idx is not None and rcv_idx != 3:
+        _RCV_LABELS = {0: 'Incorrect', 1: 'Missing', 2: 'Off Colors'}
+        reason = _RCV_LABELS.get(rcv_idx)
+
     info = {'is_error': is_error, 'reason': reason, 'comment_qty': comment_qty, 'name': name}
     _cu_task_cache[task_id] = {'ts': time.time(), 'info': info}
     return info
@@ -4815,10 +5021,19 @@ def _get_task_error_info(task_id: str) -> dict | None:
 
 @app.route('/api/shipment-status')
 def api_shipment_status():
+    from concurrent.futures import ThreadPoolExecutor
+    force = request.args.get('force') == '1'
     orders = load_display_orders()
 
     def tag_to_status(tag):
         return 'arrived' if tag == 'Delivered' else 'shipped'
+
+    # Pre-fetch all gear-task error info in parallel to avoid a serial stampede of HTTP calls
+    all_task_ids = list({
+        tid for o in orders for tid in o.get('gear_tasks', {}).values() if tid
+    })
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        list(ex.map(lambda tid: _get_task_error_info(tid, force=force), all_task_ids))
 
     # market → gear_type → counts + item lists
     # Items: {'order': order_num, 'sport': sport, 'qty': qty, 'tn': tn_or_empty, 'reason': str_or_None}
@@ -4839,7 +5054,7 @@ def api_shipment_status():
         packing_list      = order.get('packing_list', [])
         sheet_url         = order.get('order_sheet_url', '')
 
-        ordered_gear = _ordered_gear_types(sheet_url)  # None = couldn't read sheet
+        ordered_gear = _ordered_gear_types(sheet_url, force=force)  # None = couldn't read sheet
 
         for gear_type, task_id in gear_tasks.items():
             has_evidence = any(
@@ -4850,7 +5065,7 @@ def api_shipment_status():
                 continue
 
             bucket      = market_gear[market][gear_type]
-            task_info   = _get_task_error_info(task_id)
+            task_info   = _get_task_error_info(task_id)  # warm from prefetch above
             is_error    = bool(task_info and task_info.get('is_error'))
             reason      = (task_info or {}).get('reason') if is_error else None
             comment_qty = (task_info or {}).get('comment_qty')
@@ -5144,6 +5359,12 @@ def public_order_sheet():
     elif not pub_authed():
         return redirect('/public/login?next=/public/order-sheet')
     return send_file('/Users/mba/order-sheet-tool/index.html')
+
+
+@app.route('/public/logos/<path:filename>')
+def public_logo_download(filename):
+    logo_dir = os.path.join(os.path.dirname(__file__), 'static', 'logos')
+    return send_from_directory(logo_dir, filename, as_attachment=True)
 
 
 @app.route('/public/orders-login', methods=['GET', 'POST'])
@@ -5491,6 +5712,7 @@ def _order_sheet_qty_per_team(sheet_url: str, gear_type: str, order_num: str, nu
 @app.route('/api/dashboard-data')
 def api_dashboard_data():
     from concurrent.futures import ThreadPoolExecutor
+    force = request.args.get('force') == '1'
     orders = load_display_orders()
     result = []
 
@@ -5502,7 +5724,25 @@ def api_dashboard_data():
         if tid
     })
     with ThreadPoolExecutor(max_workers=10) as ex:
-        list(ex.map(_get_clickup_task, all_task_ids))
+        list(ex.map(lambda tid: _get_clickup_task(tid, force=force), all_task_ids))
+
+    # Identify which gear tasks are flagged as receiving errors (cheap — reads the
+    # warm cache above, no network) so we can pre-fetch their error info in parallel
+    # too, instead of fetching it one-at-a-time later inside the per-order loop.
+    error_flagged_ids = []
+    for tid in all_task_ids:
+        t = _get_clickup_task(tid)
+        r = _get_task_cf(t, CF_RECEIVING) if t else None
+        if r is not None:
+            try:
+                ri = int(r) if not isinstance(r, dict) else int(r.get('orderindex', 3))
+                if ri != 3:
+                    error_flagged_ids.append(tid)
+            except (TypeError, ValueError):
+                pass
+    if error_flagged_ids:
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            list(ex.map(lambda tid: _get_task_error_info(tid, force=force), error_flagged_ids))
 
     for order in orders:
         order_date_str = order.get('order_date', '')
@@ -5516,7 +5756,7 @@ def api_dashboard_data():
             continue
 
         first_task_id = next(iter(gear_tasks.values()))
-        task = _get_clickup_task(first_task_id)
+        task = _get_clickup_task(first_task_id, force=force)
         if not task:
             continue
 
@@ -5582,8 +5822,9 @@ def api_dashboard_data():
         # Denominator = all gear types ordered; numerator = those with errors
         error_count    = 0
         received_count = len(gear_tasks)   # every gear type ordered counts
-        for gear_task_id in gear_tasks.values():
-            gt = task if gear_task_id == first_task_id else _get_clickup_task(gear_task_id)
+        error_details  = []   # [{gear, qty, reason}] for tooltip
+        for gear_name, gear_task_id in gear_tasks.items():
+            gt = task if gear_task_id == first_task_id else _get_clickup_task(gear_task_id, force=force)
             if not gt:
                 continue
             r = _get_task_cf(gt, CF_RECEIVING)
@@ -5592,6 +5833,12 @@ def api_dashboard_data():
                     ri = int(r) if not isinstance(r, dict) else int(r.get('orderindex', 3))
                     if ri != 3:
                         error_count += 1
+                        flag = _get_task_error_info(gear_task_id, force=force)
+                        error_details.append({
+                            'gear':   gear_name,
+                            'qty':    flag.get('comment_qty') if flag else None,
+                            'reason': flag.get('reason') if flag else None,
+                        })
                 except (TypeError, ValueError):
                     pass
 
@@ -5620,11 +5867,13 @@ def api_dashboard_data():
             ),
             'is_delayed':       is_delayed,
             'error_count':      error_count,
+            'error_details':    error_details,
             'received_count':   received_count,
             'current_phase':    current_phase,
             'order_status':     order_status,
             'remake_qty':       order.get('remake_qty'),
             'order_jersey_qty': order.get('total_jersey_qty'),
+            'total_gear_qty':   sum((_ordered_gear_types(order.get('order_sheet_url','')) or {}).values()) or order.get('total_jersey_qty'),
         })
 
     return jsonify({'ok': True, 'orders': result})
@@ -5637,6 +5886,122 @@ def api_sync_clickup():
     result = _sync_clickup_tasks()
     ok = 'error' not in result
     return jsonify({'ok': ok, **result})
+
+
+def _fill_missing_dates() -> dict:
+    """
+    For each existing order, fetch its ClickUp task(s) and backfill any date
+    fields that are blank locally: order_date, eta_to_zees, and ship_date on
+    manual_shipments whose tracking number matches CF_SHIP_DATE_ACT on the task.
+    Returns {'updated': int, 'skipped': int}.
+    """
+    settings = get_settings()
+    token = settings.get('clickup_token', '')
+    if not token:
+        return {'updated': 0, 'skipped': 0, 'error': 'ClickUp not configured'}
+
+    headers = {'Authorization': token}
+
+    def _ms_to_date(ms_val):
+        if not ms_val:
+            return ''
+        try:
+            return datetime.utcfromtimestamp(int(ms_val) / 1000).strftime('%Y-%m-%d')
+        except Exception:
+            return ''
+
+    orders = load_orders()
+    updated = 0
+    skipped = 0
+    dirty = False
+
+    for order in orders:
+        gear_tasks = order.get('gear_tasks', {})
+        if not gear_tasks:
+            skipped += 1
+            continue
+
+        order_changed = False
+
+        for gear, task_id in gear_tasks.items():
+            if not task_id:
+                continue
+            try:
+                resp = requests.get(
+                    f'https://api.clickup.com/api/v2/task/{task_id}',
+                    headers=headers, timeout=10,
+                )
+                if resp.status_code != 200:
+                    continue
+                task = resp.json()
+            except Exception:
+                continue
+
+            def _cf(fid):
+                return _get_task_cf(task, fid)
+
+            # Fill order_date if blank
+            if not order.get('order_date'):
+                val = _ms_to_date(_cf(CF_ORDER_DATE))
+                if val:
+                    order['order_date'] = val
+                    order_changed = True
+
+            # Fill eta_to_zees if blank
+            if not order.get('eta_to_zees'):
+                val = _ms_to_date(_cf(CF_ETA_ZEES))
+                if val:
+                    order['eta_to_zees'] = val
+                    order_changed = True
+
+            # If ClickUp has a tracking number not yet in manual_shipments, add it
+            cu_tn = (_cf(CF_TRACKING) or '').strip()
+            cu_ship = _ms_to_date(_cf(CF_SHIP_DATE_ACT))
+            if cu_tn:
+                existing_tns = {m.get('tracking_number', '').strip() for m in order.get('manual_shipments', [])}
+                if cu_tn not in existing_tns:
+                    order.setdefault('manual_shipments', []).append({
+                        'gear_type':       gear,
+                        'tracking_number': cu_tn,
+                        'ship_date':       cu_ship,
+                        'declared_value':  '',
+                        'notes':           '',
+                        'box_count':       1,
+                        'added_at':        datetime.now().isoformat(),
+                        'carrier':         _detect_carrier(cu_tn).upper(),
+                    })
+                    order_changed = True
+                elif cu_ship:
+                    # TN already present — just fill ship_date if blank
+                    for m in order.get('manual_shipments', []):
+                        if m.get('tracking_number', '').strip() == cu_tn and not m.get('ship_date'):
+                            m['ship_date'] = cu_ship
+                            order_changed = True
+
+        if order_changed:
+            updated += 1
+            dirty = True
+        else:
+            skipped += 1
+
+    if dirty:
+        save_orders(orders)
+
+    return {'updated': updated, 'skipped': skipped}
+
+
+@app.route('/api/refresh-from-clickup', methods=['POST'])
+def api_refresh_from_clickup():
+    """Import new orders from ClickUp and backfill missing dates on existing ones."""
+    sync_result = _sync_clickup_tasks()
+    fill_result = _fill_missing_dates()
+    ok = 'error' not in sync_result and 'error' not in fill_result
+    return jsonify({
+        'ok': ok,
+        'added': sync_result.get('added', 0),
+        'dates_updated': fill_result.get('updated', 0),
+        'error': sync_result.get('error') or fill_result.get('error'),
+    })
 
 
 @app.route('/settings', methods=['GET', 'POST'])
@@ -6109,6 +6474,7 @@ def api_packing_verifier_save(order_id):
                 ms['declared_value'] = dv
 
     save_orders(orders)
+    _auto_generate_packing_list(order_id)
     return jsonify({'ok': True, 'saved': len(rows)})
 
 
@@ -6132,7 +6498,7 @@ def api_generate_packing_list(order_id):
     gear_tasks        = order.get('gear_tasks', {})
     sheet_url         = order.get('order_sheet_url', '')
 
-    ordered_qty_map = _ordered_gear_types(sheet_url) or {}
+    ordered_qty_map = _ordered_gear_types(sheet_url) or order.get('ordered_quantities', {})
 
     # Collect unique tracking numbers in order of first appearance
     seen_tns = []

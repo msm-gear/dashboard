@@ -30,22 +30,22 @@ CHROME             = '/Applications/Google Chrome.app/Contents/MacOS/Google Chro
 
 
 def find_order(orders, key: str):
-    """Match an order by 'Market Sport Season OrderNum' key (case-insensitive)."""
+    """Match an order by 'Market Sport Season OrderNum' key (case-insensitive).
+    Tries multi-word market prefixes so 'South Florida BSBL Summer 1' works."""
     parts = key.strip().split()
     if len(parts) < 2:
         return None
-    market = parts[0]
-    rest   = parts[1:]
-    for o in orders:
-        om = o.get('market', '').lower()
-        if om != market.lower():
-            continue
-        remaining = ' '.join(rest).lower()
-        sport  = o.get('sport', '').lower()
-        season = o.get('season', '').lower()
-        num    = str(o.get('num_for_code', o.get('order_num', ''))).lower()
-        if sport in remaining and season in remaining and num in remaining:
-            return o
+    for split_at in range(1, len(parts)):
+        market   = ' '.join(parts[:split_at])
+        rest_str = ' '.join(parts[split_at:]).lower()
+        for o in orders:
+            if o.get('market', '').lower() != market.lower():
+                continue
+            sport  = o.get('sport', '').lower()
+            season = o.get('season', '').lower()
+            num    = str(o.get('num_for_code', o.get('order_num', ''))).lower()
+            if sport in rest_str and season in rest_str and num in rest_str:
+                return o
     return None
 
 

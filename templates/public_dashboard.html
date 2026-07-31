@@ -7,7 +7,7 @@
     <h1 class="text-2xl font-bold text-gray-900">Performance Dashboard</h1>
     <p class="text-sm text-gray-400 mt-1" id="last-loaded">Loading…</p>
   </div>
-  <button onclick="loadData()" id="refresh-btn"
+  <button onclick="loadData(true); loadGearStatus(true)" id="refresh-btn"
           class="px-4 py-2 bg-white border border-gray-300 rounded-xl text-sm font-semibold text-gray-600 hover:border-purple-400 hover:text-purple-700 transition-all flex items-center gap-2">
     <span id="refresh-icon">↻</span> Refresh
   </button>
@@ -314,17 +314,53 @@
     return withData.filter(o => o.is_delayed).length / withData.length * 100;
   }
 
+  // Combines two distinct error sources, matching dashboard.html exactly:
+  //   1. order-level remake tracking (manual remake_qty, e.g. dedicated "Remake" orders)
+  //   2. gear-task-level CF_RECEIVING flags (order.error_count / error_details), already
+  //      computed server-side in /api/dashboard-data — e.g. "Incorrect Team Name print
+  //      issue" — remake_qty alone knows nothing about these.
+  // Denominator: total_gear_qty (all gear types ordered) falling back to order_jersey_qty.
   function pctError(arr) {
-    const remadeTotal  = arr.reduce((s, o) => s + (o.remake_qty || 0), 0);
-    const orderedTotal = arr.reduce((s, o) => s + (o.order_jersey_qty || 0), 0);
+    let errorPcs = 0, orderedTotal = 0;
+    arr.forEach(o => {
+      const denom = o.total_gear_qty || o.order_jersey_qty || 0;
+      if (!denom) return;
+      const detailQty = (o.error_details || []).reduce((s, d) => s + (d.qty || 0), 0);
+      const remQty    = o.remake_qty || 0;
+      const hasErrors = (o.error_count || 0) > 0 || remQty > 0;
+      const knowsQty  = detailQty > 0 || remQty > 0;
+      // If order has errors but qty is unknown, exclude entirely — adding 0/denom deflates %
+      if (hasErrors && !knowsQty) return;
+      errorPcs     += detailQty + remQty;
+      orderedTotal += denom;
+    });
     if (!orderedTotal) return null;
-    return remadeTotal / orderedTotal * 100;
+    return errorPcs / orderedTotal * 100;
   }
 
   function errorTip(arr) {
-    const remakes = arr.filter(o => (o.remake_qty || 0) > 0);
-    if (!remakes.length) return '';
-    return remakes.map(o => `${o.label}  —  ${o.remake_qty} remakes`).join('\n');
+    const lines = [];
+    arr.forEach(o => {
+      const parts = [];
+      if ((o.remake_qty || 0) > 0) parts.push(`${o.remake_qty} remake${o.remake_qty !== 1 ? 's' : ''}`);
+      if ((o.error_count || 0) > 0) {
+        const details = o.error_details || [];
+        if (details.length) {
+          details.forEach(d => {
+            const gear = d.gear || 'gear';
+            if (d.qty != null) {
+              parts.push(`${d.qty} ${gear}${d.qty !== 1 ? 's' : ''} incorrect`);
+            } else {
+              parts.push(`${gear} incorrect`);
+            }
+          });
+        } else {
+          parts.push(`${o.error_count} gear type${o.error_count !== 1 ? 's' : ''} incorrect`);
+        }
+      }
+      if (parts.length) lines.push(`${o.label}  —  ${parts.join(', ')}`);
+    });
+    return lines.join('\n');
   }
 
   function fmtErrorItem(i) {
@@ -429,11 +465,11 @@
     delayEl.textContent = fmtPct(dp);
     delayEl.className   = 'text-2xl font-bold ' + delayClass(dp);
 
-    const errorEl = document.getElementById('card-error');
-    const ep = pctError(data);
-    errorEl.textContent  = fmtPct(ep);
-    errorEl.className    = 'text-2xl font-bold cursor-help ' + errorClass(ep);
-    errorEl.dataset.tip  = errorTip(data);
+    // NOTE: #card-error is intentionally NOT updated here. It's owned by
+    // renderGearStatus() (fed by /api/shipment-status), which reflects actual
+    // flagged gear-task issues (CF_RECEIVING + reason, e.g. "Incorrect Team Name
+    // print issue") — finer-grained than this order-level remake_qty metric, which
+    // is null for most orders and was clobbering the real tooltip when this ran last.
 
     renderStatusBreakdown(data);
 
@@ -468,13 +504,13 @@
       }).join('');
   }
 
-  async function loadData() {
+  async function loadData(force) {
     const btn  = document.getElementById('refresh-btn');
     const icon = document.getElementById('refresh-icon');
     btn.disabled = true;
     icon.innerHTML = '<svg class="spin w-4 h-4 inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>';
     try {
-      const resp = await fetch('/api/dashboard-data');
+      const resp = await fetch('/api/dashboard-data' + (force ? '?force=1' : ''));
       const data = await resp.json();
       if (data.ok) {
         _allOrders = data.orders;
@@ -613,35 +649,57 @@
 
   function renderGearStatus(markets) {
     _lastGearData = markets;
+
+    // Update KPI cards first — before body.innerHTML so they always render
+    let totArr = 0, totShp = 0, totPrd = 0, totAll = 0, totErr = 0;
+    for (const d of Object.values(markets)) {
+      totArr += d.arrived; totShp += d.shipped;
+      totPrd += d.in_production; totAll += d.total;
+      totErr += d.error;
+    }
+    const fmtP = (n, t) => t ? Math.round(n / t * 100) + '%' : '—';
+    const el = id => document.getElementById(id);
+    if (el('card-gear-arrived'))    el('card-gear-arrived').textContent    = fmtP(totArr, totAll);
+    if (el('card-gear-shipped'))    el('card-gear-shipped').textContent    = fmtP(totShp, totAll);
+    if (el('card-gear-production')) el('card-gear-production').textContent = fmtP(totPrd, totAll);
+
+    // Update % Error card using real gear pcs — error pcs / total gear pcs ordered
+    if (totErr > 0 || totAll > 0) {
+      const errPct = (totAll + totErr) ? Math.round(totErr / (totAll + totErr) * 100) : 0;
+      const errEl = el('card-error');
+      if (errEl) {
+        errEl.textContent = errPct + '%';
+        errEl.className   = 'text-2xl font-bold cursor-help ' + (errPct > 0 ? 'text-red-600' : 'text-green-600');
+        // Build a complete tooltip from every market's flagged gear items so the
+        // hover always matches the % currently shown (was previously left stale/
+        // empty here while render() owned the tooltip for a different metric).
+        const allErrLines = Object.values(markets)
+          .flatMap(d => d.gear || [])
+          .flatMap(g => (g.error_items || []).map(fmtErrorItem));
+        errEl.dataset.tip = allErrLines.length ? allErrLines.join('\n') : 'No flagged issues';
+      }
+    }
+
     const body = document.getElementById('gear-status-body');
     const keys  = Object.keys(markets);
     if (!keys.length) {
       body.innerHTML = '<div class="text-center text-gray-400 text-sm py-6 col-span-full">No data.</div>';
       return;
     }
+
+    // Render market cards — isolate each so one error doesn't block the rest
     body.innerHTML = keys
       .sort((a, b) => markets[b].arrived_pct - markets[a].arrived_pct)
-      .map(m => gearStatusHTML(m, markets[m]))
+      .map(m => {
+        try { return gearStatusHTML(m, markets[m]); }
+        catch (e) { return `<div class="border border-red-200 rounded-xl p-4 text-xs text-red-400">${m}: ${e.message}</div>`; }
+      })
       .join('');
-
-    let totArr = 0, totShp = 0, totPrd = 0, totAll = 0;
-    for (const d of Object.values(markets)) {
-      totArr += d.arrived; totShp += d.shipped;
-      totPrd += d.in_production; totAll += d.total;
-    }
-    if (totAll) {
-      const pArr = Math.floor(totArr / totAll * 100);
-      const pShp = Math.round(totShp / totAll * 100);
-      const pPrd = 100 - pArr - pShp;
-      document.getElementById('card-gear-arrived').textContent    = pArr + '%';
-      document.getElementById('card-gear-shipped').textContent    = pShp + '%';
-      document.getElementById('card-gear-production').textContent = pPrd + '%';
-    }
   }
 
-  async function loadGearStatus() {
+  async function loadGearStatus(force) {
     try {
-      const resp = await fetch('/api/shipment-status');
+      const resp = await fetch('/api/shipment-status' + (force ? '?force=1' : ''));
       const data = await resp.json();
       if (data.ok) {
         renderGearStatus(data.markets);
@@ -657,6 +715,7 @@
   // ── Floating tooltip ──────────────────────────────────────────────────────────
   (function () {
     const tip = document.getElementById('gear-tip');
+    if (!tip) return;
     let cur = null;
     document.addEventListener('mouseover', e => {
       const el = e.target.closest('[data-tip]');
@@ -677,8 +736,8 @@
     });
   })();
 
-  loadData();
-  loadGearStatus();
-  setInterval(() => { loadData(); loadGearStatus(); }, 60000);
+  loadData(true);       // force-fresh on page open
+  loadGearStatus(true);
+  setInterval(() => { loadData(); loadGearStatus(); }, 60000);  // background polls use the safe cache
 </script>
 {% endblock %}
