@@ -1,5 +1,7 @@
 from __future__ import annotations
 from flask import Flask, render_template, request, session, jsonify, redirect, url_for, send_file, send_from_directory
+from PIL import Image, ImageOps, ImageChops, ImageCms
+import io
 import openpyxl
 import re
 import difflib
@@ -19,6 +21,7 @@ from datetime import datetime, timedelta
 from io import StringIO
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
+from werkzeug.exceptions import HTTPException
 from pathlib import Path
 from collections import defaultdict
 
@@ -87,6 +90,14 @@ def block_external_admin():
             request.path.startswith('/api/calendar-events') or
             request.path.startswith('/api/events') or
             request.path.startswith('/api/inventory-data') or
+            request.path.startswith('/api/inventory-update') or
+            request.path.startswith('/api/inventory-bulk-update') or
+            request.path.startswith('/api/inventory-photo-upload') or
+            request.path.startswith('/api/inventory-log-photo-upload') or
+            request.path.startswith('/api/inventory-pending-photos') or
+            request.path.startswith('/api/inventory-log') or
+            request.path.startswith('/inventory-photo/') or
+            request.path.startswith('/inventory-log-photo/') or
             request.path.startswith('/api/orders-summary') or
             request.path.startswith('/static/')
         )
@@ -109,6 +120,25 @@ def block_external_admin():
             return 'Not found', 404
         return
     return 'Not found', 404
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(e):
+    """Any unhandled exception on an API/photo route returns JSON, not Flask's
+    default HTML error page — a page doing fetch(...).json() on that HTML gets
+    'Unexpected token <' instead of a readable error otherwise. Non-API routes
+    keep Flask's normal behavior (HTTPException -> its own response, anything
+    else re-raised so the default handling/status code is preserved)."""
+    is_api = (request.path.startswith('/api/') or request.path.startswith('/inventory-photo/')
+              or request.path.startswith('/inventory-log-photo/'))
+    if isinstance(e, HTTPException):
+        if is_api:
+            return jsonify({'ok': False, 'error': e.description}), e.code
+        return e.get_response()
+    if is_api:
+        app.logger.exception('Unhandled error on %s', request.path)
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    raise e
 
 UPLOAD_FOLDER = Path(__file__).parent / 'uploads'
 DATA_FOLDER = Path(__file__).parent / 'data'
@@ -1201,6 +1231,12 @@ def check_all_fedex_statuses(notify_changes: bool = False) -> dict:
                         hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
                 try:
                     _sync_delivered_to_clickup(order, tn, actual_ms, all_orders=orders)
+                except Exception:
+                    pass
+
+            if new_tag == 'Delivered':
+                try:
+                    _sync_delivered_to_inventory(order, tn)
                 except Exception:
                     pass
 
@@ -4524,6 +4560,14 @@ def update_tracking_status():
                 hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
             cu_errors.extend(_sync_delivered_to_clickup(order, tn, actual_ms, all_orders=orders))
 
+    # ── Update Inventory ──────────────────────────────────────────────────────
+    if tag == 'Delivered':
+        try:
+            _sync_delivered_to_inventory(order, tn)
+            save_orders(orders)
+        except Exception:
+            pass
+
     # ── Notify ────────────────────────────────────────────────────────────────
     email_error = ''
     if notify:
@@ -4574,9 +4618,36 @@ def api_sync_delivered():
     actual_ms = int(dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
 
     errs = _sync_delivered_to_clickup(order, tn, actual_ms, all_orders=orders)
+
+    try:
+        _sync_delivered_to_inventory(order, tn)
+        save_orders(orders)
+    except Exception:
+        pass
+
     if errs:
         return jsonify({'ok': False, 'error': '; '.join(errs)})
     return jsonify({'ok': True, 'message': 'Delivered, Delivery Date [Actual], and Order Status updated in ClickUp.'})
+
+
+@app.route('/api/inventory-backfill-order/<order_id>', methods=['POST'])
+def api_inventory_backfill_order(order_id):
+    """Re-run _sync_delivered_to_inventory for every already-Delivered tracking
+    number on one order — inventory only, no ClickUp calls. For retroactively
+    pulling gear from orders that were delivered before auto-sync existed."""
+    orders = load_orders()
+    order  = next((o for o in orders if o.get('id') == order_id), None)
+    if not order:
+        return jsonify({'ok': False, 'error': 'Order not found.'})
+
+    before = list(order.get('inventory_synced_gears', []))
+    for tn, st in order.get('tracking_statuses', {}).items():
+        if st.get('tag') == 'Delivered':
+            _sync_delivered_to_inventory(order, tn)
+    save_orders(orders)
+
+    synced_now = [g for g in order.get('inventory_synced_gears', []) if g not in before]
+    return jsonify({'ok': True, 'synced': synced_now})
 
 
 # ── Dashboard ────────────────────────────────────────────────────────────────
@@ -6088,6 +6159,18 @@ INVENTORY_STOCK_FILE = DATA_FOLDER / 'inventory_stock.json'
 
 _REVERSIBLE_SPORTS = {'Soccer', 'Bowling', '7V7'}
 
+# Landed (vendor) cost per unit, from gear-tools/tariff_audit.html's cost
+# table — used for order-synced items, which don't carry a per-row cost the
+# way HQ Stock sheet rows do (sheet items keep their own column L cost).
+_ORDER_ITEM_LANDED_COST = {
+    'Jerseys':      7.80,
+    'Hoodies':      10.50,
+    'Windbreakers': 11.50,
+    'Caps':         5.00,
+    'Rings':        5.00,
+    'Hype Chains':  9.50,
+}
+
 
 def calc_2026_price(gear_type: str, sport: str, season: str) -> float | None:
     """Return 2026 franchise sell price per unit. None = no known price."""
@@ -6146,6 +6229,445 @@ def _item_key(row: dict) -> str:
                      row.get('code',''), row.get('size',''), row.get('color','')])
 
 
+# ── Order → Inventory auto-sync ─────────────────────────────────────────────
+# When a Dallas / Kansas City order is fully delivered, its ordered gear qty is
+# parsed from the order sheet's per-gear tab (team + size breakdown where the
+# sheet has one) and added into HQ Inventory as Stock In movements — one SKU
+# line per team+size (Jersey/Hoodie), per size (Tee/Windbreaker), or one pooled
+# line for gear types the sheet doesn't break down further (Cap, Ring, etc).
+
+INVENTORY_EXTRA_FILE  = DATA_FOLDER / 'inventory_extra_items.json'
+INVENTORY_PHOTOS_FILE = DATA_FOLDER / 'inventory_photos.json'
+INVENTORY_PHOTOS_DIR  = DATA_FOLDER / 'inventory_photos'
+INVENTORY_LOG_PHOTOS_DIR = DATA_FOLDER / 'inventory_log_photos'
+
+_INVENTORY_SYNC_MARKETS = {'Dallas', 'Kansas City'}
+
+# SKU prefix used when auto-generating inventory codes — matches the existing
+# HQ Stock sheet's own convention (e.g. "H25-ARGYLE-YL" for Hoodie, not "HOD25").
+# Falls back to GEAR_CODES (used elsewhere for ClickUp/order codes) for any
+# gear type not explicitly confirmed here.
+_INVENTORY_SKU_PREFIX = {
+    'Hoodie':     'H',
+    'Tee':        'T',
+    'Cage Jacket': 'CAGE',
+    'Ring':       'R',
+}
+
+_ORDER_GEAR_TO_INV_TYPE = {
+    'Jersey':          'Jerseys',
+    'Hoodie':          'Hoodies',
+    'Tee':             'Tees',
+    'Cap':             'Caps',
+    'Cage Jacket':     'Cage Jackets',
+    'Windbreaker':     'Windbreakers',
+    'Ring':            'Rings',
+    'Hypechain':       'Hype Chains',
+    'Awards':          'Awards',
+    'Park Banner':     'Park Banner',
+    'Name Banner':     'Name Banner',
+    'Hybrid Pullover': 'Hybrid Pullovers',
+    'Drawstring Bag':  'Drawstring Bags',
+}
+
+# Product name shown for each gear type's auto-synced inventory line (+ year).
+# Gear types not listed here just use their plain gear-type name.
+_ORDER_ITEM_STYLE_NAME = {
+    'Jersey': 'Ice Cream Jersey',
+    'Hoodie': 'Ultralight Hoodie',
+}
+
+# Some sports use a completely different Jersey product than the Ice Cream
+# Jersey used for Baseball/Softball/Freshmen (different template, different
+# photo) — keyed by (gear, sport display name from SPORTS).
+_SPORT_STYLE_OVERRIDE = {
+    ('Jersey', '7V7 Football'): '7V7 Swirl Jersey',
+    ('Jersey', 'Golf'):         'Golf Polo',
+}
+
+_SIZE_COLS = ['YM', 'YL', 'YXL', 'AS', 'AM', 'AL', 'AXL']
+
+_TEAM_SIZE_GEAR = {'Jersey', 'Hoodie'}     # tab breaks qty out by team + size
+_SIZE_ONLY_GEAR = {'Tee', 'Windbreaker'}   # tab breaks qty out by size only
+
+
+def _load_inv_extra() -> dict:
+    if not INVENTORY_EXTRA_FILE.exists():
+        return {}
+    try:
+        return json.loads(INVENTORY_EXTRA_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_inv_extra(data: dict):
+    INVENTORY_EXTRA_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _load_inv_photos() -> dict:
+    if not INVENTORY_PHOTOS_FILE.exists():
+        return {}
+    try:
+        return json.loads(INVENTORY_PHOTOS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_inv_photos(data: dict):
+    INVENTORY_PHOTOS_FILE.write_text(json.dumps(data, indent=2))
+
+
+# Tees and Windbreakers use genuinely different artwork per sport (e.g. blue
+# Baseball vs pink Softball) — every other product's sample photo is the same
+# regardless of sport, so only these two split their photo key by sport.
+_SPORT_SPLIT_PHOTO_GEAR = {'Tees', 'Windbreakers'}
+
+# Drawstring bags never change design year to year — their sample photo is
+# keyed by gear type + sport only (not product name), so it stays attached no
+# matter what year ends up in the name. Both the order-sync gear_type
+# ('Drawstring Bags') and the legacy HQ sheet's own label ('Bags') normalize
+# to the same key so one upload covers both sources.
+_YEARLESS_SPORT_PHOTO_GEAR = {'Drawstring Bags': 'DrawstringBag', 'Bags': 'DrawstringBag'}
+
+
+def _inv_photo_key(name: str, gear_type: str, sport: str) -> str:
+    if gear_type in _YEARLESS_SPORT_PHOTO_GEAR:
+        return f'{_YEARLESS_SPORT_PHOTO_GEAR[gear_type]}|{sport}'
+    if gear_type in _SPORT_SPLIT_PHOTO_GEAR:
+        return f'{name}|{sport}'
+    return name
+
+
+def _gear_fully_delivered(order: dict, gear: str) -> bool:
+    """True when every tracking number carrying this gear type in the order is Delivered."""
+    shipments = _collect_shipments(order)
+    statuses  = order.get('tracking_statuses', {})
+    tns = [s['tracking_number'] for s in shipments
+           if any(gs['gear'] == gear for gs in s['gear_summary'])]
+    if not tns:
+        return False
+    return all(statuses.get(t, {}).get('tag') == 'Delivered' for t in tns)
+
+
+def _order_year(order: dict) -> str:
+    for f in ('order_date', 'delivery_date', 'eta_to_zees', 'created_at'):
+        v = order.get(f, '')
+        if v and v[:4].isdigit():
+            return v[:4]
+    return str(datetime.now().year)
+
+
+def _order_item_name(gear: str, year: str, sport: str = '') -> str:
+    if (gear, sport) in _SPORT_STYLE_OVERRIDE:
+        style = _SPORT_STYLE_OVERRIDE[(gear, sport)]
+    elif gear in _ORDER_ITEM_STYLE_NAME:
+        style = _ORDER_ITEM_STYLE_NAME[gear]
+    else:
+        plural = _ORDER_GEAR_TO_INV_TYPE.get(gear, gear)
+        style = plural[:-1] if plural.endswith('s') and not plural.endswith('ss') else plural
+    return f'{style} {year}'.strip()
+
+
+def _team_abbr(name: str) -> str:
+    abbr = re.sub(r'[^A-Za-z0-9]', '', name or '').upper()
+    return abbr[:12] or 'TEAM'
+
+
+def _find_gear_tab_gid(tabs: list, home_title: str, gear_type: str) -> str | None:
+    keywords = _GEAR_TAB_KW.get(gear_type, [])
+    for tab in tabs:
+        tname = tab['properties']['title'].lower()
+        if tname == home_title:
+            continue
+        if any(kw in tname for kw in keywords):
+            return str(tab['properties']['sheetId'])
+    return None
+
+
+def _parse_order_gear_breakdown(sheet_url: str, gear_type: str) -> list:
+    """Per-SKU rows for one gear type in an order sheet, read straight off its tab:
+      Jersey/Hoodie   -> [{team, size, qty, color}, ...]   (MIDDLE SCHOOL + size cols)
+      Tee/Windbreaker -> [{size, qty}, ...]                (SIZE + QTY cols)
+      everything else -> []  (sheet has no breakdown; caller pools the total instead)
+    """
+    m = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', sheet_url or '')
+    if not m:
+        return []
+    sheet_id = m.group(1)
+    gkey = os.getenv('GOOGLE_API_KEY', '')
+    if not gkey:
+        return []
+
+    try:
+        meta = requests.get(
+            f'https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}',
+            params={'key': gkey, 'fields': 'sheets.properties'}, timeout=10,
+        )
+        meta.raise_for_status()
+        tabs = meta.json().get('sheets', [])
+    except Exception:
+        return []
+
+    home_title = ''
+    for tab in tabs:
+        name = tab['properties']['title'].lower()
+        if 'order home' in name or 'home page' in name:
+            home_title = name
+            break
+
+    gid = _find_gear_tab_gid(tabs, home_title, gear_type)
+    if gid is None:
+        return []
+
+    try:
+        csv_resp = requests.get(
+            f'https://docs.google.com/spreadsheets/d/{sheet_id}/export',
+            params={'format': 'csv', 'gid': gid}, timeout=15,
+        )
+        csv_resp.raise_for_status()
+        if 'accounts.google.com' in csv_resp.url:
+            return []
+        rows = list(csv.reader(StringIO(csv_resp.text)))
+    except Exception:
+        return []
+
+    out = []
+    if gear_type in _TEAM_SIZE_GEAR:
+        for row in rows:
+            while len(row) < 17:
+                row.append('')
+            team_full = row[1].strip()
+            if not team_full or team_full.upper() in ('MIDDLE SCHOOL', 'TOTAL'):
+                continue
+            team_short = row[14].strip() or team_full
+            colorway   = row[16].strip()
+            for size, qcell in zip(_SIZE_COLS, row[2:9]):
+                qcell = qcell.strip()
+                if not qcell:
+                    continue
+                try:
+                    qty = int(float(qcell))
+                except ValueError:
+                    continue
+                if qty > 0:
+                    out.append({'team': team_short, 'size': size, 'qty': qty, 'color': colorway})
+    elif gear_type in _SIZE_ONLY_GEAR:
+        for row in rows:
+            if len(row) < 3:
+                continue
+            size = row[1].strip().upper()
+            if size not in _SIZE_COLS:
+                continue
+            qcell = row[2].strip()
+            if not qcell:
+                continue
+            try:
+                qty = int(float(qcell))
+            except ValueError:
+                continue
+            if qty > 0:
+                out.append({'size': size, 'qty': qty})
+    return out
+
+
+# Rings are never pooled — Champion (gold) and Finalist (silver) are always
+# tracked as separate inventory lines, read off the Awards tab's own rows.
+_RING_VARIANTS = [
+    ('champ', 'Champion Gold Ring',   'CHAMP'),
+    ('final', 'Finalist Silver Ring', 'FINAL'),
+]
+
+
+def _parse_ring_breakdown(sheet_url: str) -> list:
+    """Return [{name, suffix, qty}, ...] for Champion/Finalist rings, read from
+    the order sheet's Awards tab (e.g. 'Rings - Champs', 'Rings - Finalist')."""
+    m = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', sheet_url or '')
+    if not m:
+        return []
+    sheet_id = m.group(1)
+    gkey = os.getenv('GOOGLE_API_KEY', '')
+    if not gkey:
+        return []
+
+    try:
+        meta = requests.get(
+            f'https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}',
+            params={'key': gkey, 'fields': 'sheets.properties'}, timeout=10,
+        )
+        meta.raise_for_status()
+        tabs = meta.json().get('sheets', [])
+    except Exception:
+        return []
+
+    gid = None
+    for tab in tabs:
+        if 'award' in tab['properties']['title'].lower():
+            gid = str(tab['properties']['sheetId'])
+            break
+    if gid is None:
+        return []
+
+    try:
+        csv_resp = requests.get(
+            f'https://docs.google.com/spreadsheets/d/{sheet_id}/export',
+            params={'format': 'csv', 'gid': gid}, timeout=15,
+        )
+        csv_resp.raise_for_status()
+        if 'accounts.google.com' in csv_resp.url:
+            return []
+        rows = list(csv.reader(StringIO(csv_resp.text)))
+    except Exception:
+        return []
+
+    out = []
+    for row in rows:
+        if len(row) < 3:
+            continue
+        label   = row[1].strip().lower()
+        qty_str = row[2].strip()
+        if not qty_str:
+            continue
+        try:
+            qty = int(float(qty_str))
+        except ValueError:
+            continue
+        if qty <= 0 or 'ring' not in label:
+            continue
+        for kw, name, suffix in _RING_VARIANTS:
+            if kw in label:
+                out.append({'name': name, 'suffix': suffix, 'qty': qty})
+                break
+    return out
+
+
+def _sync_delivered_to_inventory(order: dict, tn: str) -> None:
+    """For Dallas/Kansas City orders: once ALL boxes for a gear type are Delivered,
+    add that gear's ordered quantity into HQ Inventory as Stock In movements.
+    Mutates order['inventory_synced_gears'] — caller must save_orders() after.
+    """
+    market = order.get('market', '')
+    if market not in _INVENTORY_SYNC_MARKETS:
+        return
+    order_sheet_url = order.get('order_sheet_url', '')
+    if not order_sheet_url:
+        return
+
+    shipments = _collect_shipments(order)
+    ship = next((s for s in shipments if s['tracking_number'] == tn), None)
+    if not ship:
+        return
+
+    synced      = order.setdefault('inventory_synced_gears', [])
+    ordered_qty = _ordered_gear_types(order_sheet_url) or {}
+    sport_name  = dict(SPORTS).get(order.get('sport', ''), order.get('sport', ''))
+    season      = order.get('season', '')
+    year        = _order_year(order)
+    order_label = f"{market} {sport_name} {season} Order #{order.get('order_num', '')}"
+
+    extra       = _load_inv_extra()
+    stock       = _load_inv_stock()
+    log_entries = None  # lazy-loaded only if something actually syncs
+
+    def _apply(item_meta: dict, qty: int, size_for_log: str):
+        nonlocal log_entries
+        key = _item_key(item_meta)
+        sources = extra.get(key, {}).get('sources', [])
+        if order_label not in sources:
+            sources = sources + [order_label]
+        extra[key] = {**item_meta, 'sources': sources}
+
+        cst_now = _fmt_cst()
+        saved   = stock.get(key, {})
+        before  = saved.get('current_stock', 0) or 0
+        new_in  = (saved.get('stock_in', 0) or 0) + qty
+        new_out = saved.get('stock_out', 0) or 0
+        new_cur = new_in - new_out
+        stock[key] = {'stock_in': new_in, 'stock_out': new_out,
+                       'current_stock': new_cur, 'last_updated': cst_now}
+
+        if log_entries is None:
+            log_entries = _load_inv_log()
+        log_entries.insert(0, {
+            'id':           str(uuid.uuid4()),
+            'timestamp':    cst_now,
+            'server_time':  cst_now,
+            'code':         item_meta['code'],
+            'name':         item_meta['name'],
+            'gear_type':    item_meta['gear_type'],
+            'size':         size_for_log,
+            'direction':    'in',
+            'qty':          qty,
+            'stock_before': before,
+            'stock_after':  new_cur,
+            'by':           'Auto (Delivery)',
+            'note':         f'Auto-received on delivery — {order_label}',
+        })
+
+    for gs in ship['gear_summary']:
+        gear = gs['gear']
+        if gear in synced or gear not in ordered_qty:
+            continue
+        if not _gear_fully_delivered(order, gear):
+            continue
+
+        inv_type  = _ORDER_GEAR_TO_INV_TYPE.get(gear, gear)
+        gear_code = _INVENTORY_SKU_PREFIX.get(gear) or GEAR_CODES.get(gear, gear[:3].upper())
+        item_name = _order_item_name(gear, year, sport_name)
+
+        if gear == 'Ring':
+            ring_rows = _parse_ring_breakdown(order_sheet_url)
+            if ring_rows:
+                for r in ring_rows:
+                    item_meta = {
+                        'gear_type': inv_type, 'name': f"{r['name']} {year}", 'sport': sport_name,
+                        'code':      f"{gear_code}{year[-2:]}-{r['suffix']}",
+                        'season':    season, 'status': 'Active',
+                        'color':     '', 'size': '', 'team': '',
+                    }
+                    _apply(item_meta, r['qty'], '')
+                synced.append(gear)
+                continue
+            # Fall through to the pooled branch below if the Awards tab couldn't be read.
+
+        rows = _parse_order_gear_breakdown(order_sheet_url, gear)
+
+        if gear in _TEAM_SIZE_GEAR and rows:
+            for r in rows:
+                item_meta = {
+                    'gear_type': inv_type, 'name': item_name, 'sport': sport_name,
+                    'code':      f"{gear_code}{year[-2:]}-{_team_abbr(r['team'])}-{r['size']}",
+                    'season':    season, 'status': 'Active',
+                    'color':     r['color'], 'size': r['size'], 'team': r['team'],
+                }
+                _apply(item_meta, r['qty'], r['size'])
+        elif gear in _SIZE_ONLY_GEAR and rows:
+            for r in rows:
+                item_meta = {
+                    'gear_type': inv_type, 'name': item_name, 'sport': sport_name,
+                    'code':      f"{gear_code}{year[-2:]}-{r['size']}",
+                    'season':    season, 'status': 'Active',
+                    'color':     '', 'size': r['size'], 'team': '',
+                }
+                _apply(item_meta, r['qty'], r['size'])
+        else:
+            qty = ordered_qty.get(gear) or 0
+            if qty:
+                item_meta = {
+                    'gear_type': inv_type, 'name': item_name, 'sport': sport_name,
+                    'code':      f"{gear_code}{year[-2:]}",
+                    'season':    season, 'status': 'Active',
+                    'color':     '', 'size': '', 'team': '',
+                }
+                _apply(item_meta, qty, '')
+
+        synced.append(gear)
+
+    _save_inv_extra(extra)
+    _save_inv_stock(stock)
+    if log_entries is not None:
+        _save_inv_log(log_entries)
+
+
 @app.route('/inventory')
 def inventory():
     return render_template('inventory.html')
@@ -6175,8 +6697,9 @@ def api_inventory_data():
         return jsonify({'ok': False, 'error': str(e)}), 502
 
     rows = data.get('values', [])
+    local_stock = _load_inv_stock()
     if len(rows) < 2:
-        return jsonify({'ok': True, 'items': []})
+        return jsonify({'ok': True, 'items': _extra_inventory_items(local_stock)})
 
     def _f(v):
         try:
@@ -6184,8 +6707,7 @@ def api_inventory_data():
         except Exception:
             return 0.0
 
-    local_stock = _load_inv_stock()
-
+    photos = _load_inv_photos()
     items = []
     for idx, row in enumerate(rows[1:], start=2):
         while len(row) < 14:
@@ -6199,6 +6721,7 @@ def api_inventory_data():
             'row':           idx,
             'gear_type':     gear_type,
             'name':          row[1],
+            'team':          '',
             'sport':         sport,
             'code':          row[3],
             'season':        season,
@@ -6210,8 +6733,12 @@ def api_inventory_data():
             'current_stock': _f(row[10]),
             'cost_per_unit': cost_per_unit,
             'price_per_unit': p2026,
+            'source':        'sheet',
+            'source_label':  'HQ Stock',
         }
         key = _item_key(item)
+        pkey = _inv_photo_key(item['name'], gear_type, sport)
+        item['photo_url'] = f'/inventory-photo/{photos[pkey]}' if pkey in photos else ''
         if key in local_stock:
             saved = local_stock[key]
             item['stock_in']      = saved.get('stock_in', item['stock_in'])
@@ -6222,7 +6749,203 @@ def api_inventory_data():
         item['total_cost']  = round(cs * cost_per_unit, 2)
         item['total_price'] = round(cs * p2026, 2) if p2026 is not None else 0
         items.append(item)
+
+    items.extend(_extra_inventory_items(local_stock))
     return jsonify({'ok': True, 'items': items})
+
+
+def _used_photo_keys() -> set:
+    """Photo keys (see _inv_photo_key) that currently match a real inventory
+    row — sheet-backed or order-synced. Anything in inventory_photos.json
+    outside this set has no matching item yet (see /api/inventory-pending-photos)."""
+    used = set()
+
+    for key, meta in _load_inv_extra().items():
+        used.add(_inv_photo_key(meta.get('name', ''), meta.get('gear_type', ''), meta.get('sport', '')))
+
+    api_key = os.getenv('GOOGLE_API_KEY', '')
+    if not api_key:
+        return used
+    try:
+        r = requests.get(
+            f'https://sheets.googleapis.com/v4/spreadsheets/{INVENTORY_SHEET_ID}/values/HQ%20Inventory!A1:N300',
+            params={'key': api_key}, timeout=15,
+        )
+        r.raise_for_status()
+        rows = r.json().get('values', [])
+    except Exception:
+        return used
+
+    for row in rows[1:]:
+        while len(row) < 8:
+            row.append('')
+        used.add(_inv_photo_key(row[1], row[0], row[2]))
+    return used
+
+
+@app.route('/api/inventory-pending-photos')
+def api_inventory_pending_photos():
+    """Photos uploaded ahead of a matching inventory item (e.g. a new sport's
+    gear that hasn't synced yet) — kept on file so they attach automatically
+    once that item shows up."""
+    photos = _load_inv_photos()
+    used = _used_photo_keys()
+    pending = [
+        {'key': key, 'photo_url': f'/inventory-photo/{filename}'}
+        for key, filename in photos.items()
+        if key not in used
+    ]
+    return jsonify({'ok': True, 'pending': pending})
+
+
+def _extra_inventory_items(local_stock: dict) -> list:
+    """Order-synced inventory lines (see _sync_delivered_to_inventory), with
+    the same local_stock overlay applied as sheet-backed items."""
+    photos = _load_inv_photos()
+    items = []
+    for key, meta in _load_inv_extra().items():
+        gear_type     = meta.get('gear_type', '')
+        sport         = meta.get('sport', '')
+        season        = meta.get('season', '')
+        cost_per_unit = meta.get('cost_per_unit', 0) or _ORDER_ITEM_LANDED_COST.get(gear_type, 0)
+        p2026         = calc_2026_price(gear_type, sport, season)
+        saved         = local_stock.get(key, {})
+        stock_in      = saved.get('stock_in', 0) or 0
+        stock_out     = saved.get('stock_out', 0) or 0
+        current_stock = saved.get('current_stock', stock_in - stock_out)
+        pkey = _inv_photo_key(meta.get('name', ''), gear_type, sport)
+        item = {
+            'row':            None,
+            'gear_type':      gear_type,
+            'name':           meta.get('name', ''),
+            'team':           meta.get('team', ''),
+            'sport':          sport,
+            'code':           meta.get('code', ''),
+            'season':         season,
+            'status':         meta.get('status', 'Active'),
+            'color':          meta.get('color', ''),
+            'size':           meta.get('size', ''),
+            'stock_in':       stock_in,
+            'stock_out':      stock_out,
+            'current_stock':  current_stock,
+            'cost_per_unit':  cost_per_unit,
+            'price_per_unit': p2026,
+            'last_updated':   saved.get('last_updated', ''),
+            'source':         'order',
+            'source_label':   ', '.join(meta.get('sources', [])) or 'Order',
+            'photo_url':      f'/inventory-photo/{photos[pkey]}' if pkey in photos else '',
+        }
+        item['total_cost']  = round(current_stock * cost_per_unit, 2)
+        item['total_price'] = round(current_stock * p2026, 2) if p2026 is not None else 0
+        items.append(item)
+    return items
+
+
+def _save_web_image(file_storage, dest_path, max_dim: int = 1600, quality: int = 85) -> None:
+    """Save an uploaded image resized/compressed for the web (uploads come
+    straight off a phone camera — often 4000px+ and several MB, which loads
+    slowly or fails outright in a page with many thumbnails). Falls back to
+    a raw save if the format can't be processed (e.g. HEIC with no decoder)."""
+    try:
+        img = Image.open(file_storage)
+        img = ImageOps.exif_transpose(img)  # bake in phone/camera rotation
+        if img.mode == 'CMYK':
+            # Naively converting CMYK -> RGB ignores any embedded print ICC
+            # profile (e.g. "Japan Color 2001 Coated") and gives badly wrong
+            # colors — this is what was rendering as "corrupted" in the
+            # browser. Do a real ICC-aware transform when a profile is
+            # embedded; only fall back to the Adobe-inversion heuristic when
+            # there's no profile to work with.
+            icc = img.info.get('icc_profile')
+            if icc:
+                try:
+                    src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+                    dst_profile = ImageCms.createProfile('sRGB')
+                    img = ImageCms.profileToProfile(img, src_profile, dst_profile, outputMode='RGB')
+                except Exception:
+                    if 'adobe' in img.info:
+                        img = ImageChops.invert(img)
+                    img = img.convert('RGB')
+            else:
+                if 'adobe' in img.info:
+                    img = ImageChops.invert(img)
+                img = img.convert('RGB')
+        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+        ext = Path(dest_path).suffix.lower()
+        if ext in ('.jpg', '.jpeg'):
+            if img.mode not in ('RGB', 'L'):
+                img = img.convert('RGB')
+            img.save(dest_path, 'JPEG', quality=quality, optimize=True)
+        elif ext == '.png':
+            img.save(dest_path, 'PNG', optimize=True)
+        elif ext == '.webp':
+            img.save(dest_path, 'WEBP', quality=quality)
+        else:
+            file_storage.stream.seek(0)
+            file_storage.save(dest_path)
+    except Exception:
+        file_storage.stream.seek(0)
+        file_storage.save(dest_path)
+
+
+@app.route('/api/inventory-photo-upload', methods=['POST'])
+def api_inventory_photo_upload():
+    """Attach a reference sample photo to a product (by name) — applies to every
+    SKU row sharing that product name, regardless of team/size/color. For gear
+    types with sport-specific artwork (Tees, Windbreakers) the photo is scoped
+    to that product name + sport instead (see _SPORT_SPLIT_PHOTO_GEAR)."""
+    product_name = request.form.get('product_name', '')
+    gear_type    = request.form.get('gear_type', '')
+    sport        = request.form.get('sport', '')
+    file         = request.files.get('photo')
+    if not product_name or not file or not file.filename:
+        return jsonify({'ok': False, 'error': 'Missing product_name or photo'}), 400
+
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ('.jpg', '.jpeg', '.png', '.webp', '.heic'):
+        return jsonify({'ok': False, 'error': 'Unsupported file type'}), 400
+
+    INVENTORY_PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f'{uuid.uuid4().hex}{ext}'
+    _save_web_image(file, INVENTORY_PHOTOS_DIR / filename)
+
+    pkey = _inv_photo_key(product_name, gear_type, sport)
+    photos = _load_inv_photos()
+    old = photos.get(pkey)
+    photos[pkey] = filename
+    _save_inv_photos(photos)
+    if old and old != filename:
+        (INVENTORY_PHOTOS_DIR / old).unlink(missing_ok=True)
+
+    return jsonify({'ok': True, 'photo_url': f'/inventory-photo/{filename}'})
+
+
+@app.route('/inventory-photo/<filename>')
+def inventory_photo(filename):
+    return send_from_directory(INVENTORY_PHOTOS_DIR, filename)
+
+
+@app.route('/api/inventory-log-photo-upload', methods=['POST'])
+def api_inventory_log_photo_upload():
+    """Upload a 'how HQ was left' photo to attach to a Stock Out log entry."""
+    file = request.files.get('photo')
+    if not file or not file.filename:
+        return jsonify({'ok': False, 'error': 'Missing photo'}), 400
+
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ('.jpg', '.jpeg', '.png', '.webp', '.heic'):
+        return jsonify({'ok': False, 'error': 'Unsupported file type'}), 400
+
+    INVENTORY_LOG_PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f'{uuid.uuid4().hex}{ext}'
+    _save_web_image(file, INVENTORY_LOG_PHOTOS_DIR / filename)
+
+    return jsonify({'ok': True, 'photo_url': f'/inventory-log-photo/{filename}'})
+
+
+@app.route('/inventory-log-photo/<filename>')
+def inventory_log_photo(filename):
+    return send_from_directory(INVENTORY_LOG_PHOTOS_DIR, filename)
 
 
 @app.route('/api/inventory-update', methods=['POST'])
@@ -6255,6 +6978,83 @@ def api_inventory_update():
         _save_inv_log(entries)
 
     return jsonify({'ok': True})
+
+
+@app.route('/api/inventory-bulk-update', methods=['POST'])
+def api_inventory_bulk_update():
+    """Apply a Stock In/Out movement to multiple selected items at once,
+    recorded as a single log entry (with per-item detail attached)."""
+    body         = request.get_json(force=True) or {}
+    direction    = body.get('direction')
+    by           = (body.get('by') or '').strip()
+    note         = (body.get('note') or '').strip()
+    hq_photo_url = (body.get('hq_photo_url') or '').strip()
+    requested    = body.get('items', [])
+
+    if direction not in ('in', 'out'):
+        return jsonify({'ok': False, 'error': 'Invalid direction'}), 400
+    if not by:
+        return jsonify({'ok': False, 'error': 'Name required'}), 400
+    if not requested:
+        return jsonify({'ok': False, 'error': 'No items selected'}), 400
+
+    stock   = _load_inv_stock()
+    cst_now = _fmt_cst()
+    applied = []
+
+    for e in requested:
+        key = e.get('item_key')
+        try:
+            qty = int(e.get('qty'))
+        except (TypeError, ValueError):
+            continue
+        if not key or qty <= 0:
+            continue
+
+        saved   = stock.get(key, {})
+        before  = saved.get('current_stock', 0) or 0
+        in_qty  = saved.get('stock_in', 0) or 0
+        out_qty = saved.get('stock_out', 0) or 0
+        if direction == 'in':
+            in_qty += qty
+        else:
+            out_qty += qty
+        after = in_qty - out_qty
+        stock[key] = {'stock_in': in_qty, 'stock_out': out_qty,
+                       'current_stock': after, 'last_updated': cst_now}
+
+        applied.append({
+            'item_key':     key,
+            'name':         e.get('name', ''),
+            'code':         e.get('code', ''),
+            'gear_type':    e.get('gear_type', ''),
+            'size':         e.get('size', ''),
+            'qty':          qty,
+            'stock_before': before,
+            'stock_after':  after,
+        })
+
+    if not applied:
+        return jsonify({'ok': False, 'error': 'No valid items to update'}), 400
+
+    _save_inv_stock(stock)
+
+    entries = _load_inv_log()
+    entries.insert(0, {
+        'id':          str(uuid.uuid4()),
+        'timestamp':   cst_now,
+        'server_time': cst_now,
+        'bulk':        True,
+        'direction':   direction,
+        'by':          by,
+        'hq_photo_url': hq_photo_url,
+        'note':        note,
+        'qty':         sum(a['qty'] for a in applied),
+        'items':       applied,
+    })
+    _save_inv_log(entries)
+
+    return jsonify({'ok': True, 'count': len(applied), 'total_qty': sum(a['qty'] for a in applied)})
 
 
 @app.route('/api/inventory-log', methods=['GET'])

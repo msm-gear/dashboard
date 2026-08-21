@@ -1,0 +1,1207 @@
+<div class="flex items-center justify-between mb-6">
+  <div>
+    <h1 class="text-2xl font-bold text-gray-900">HQ Inventory</h1>
+    <p class="text-sm text-gray-400 mt-1" id="last-loaded">Loading…</p>
+  </div>
+  <div class="flex items-center gap-3">
+    <button onclick="openBulkModal('in')"
+            class="px-4 py-2 bg-green-500 rounded-xl text-sm font-bold text-white hover:bg-green-600 transition-all">
+      ＋ Bulk In
+    </button>
+    <button onclick="openBulkModal('out')"
+            class="px-4 py-2 bg-red-500 rounded-xl text-sm font-bold text-white hover:bg-red-600 transition-all">
+      － Bulk Out
+    </button>
+    <button onclick="loadInventory()" id="refresh-btn"
+            class="px-4 py-2 bg-white border border-gray-300 rounded-xl text-sm font-semibold text-gray-600 hover:border-purple-400 hover:text-purple-700 transition-all flex items-center gap-2">
+      <span id="refresh-icon">↻</span> Refresh
+    </button>
+  </div>
+</div>
+
+<!-- Summary Cards -->
+<div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">SKUs</p>
+    <p class="text-2xl font-bold text-gray-900" id="card-skus">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">unique items</p>
+  </div>
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">Units In Stock</p>
+    <p class="text-2xl font-bold text-gray-900" id="card-units">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">current stock</p>
+  </div>
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">Cost Value</p>
+    <p class="text-2xl font-bold text-gray-900" id="card-cost">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">total landed cost</p>
+  </div>
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">Price Value</p>
+    <p class="text-2xl font-bold text-gray-900" id="card-price">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">at 2026 price</p>
+  </div>
+  <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">Margin</p>
+    <p class="text-2xl font-bold text-green-600" id="card-margin">—</p>
+    <p class="text-xs text-gray-400 mt-0.5">potential profit</p>
+  </div>
+</div>
+
+<!-- Filters -->
+<div class="flex flex-wrap items-center gap-3 mb-4">
+  <div class="flex flex-wrap gap-1" id="type-filters"></div>
+
+  <select id="filter-season" onchange="setSeason(this.value)"
+          class="border border-gray-200 rounded-xl px-3 py-2 text-sm font-semibold text-gray-600 focus:outline-none focus:ring-2 focus:ring-purple-400">
+    <option value="All">All Seasons</option>
+  </select>
+
+  <select id="filter-year" onchange="setYear(this.value)"
+          class="border border-gray-200 rounded-xl px-3 py-2 text-sm font-semibold text-gray-600 focus:outline-none focus:ring-2 focus:ring-purple-400">
+    <option value="All">All Years</option>
+  </select>
+
+  <div class="relative ml-auto">
+    <input id="search-input" type="text" placeholder="Search items…"
+           oninput="onSearch()"
+           class="pl-8 pr-8 py-2 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-purple-400 w-56">
+    <span class="absolute left-2.5 top-2.5 text-gray-400 text-sm">🔍</span>
+    <button id="clear-search" onclick="clearSearch()" class="hidden absolute right-2 top-2 text-gray-400 hover:text-gray-600 text-lg leading-none">×</button>
+  </div>
+
+  <div class="flex rounded-xl border border-gray-200 overflow-hidden text-sm font-semibold">
+    <button onclick="setStatus('All')"      id="status-All"      class="px-3 py-2 bg-purple-600 text-white">All</button>
+    <button onclick="setStatus('Active')"   id="status-Active"   class="px-3 py-2 bg-white text-gray-600 hover:bg-gray-50">Active</button>
+    <button onclick="setStatus('Inactive')" id="status-Inactive" class="px-3 py-2 bg-white text-gray-600 hover:bg-gray-50">Inactive</button>
+  </div>
+</div>
+
+<!-- Bulk selection bar -->
+<div id="bulk-bar" class="hidden flex items-center gap-3 mb-4 px-4 py-3 bg-purple-50 border border-purple-200 rounded-xl">
+  <span class="text-sm font-semibold text-purple-800"><span id="bulk-count">0</span> selected</span>
+  <button onclick="openBulkModal('in')" class="px-3 py-1.5 rounded-lg text-sm font-bold bg-green-500 text-white hover:bg-green-600 transition-all">＋ Stock In</button>
+  <button onclick="openBulkModal('out')" class="px-3 py-1.5 rounded-lg text-sm font-bold bg-red-500 text-white hover:bg-red-600 transition-all">－ Stock Out</button>
+  <button onclick="clearSelection()" class="ml-auto text-sm font-semibold text-gray-500 hover:text-gray-700">Clear selection</button>
+</div>
+
+<!-- Table -->
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden mb-6">
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="bg-gray-50 border-b border-gray-200">
+          <th class="px-3 py-3 w-10"><input type="checkbox" id="select-all-cb" onchange="toggleSelectAll(this.checked)"></th>
+          <th class="px-3 py-3 w-12"></th>
+          <th class="px-3 py-3 w-12">Photo</th>
+          <th class="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide cursor-pointer hover:text-gray-800" onclick="sortBy('name')">Name <span class="sort-ind" data-col="name"></span></th>
+          <th class="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide cursor-pointer hover:text-gray-800" onclick="sortBy('team')">Team <span class="sort-ind" data-col="team"></span></th>
+          <th class="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide cursor-pointer hover:text-gray-800" onclick="sortBy('size')">Size <span class="sort-ind" data-col="size"></span></th>
+          <th class="text-right px-4 py-3 text-xs font-semibold text-gray-800 uppercase tracking-wide cursor-pointer hover:text-purple-700 bg-purple-50" onclick="sortBy('current_stock')">Stock <span class="sort-ind" data-col="current_stock"></span></th>
+          <th class="text-right px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide cursor-pointer hover:text-gray-800" onclick="sortBy('stock_in')">In <span class="sort-ind" data-col="stock_in"></span></th>
+          <th class="text-right px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide cursor-pointer hover:text-gray-800" onclick="sortBy('stock_out')">Out <span class="sort-ind" data-col="stock_out"></span></th>
+          <th class="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide cursor-pointer hover:text-gray-800" onclick="sortBy('source_label')">Source <span class="sort-ind" data-col="source_label"></span></th>
+          <th class="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide cursor-pointer hover:text-gray-800" onclick="sortBy('sport')">Sport <span class="sort-ind" data-col="sport"></span></th>
+          <th class="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Code</th>
+          <th class="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide cursor-pointer hover:text-gray-800" onclick="sortBy('season')">Season <span class="sort-ind" data-col="season"></span></th>
+          <th class="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Color</th>
+          <th class="text-right px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide cursor-pointer hover:text-gray-800" onclick="sortBy('cost_per_unit')">Cost/Unit <span class="sort-ind" data-col="cost_per_unit"></span></th>
+          <th class="text-right px-4 py-3 text-xs font-semibold text-purple-500 uppercase tracking-wide cursor-pointer hover:text-purple-700" onclick="sortBy('price_per_unit')">2026 Price <span class="sort-ind" data-col="price_per_unit"></span></th>
+          <th class="text-right px-4 py-3 text-xs font-semibold text-purple-500 uppercase tracking-wide cursor-pointer hover:text-purple-700" onclick="sortBy('total_price')">2026 Value <span class="sort-ind" data-col="total_price"></span></th>
+          <th class="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Status</th>
+        </tr>
+      </thead>
+      <tbody id="inv-tbody">
+        <tr><td colspan="18" class="text-center py-12 text-gray-400">Loading inventory…</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="px-4 py-2 border-t border-gray-100 bg-gray-50">
+    <span class="text-xs text-gray-400" id="row-count"></span>
+  </div>
+</div>
+
+<!-- Pending Photos -->
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden mb-6" id="pending-photos-card">
+  <button onclick="togglePending()" class="w-full flex items-center justify-between px-5 py-4 text-left hover:bg-gray-50 transition-colors">
+    <div class="flex items-center gap-3">
+      <span class="font-bold text-gray-800">📷 Pending Photos</span>
+      <span id="pending-badge" class="text-xs bg-purple-100 text-purple-700 font-semibold px-2 py-0.5 rounded-full">0</span>
+      <span class="text-xs text-gray-400">uploaded ahead of a matching item — will attach automatically once it shows up</span>
+    </div>
+    <span id="pending-chevron" class="text-gray-400 text-lg transition-transform">▼</span>
+  </button>
+  <div id="pending-panel" class="hidden border-t border-gray-100 px-5 py-4">
+    <div id="pending-grid" class="flex flex-wrap gap-3"></div>
+  </div>
+</div>
+
+<!-- Inventory Log -->
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
+  <button onclick="toggleLog()" class="w-full flex items-center justify-between px-5 py-4 text-left hover:bg-gray-50 transition-colors">
+    <div class="flex items-center gap-3">
+      <span class="font-bold text-gray-800">📋 Inventory Log</span>
+      <span id="log-badge" class="text-xs bg-purple-100 text-purple-700 font-semibold px-2 py-0.5 rounded-full">0</span>
+    </div>
+    <span id="log-chevron" class="text-gray-400 text-lg transition-transform">▼</span>
+  </button>
+  <div id="log-panel" class="hidden border-t border-gray-100">
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="bg-gray-50 border-b border-gray-100">
+            <th class="text-left px-4 py-2.5 text-xs font-semibold text-gray-500 uppercase tracking-wide">Time (CST)</th>
+            <th class="text-left px-4 py-2.5 text-xs font-semibold text-gray-500 uppercase tracking-wide">By</th>
+            <th class="text-left px-4 py-2.5 text-xs font-semibold text-gray-500 uppercase tracking-wide">Item</th>
+            <th class="text-left px-4 py-2.5 text-xs font-semibold text-gray-500 uppercase tracking-wide">Code</th>
+            <th class="text-left px-4 py-2.5 text-xs font-semibold text-gray-500 uppercase tracking-wide">Size</th>
+            <th class="text-left px-4 py-2.5 text-xs font-semibold text-gray-500 uppercase tracking-wide">Movement</th>
+            <th class="text-right px-4 py-2.5 text-xs font-semibold text-gray-500 uppercase tracking-wide">Qty</th>
+            <th class="text-right px-4 py-2.5 text-xs font-semibold text-gray-500 uppercase tracking-wide">Before → After</th>
+            <th class="text-left px-4 py-2.5 text-xs font-semibold text-gray-500 uppercase tracking-wide">Note</th>
+          </tr>
+        </thead>
+        <tbody id="log-tbody">
+          <tr><td colspan="9" class="text-center py-6 text-gray-400 text-sm">No log entries yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Stock Movement Modal -->
+<div id="modal-overlay" class="hidden fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md">
+    <div class="px-6 py-5 border-b border-gray-100 flex items-start gap-4">
+      <img id="modal-item-photo" src="" class="hidden w-16 h-16 object-cover rounded-xl border border-gray-200 cursor-pointer shrink-0" onclick="openLightbox(this.src)" title="Click to view full size">
+      <div class="min-w-0">
+        <h2 class="font-bold text-gray-900 text-lg">Record Stock Movement</h2>
+        <p class="text-sm text-gray-500 mt-0.5" id="modal-item-label">—</p>
+        <p class="text-xs text-gray-400 mt-0.5" id="modal-item-source"></p>
+      </div>
+    </div>
+    <div class="px-6 pt-4 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-500 border-b border-gray-100 pb-4" id="modal-item-details"></div>
+    <div class="px-6 py-5 space-y-4">
+      <div>
+        <label class="text-xs font-semibold text-gray-500 uppercase tracking-wide block mb-2">Movement Type</label>
+        <div class="flex gap-2">
+          <button onclick="setDirection('in')" id="dir-in"
+                  class="flex-1 py-2.5 rounded-xl text-sm font-bold border-2 border-green-500 bg-green-500 text-white transition-all">
+            ＋ Stock In
+          </button>
+          <button onclick="setDirection('out')" id="dir-out"
+                  class="flex-1 py-2.5 rounded-xl text-sm font-bold border-2 border-gray-200 text-gray-500 transition-all hover:border-red-400">
+            － Stock Out
+          </button>
+        </div>
+      </div>
+      <div>
+        <label class="text-xs font-semibold text-gray-500 uppercase tracking-wide block mb-1">Quantity</label>
+        <input id="modal-qty" type="number" min="1" value="1"
+               class="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400 text-center text-lg font-bold"
+               oninput="updateModalPreview()">
+      </div>
+      <div class="bg-gray-50 rounded-xl px-4 py-3 text-sm text-gray-600">
+        <div class="flex justify-between">
+          <span>Current stock:</span>
+          <span class="font-semibold text-gray-800" id="modal-cur">—</span>
+        </div>
+        <div class="flex justify-between mt-1">
+          <span>After change:</span>
+          <span class="font-bold text-lg" id="modal-after">—</span>
+        </div>
+      </div>
+      <div>
+        <label class="text-xs font-semibold text-gray-500 uppercase tracking-wide block mb-1">Your Name</label>
+        <input id="modal-by" type="text" placeholder="e.g. Gavin"
+               class="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400">
+      </div>
+      <div>
+        <label class="text-xs font-semibold text-gray-500 uppercase tracking-wide block mb-1">Note <span class="font-normal text-gray-400">(optional)</span></label>
+        <input id="modal-note" type="text" placeholder="e.g. Used at Dallas tournament, Received from vendor…"
+               class="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400">
+      </div>
+      <div id="modal-hq-photo-wrap" class="hidden">
+        <label class="text-xs font-semibold text-gray-500 uppercase tracking-wide block mb-1">Photo of HQ <span class="font-normal text-gray-400">(how you left it — optional)</span></label>
+        <input id="modal-hq-photo" type="file" accept="image/*"
+               class="w-full text-sm text-gray-600 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-purple-100 file:text-purple-700 file:text-xs file:font-semibold hover:file:bg-purple-200">
+      </div>
+    </div>
+    <div class="px-6 pb-5 flex gap-3">
+      <button onclick="closeModal()" class="flex-1 py-2.5 rounded-xl border border-gray-200 text-sm font-semibold text-gray-600 hover:bg-gray-50">Cancel</button>
+      <button onclick="saveMovement()" id="modal-save-btn"
+              class="flex-1 py-2.5 rounded-xl bg-purple-600 text-white text-sm font-bold hover:bg-purple-700 transition-all">
+        Save
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Photo Lightbox -->
+<div id="lightbox-overlay" class="hidden fixed inset-0 bg-black/80 z-[60] flex items-center justify-center p-6" onclick="closeLightbox()">
+  <img id="lightbox-img" src="" class="max-w-full max-h-full rounded-xl shadow-2xl">
+</div>
+
+<!-- Bulk Stock Movement Modal -->
+<div id="bulk-modal-overlay" class="hidden fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[85vh] flex flex-col">
+    <div class="px-6 py-5 border-b border-gray-100">
+      <h2 class="font-bold text-gray-900 text-lg" id="bulk-modal-title">Bulk Stock In</h2>
+      <p class="text-sm text-gray-500 mt-0.5"><span id="bulk-modal-count">0</span> items selected</p>
+    </div>
+    <div class="px-6 py-4 space-y-4 overflow-y-auto flex-1" id="bulk-modal-body">
+      <div>
+        <label class="text-xs font-semibold text-gray-500 uppercase tracking-wide block mb-1">Add items</label>
+        <div class="flex gap-2">
+          <input id="bulk-search" type="text" placeholder="Type a team, color, or item name…"
+                 oninput="renderBulkSuggestions()"
+                 class="flex-1 border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400">
+          <select id="bulk-filter-sport" onchange="renderBulkSuggestions()"
+                  class="border border-gray-200 rounded-xl px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400">
+            <option value="">Any Sport</option>
+          </select>
+          <select id="bulk-filter-size" onchange="renderBulkSuggestions()"
+                  class="border border-gray-200 rounded-xl px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400">
+            <option value="">Any Size</option>
+          </select>
+        </div>
+        <div id="bulk-suggestions" class="mt-2 border border-gray-100 rounded-xl divide-y divide-gray-100 max-h-40 overflow-y-auto"></div>
+      </div>
+      <div>
+        <label class="text-xs font-semibold text-gray-500 uppercase tracking-wide block mb-1">Or pull up an entire order</label>
+        <input id="bulk-order-search" type="text" placeholder="Type an order, e.g. Dallas Baseball Summer, Kansas City…"
+               oninput="renderOrderMatches()"
+               class="w-full border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400">
+        <div id="bulk-order-matches" class="mt-2 border border-gray-100 rounded-xl divide-y divide-gray-100 max-h-32 overflow-y-auto"></div>
+        <div id="bulk-order-checklist-wrap" class="hidden mt-2 border border-purple-200 rounded-xl overflow-hidden">
+          <div class="flex items-center justify-between px-3 py-2 bg-purple-50 border-b border-purple-100">
+            <span class="text-sm font-semibold text-purple-800" id="bulk-order-checklist-title">—</span>
+            <div class="flex items-center gap-3">
+              <button onclick="toggleAllOrderChecklist(true)" class="text-xs font-semibold text-purple-700 hover:text-purple-900">All</button>
+              <button onclick="toggleAllOrderChecklist(false)" class="text-xs font-semibold text-purple-700 hover:text-purple-900">None</button>
+              <button onclick="invertOrderChecklist()" title="Check what's staying at HQ, then invert to select everything else"
+                      class="text-xs font-semibold text-purple-700 hover:text-purple-900">Invert</button>
+              <button onclick="closeOrderChecklist()" class="text-gray-400 hover:text-gray-600 text-lg leading-none">×</button>
+            </div>
+          </div>
+          <div id="bulk-order-checklist" class="divide-y divide-gray-100 max-h-52 overflow-y-auto"></div>
+        </div>
+      </div>
+      <div class="flex items-end gap-3">
+        <div class="flex-1">
+          <label class="text-xs font-semibold text-gray-500 uppercase tracking-wide block mb-1">Set qty for all</label>
+          <input id="bulk-qty-all" type="number" min="1" placeholder="e.g. 1"
+                 class="w-full border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400">
+        </div>
+        <button onclick="applyBulkQtyToAll()" class="px-3 py-2 rounded-xl border border-gray-200 text-sm font-semibold text-gray-600 hover:border-purple-400 hover:text-purple-700">Apply to all</button>
+      </div>
+      <div class="border border-gray-100 rounded-xl divide-y divide-gray-100" id="bulk-item-rows"></div>
+      <button type="button" onclick="focusBulkAddRow()"
+              class="w-full py-2 rounded-xl border-2 border-dashed border-gray-200 text-sm font-semibold text-gray-500 hover:border-purple-400 hover:text-purple-600 transition-all">
+        + Add Row
+      </button>
+      <div>
+        <label class="text-xs font-semibold text-gray-500 uppercase tracking-wide block mb-1">Your Name</label>
+        <input id="bulk-by" type="text" placeholder="e.g. Gavin"
+               class="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400">
+      </div>
+      <div>
+        <label class="text-xs font-semibold text-gray-500 uppercase tracking-wide block mb-1">Note <span class="font-normal text-gray-400">(optional)</span></label>
+        <input id="bulk-note" type="text" placeholder="e.g. Used at Dallas tournament…"
+               class="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400">
+      </div>
+      <div id="bulk-hq-photo-wrap" class="hidden">
+        <label class="text-xs font-semibold text-gray-500 uppercase tracking-wide block mb-1">Photo of HQ <span class="font-normal text-gray-400">(how you left it — optional)</span></label>
+        <input id="bulk-hq-photo" type="file" accept="image/*"
+               class="w-full text-sm text-gray-600 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-purple-100 file:text-purple-700 file:text-xs file:font-semibold hover:file:bg-purple-200">
+      </div>
+    </div>
+    <div class="px-6 py-5 border-t border-gray-100 flex gap-3">
+      <button onclick="closeBulkModal()" class="flex-1 py-2.5 rounded-xl border border-gray-200 text-sm font-semibold text-gray-600 hover:bg-gray-50">Cancel</button>
+      <button onclick="saveBulkMovement()" id="bulk-modal-save-btn"
+              class="flex-1 py-2.5 rounded-xl bg-purple-600 text-white text-sm font-bold hover:bg-purple-700 transition-all">
+        Save
+      </button>
+    </div>
+  </div>
+</div>
+
+<script>
+let allItems   = [];
+let activeType = 'All';
+let activeStatus = 'All';
+let activeSeason = 'All';
+let activeYear   = 'All';
+let sortCol    = 'gear_type';
+let sortAsc    = true;
+let logOpen    = false;
+let modalItem  = null;
+let modalDir   = 'in';
+let selectedKeys = new Set();
+let bulkDir      = 'in';
+let bulkItems    = [];   // [{item, qty}, ...] working list for the bulk modal
+let activeOrderLabel = null;
+
+const fmt  = n => n != null && n !== '' ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—';
+const fmtN = n => (n != null && n !== '') ? Number(n).toLocaleString('en-US') : '0';
+
+function itemKey(i) {
+  return [i.gear_type, i.name, i.sport, i.code, i.size, i.color].join('|');
+}
+
+function escAttr(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+function openLightbox(url) {
+  document.getElementById('lightbox-img').src = url;
+  document.getElementById('lightbox-overlay').classList.remove('hidden');
+}
+
+function closeLightbox() {
+  document.getElementById('lightbox-overlay').classList.add('hidden');
+  document.getElementById('lightbox-img').src = '';
+}
+
+async function uploadHqPhoto(inputEl) {
+  const file = inputEl.files[0];
+  if (!file) return '';
+  const fd = new FormData();
+  fd.append('photo', file);
+  const resp = await fetch('/api/inventory-log-photo-upload', { method: 'POST', body: fd });
+  const data = await resp.json();
+  if (!data.ok) throw new Error(data.error || 'HQ photo upload failed');
+  return data.photo_url;
+}
+
+const SPORT_SPLIT_PHOTO_GEAR    = new Set(['Tees', 'Windbreakers']);
+const YEARLESS_SPORT_PHOTO_GEAR = new Set(['Drawstring Bags', 'Bags']);
+
+async function uploadPhoto(inputEl) {
+  const file = inputEl.files[0];
+  if (!file) return;
+  const productName = inputEl.dataset.productName;
+  const gearType     = inputEl.dataset.gearType;
+  const sport         = inputEl.dataset.sport;
+  const yearless = YEARLESS_SPORT_PHOTO_GEAR.has(gearType);
+  const scoped   = yearless || SPORT_SPLIT_PHOTO_GEAR.has(gearType);
+  const fd  = new FormData();
+  fd.append('product_name', productName);
+  fd.append('gear_type', gearType);
+  fd.append('sport', sport);
+  fd.append('photo', file);
+  try {
+    const resp = await fetch('/api/inventory-photo-upload', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Upload failed');
+    allItems.forEach(it => {
+      if (yearless) {
+        if (YEARLESS_SPORT_PHOTO_GEAR.has(it.gear_type) && it.sport === sport) it.photo_url = data.photo_url;
+      } else if (it.name === productName && (!scoped || it.sport === sport)) {
+        it.photo_url = data.photo_url;
+      }
+    });
+    render();
+    const scopeLabel = yearless ? `Drawstring Bag · ${sport}` : (scoped ? `${productName} · ${sport}` : productName);
+    showToast(`Photo saved — applied to all "${scopeLabel}" items`, 'green');
+  } catch (err) {
+    showToast('Error: ' + err.message, 'red');
+  }
+}
+
+// ── Bulk selection ───────────────────────────────────────────────────────────
+function toggleRowSelect(key, checked) {
+  if (checked) selectedKeys.add(key); else selectedKeys.delete(key);
+  updateBulkBar();
+}
+
+function toggleSelectAll(checked) {
+  const visible = filtered();
+  if (checked) visible.forEach(i => selectedKeys.add(itemKey(i)));
+  else visible.forEach(i => selectedKeys.delete(itemKey(i)));
+  render();
+}
+
+function clearSelection() {
+  selectedKeys.clear();
+  render();
+}
+
+function updateBulkBar() {
+  const bar = document.getElementById('bulk-bar');
+  const n   = selectedKeys.size;
+  bar.classList.toggle('hidden', n === 0);
+  document.getElementById('bulk-count').textContent = n;
+  const visible = filtered();
+  const selectAllCb = document.getElementById('select-all-cb');
+  if (selectAllCb) {
+    selectAllCb.checked = visible.length > 0 && visible.every(i => selectedKeys.has(itemKey(i)));
+  }
+}
+
+function nowCST() {
+  return new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' });
+}
+function fmtCST(str) {
+  const d = new Date(str);
+  if (isNaN(d)) return str;
+  return d.toLocaleString('en-US', {
+    timeZone: 'America/Chicago', month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit', hour12: true,
+  });
+}
+
+// ── Data loading ──────────────────────────────────────────────────────────────
+async function loadInventory() {
+  const icon = document.getElementById('refresh-icon');
+  icon.classList.add('spin');
+  document.getElementById('refresh-btn').disabled = true;
+  try {
+    const resp = await fetch('/api/inventory-data');
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Failed');
+    allItems = data.items;
+    buildTypeFilters();
+    buildSeasonYearFilters();
+    render();
+    document.getElementById('last-loaded').textContent = 'Updated ' + nowCST();
+  } catch (e) {
+    document.getElementById('last-loaded').textContent = 'Error: ' + e.message;
+  } finally {
+    icon.classList.remove('spin');
+    document.getElementById('refresh-btn').disabled = false;
+  }
+  await loadLog();
+  await loadPendingPhotos();
+}
+
+// ── Pending Photos ────────────────────────────────────────────────────────────
+let pendingOpen = false;
+
+async function loadPendingPhotos() {
+  try {
+    const resp = await fetch('/api/inventory-pending-photos');
+    const data = await resp.json();
+    if (data.ok) renderPending(data.pending);
+  } catch (_) {}
+}
+
+function togglePending() {
+  pendingOpen = !pendingOpen;
+  document.getElementById('pending-panel').classList.toggle('hidden', !pendingOpen);
+  document.getElementById('pending-chevron').style.transform = pendingOpen ? 'rotate(180deg)' : '';
+}
+
+function renderPending(pending) {
+  document.getElementById('pending-badge').textContent = pending.length;
+  document.getElementById('pending-photos-card').classList.toggle('hidden', pending.length === 0);
+  document.getElementById('pending-grid').innerHTML = pending.map(p => {
+    const label = p.key.replace('|', ' · ');
+    return `<div class="w-24 text-center">
+      <img src="${p.photo_url}" class="w-24 h-24 object-cover rounded-xl border border-gray-200 cursor-pointer hover:opacity-80" onclick="openLightbox('${p.photo_url}')">
+      <div class="text-xs text-gray-500 mt-1 truncate" title="${escAttr(label)}">${label}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── Filters ───────────────────────────────────────────────────────────────────
+function buildTypeFilters() {
+  const types = [...new Set(allItems.map(i => i.gear_type).filter(Boolean))].sort();
+  const wrap  = document.getElementById('type-filters');
+  wrap.innerHTML = '';
+  for (const t of ['All', ...types]) {
+    const b = document.createElement('button');
+    b.textContent = t;
+    b.onclick = () => setType(t);
+    b.className = 'px-3 py-1.5 rounded-lg text-sm font-semibold transition-all ' +
+      (activeType === t ? 'bg-purple-600 text-white' : 'bg-white border border-gray-200 text-gray-600 hover:border-purple-400');
+    wrap.appendChild(b);
+  }
+}
+
+function setType(t) { activeType = t; buildTypeFilters(); render(); }
+
+function itemYear(i) {
+  const m = String(i.name || '').match(/\b(20\d{2})\b/);
+  return m ? m[1] : '';
+}
+
+function buildSeasonYearFilters() {
+  const seasons = [...new Set(allItems.map(i => i.season).filter(Boolean))].sort();
+  const years   = [...new Set(allItems.map(itemYear).filter(Boolean))].sort().reverse();
+
+  const seasonSel = document.getElementById('filter-season');
+  const yearSel   = document.getElementById('filter-year');
+  seasonSel.innerHTML = '<option value="All">All Seasons</option>' +
+    seasons.map(s => `<option value="${escAttr(s)}">${s}</option>`).join('');
+  yearSel.innerHTML = '<option value="All">All Years</option>' +
+    years.map(y => `<option value="${escAttr(y)}">${y}</option>`).join('');
+  seasonSel.value = activeSeason;
+  yearSel.value    = activeYear;
+}
+
+function setSeason(s) { activeSeason = s; render(); }
+function setYear(y)   { activeYear   = y; render(); }
+
+function setStatus(s) {
+  activeStatus = s;
+  ['All','Active','Inactive'].forEach(x => {
+    const el = document.getElementById('status-' + x);
+    if (el) el.className = x === s
+      ? 'px-3 py-2 bg-purple-600 text-white'
+      : 'px-3 py-2 bg-white text-gray-600 hover:bg-gray-50';
+  });
+  render();
+}
+
+function onSearch() {
+  const q = document.getElementById('search-input').value;
+  document.getElementById('clear-search').classList.toggle('hidden', !q);
+  render();
+}
+function clearSearch() {
+  document.getElementById('search-input').value = '';
+  document.getElementById('clear-search').classList.add('hidden');
+  render();
+}
+
+function sortBy(col) {
+  if (sortCol === col) sortAsc = !sortAsc; else { sortCol = col; sortAsc = true; }
+  document.querySelectorAll('.sort-ind').forEach(el => {
+    el.textContent = el.dataset.col === col ? (sortAsc ? ' ↑' : ' ↓') : '';
+  });
+  render();
+}
+
+function filtered() {
+  const q = document.getElementById('search-input').value.toLowerCase().trim();
+  return allItems.filter(i => {
+    if (activeType   !== 'All' && i.gear_type !== activeType)   return false;
+    if (activeStatus !== 'All' && i.status    !== activeStatus) return false;
+    if (activeSeason !== 'All' && i.season    !== activeSeason) return false;
+    if (activeYear   !== 'All' && itemYear(i) !== activeYear)   return false;
+    if (q) {
+      const hay = [i.name, i.code, i.sport, i.color, i.size, i.gear_type, i.season].join(' ').toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function render() {
+  updateBulkBar();
+  const items = filtered().slice().sort((a, b) => {
+    const av = a[sortCol], bv = b[sortCol];
+    if (typeof av === 'number') return sortAsc ? av - bv : bv - av;
+    return sortAsc ? String(av).localeCompare(String(bv)) : String(bv).localeCompare(String(av));
+  });
+
+  const totalUnits = items.reduce((s, i) => s + i.current_stock, 0);
+  const totalCost  = items.reduce((s, i) => s + i.total_cost,    0);
+  const totalPrice = items.reduce((s, i) => s + i.total_price,   0);
+  document.getElementById('card-skus').textContent   = items.length.toLocaleString();
+  document.getElementById('card-units').textContent  = fmtN(totalUnits);
+  document.getElementById('card-cost').textContent   = fmt(totalCost);
+  document.getElementById('card-price').textContent  = fmt(totalPrice);
+  document.getElementById('card-margin').textContent = fmt(totalPrice - totalCost);
+  document.getElementById('row-count').textContent   = items.length + ' rows';
+
+  if (!items.length) {
+    document.getElementById('inv-tbody').innerHTML =
+      '<tr><td colspan="18" class="text-center py-10 text-gray-400">No items match the filter.</td></tr>';
+    return;
+  }
+
+  const badge = s => s === 'Active'
+    ? '<span class="px-2 py-0.5 rounded-full text-xs font-semibold bg-green-100 text-green-700">Active</span>'
+    : '<span class="px-2 py-0.5 rounded-full text-xs font-semibold bg-gray-100 text-gray-500">Inactive</span>';
+
+  const sourceBadge = i => i.source === 'order'
+    ? `<span class="px-2 py-0.5 rounded-full text-xs font-semibold bg-blue-100 text-blue-700" title="${escAttr(i.source_label)}">${i.source_label}</span>`
+    : `<span class="px-2 py-0.5 rounded-full text-xs font-semibold bg-gray-100 text-gray-500">HQ Stock</span>`;
+
+  let photoCellSeq = 0;
+  const photoCell = i => {
+    const yearless = YEARLESS_SPORT_PHOTO_GEAR.has(i.gear_type);
+    const scoped   = yearless || SPORT_SPLIT_PHOTO_GEAR.has(i.gear_type);
+    const scopeLabel = yearless ? `Drawstring Bag · ${i.sport}` : (scoped ? `${i.name} · ${i.sport}` : i.name);
+    const uploadTitle = (i.photo_url ? 'Replace photo (applies to all ' : 'Upload sample photo (applies to all ')
+      + escAttr(scopeLabel) + ' items)';
+    const inputId = `photo-input-${photoCellSeq++}`;
+    const fileInput = `<input type="file" accept="image/*" class="hidden" id="${inputId}"
+           data-product-name="${escAttr(i.name)}" data-gear-type="${escAttr(i.gear_type)}" data-sport="${escAttr(i.sport)}"
+           onchange="uploadPhoto(this)">`;
+    if (i.photo_url) {
+      return `<div class="relative w-8 h-8 group/photo">
+        ${fileInput}
+        <img src="${i.photo_url}" class="w-8 h-8 object-cover rounded-lg border border-gray-200 cursor-pointer"
+             onclick="openLightbox('${i.photo_url}')" title="Click to view full size">
+        <label for="${inputId}" title="${uploadTitle}"
+               class="absolute -bottom-1 -right-1 w-4 h-4 rounded-full bg-purple-600 text-white text-[9px] leading-none flex items-center justify-center cursor-pointer opacity-0 group-hover/photo:opacity-100 transition-opacity">✎</label>
+      </div>`;
+    }
+    return `<label for="${inputId}" class="inline-block cursor-pointer" title="${uploadTitle}">
+      ${fileInput}
+      <span class="w-8 h-8 rounded-lg border border-dashed border-gray-300 text-gray-400 text-sm flex items-center justify-center hover:border-purple-400 hover:text-purple-500">📷</span>
+    </label>`;
+  };
+
+  let prevType = null;
+  const rows = items.map(i => {
+    const isZero = i.current_stock === 0;
+    const bg = isZero ? 'bg-red-50' : '';
+    const typeHeader = (activeType === 'All' && sortCol === 'gear_type' && i.gear_type !== prevType)
+      ? `<tr class="border-t-2 border-gray-300"><td colspan="18" class="px-4 py-1 text-xs font-bold text-gray-500 uppercase tracking-wider bg-gray-100">${i.gear_type}</td></tr>`
+      : '';
+    prevType = i.gear_type;
+    const stockNum = isZero
+      ? `<span class="text-red-500 font-bold">0</span>`
+      : `<span class="font-bold text-gray-900">${fmtN(i.current_stock)}</span>`;
+    const key = itemKey(i);
+    return `${typeHeader}<tr class="border-b border-gray-100 hover:bg-blue-50/40 ${bg}">
+      <td class="px-3 py-2 text-center">
+        <input type="checkbox" data-key="${escAttr(key)}" ${selectedKeys.has(key) ? 'checked' : ''} onchange="toggleRowSelect(this.dataset.key, this.checked)">
+      </td>
+      <td class="px-3 py-2">
+        <button data-key="${escAttr(key)}" onclick="openModal(allItems.find(x => itemKey(x) === this.dataset.key))"
+                class="px-2 py-1 rounded-lg text-xs font-bold bg-purple-100 text-purple-700 hover:bg-purple-200 transition-colors">
+          + / −
+        </button>
+      </td>
+      <td class="px-3 py-2">${photoCell(i)}</td>
+      <td class="px-4 py-2.5 font-medium text-gray-800 cursor-pointer hover:text-purple-700 hover:underline" data-key="${escAttr(key)}" onclick="openModal(allItems.find(x => itemKey(x) === this.dataset.key))" title="Click for details">${i.name}</td>
+      <td class="px-4 py-2.5 text-gray-600">${i.team || '—'}</td>
+      <td class="px-4 py-2.5 font-mono text-xs font-semibold text-gray-700">${i.size || '—'}</td>
+      <td class="px-4 py-2.5 text-right bg-purple-50/60">${stockNum}</td>
+      <td class="px-4 py-2.5 text-right text-gray-600">${fmtN(i.stock_in)}</td>
+      <td class="px-4 py-2.5 text-right text-gray-600">${i.stock_out ? fmtN(i.stock_out) : '—'}</td>
+      <td class="px-4 py-2.5">${sourceBadge(i)}</td>
+      <td class="px-4 py-2.5 text-gray-600">${i.sport}</td>
+      <td class="px-4 py-2.5 text-gray-400 font-mono text-xs">${i.code}</td>
+      <td class="px-4 py-2.5 text-gray-600">${i.season || '—'}</td>
+      <td class="px-4 py-2.5 text-gray-600">${i.color || '—'}</td>
+      <td class="px-4 py-2.5 text-right text-gray-600">${i.cost_per_unit ? fmt(i.cost_per_unit) : '—'}</td>
+      <td class="px-4 py-2.5 text-right font-semibold text-purple-700">${i.price_per_unit != null ? fmt(i.price_per_unit) : '<span class="text-gray-300 font-normal text-xs">no price</span>'}</td>
+      <td class="px-4 py-2.5 text-right font-semibold text-purple-700">${i.total_price ? fmt(i.total_price) : '—'}</td>
+      <td class="px-4 py-2.5">${badge(i.status)}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('inv-tbody').innerHTML = rows;
+}
+
+// ── Modal ─────────────────────────────────────────────────────────────────────
+function openModal(item) {
+  modalItem = item;
+  modalDir  = 'in';
+  document.getElementById('modal-item-label').textContent =
+    `${item.name}  ·  ${item.code}  ·  Size ${item.size || '—'}`;
+  document.getElementById('modal-item-source').textContent =
+    item.source === 'order' ? `Source: ${item.source_label}` : 'Source: HQ Stock';
+
+  const photoEl = document.getElementById('modal-item-photo');
+  if (item.photo_url) {
+    photoEl.src = item.photo_url;
+    photoEl.classList.remove('hidden');
+  } else {
+    photoEl.classList.add('hidden');
+  }
+
+  const details = [
+    ['Team',    item.team || '—'],
+    ['Sport',   item.sport || '—'],
+    ['Color',   item.color || '—'],
+    ['Stock',   fmtN(item.current_stock)],
+    ['Cost/Unit', fmt(item.cost_per_unit)],
+    ['2026 Price', item.price_per_unit != null ? fmt(item.price_per_unit) : '—'],
+  ];
+  document.getElementById('modal-item-details').innerHTML = details.map(([label, val]) =>
+    `<div><span class="text-gray-400">${label}:</span> <span class="text-gray-700 font-medium">${val}</span></div>`
+  ).join('');
+
+  document.getElementById('modal-qty').value  = 1;
+  document.getElementById('modal-by').value   = localStorage.getItem('inv-by-name') || '';
+  document.getElementById('modal-note').value = '';
+  document.getElementById('modal-hq-photo').value = '';
+  setDirection('in');
+  updateModalPreview();
+  document.getElementById('modal-overlay').classList.remove('hidden');
+  document.getElementById('modal-qty').focus();
+}
+
+function closeModal() {
+  document.getElementById('modal-overlay').classList.add('hidden');
+  modalItem = null;
+}
+
+document.getElementById('modal-overlay').addEventListener('click', e => {
+  if (e.target === document.getElementById('modal-overlay')) closeModal();
+});
+
+function setDirection(dir) {
+  modalDir = dir;
+  const inBtn  = document.getElementById('dir-in');
+  const outBtn = document.getElementById('dir-out');
+  inBtn.className  = 'flex-1 py-2.5 rounded-xl text-sm font-bold border-2 transition-all ' +
+    (dir === 'in'  ? 'border-green-500 bg-green-500 text-white' : 'border-gray-200 text-gray-500 hover:border-green-400');
+  outBtn.className = 'flex-1 py-2.5 rounded-xl text-sm font-bold border-2 transition-all ' +
+    (dir === 'out' ? 'border-red-500 bg-red-500 text-white'     : 'border-gray-200 text-gray-500 hover:border-red-400');
+  document.getElementById('modal-hq-photo-wrap').classList.toggle('hidden', dir !== 'out');
+  updateModalPreview();
+}
+
+function updateModalPreview() {
+  if (!modalItem) return;
+  const qty   = Math.max(0, parseInt(document.getElementById('modal-qty').value) || 0);
+  const cur   = modalItem.current_stock;
+  const after = modalDir === 'in' ? cur + qty : Math.max(0, cur - qty);
+  document.getElementById('modal-cur').textContent = fmtN(cur);
+  const afterEl = document.getElementById('modal-after');
+  afterEl.textContent = fmtN(after);
+  afterEl.className   = 'font-bold text-lg ' + (after < cur ? 'text-red-600' : after > cur ? 'text-green-600' : 'text-gray-800');
+}
+
+async function saveMovement() {
+  if (!modalItem) return;
+
+  const qty  = Math.max(0, parseInt(document.getElementById('modal-qty').value) || 0);
+  const by   = document.getElementById('modal-by').value.trim();
+  const note = document.getElementById('modal-note').value.trim();
+  if (!qty) { showToast('Enter a quantity greater than 0', 'red'); return; }
+  if (!by)  { showToast('Enter your name', 'red'); return; }
+  localStorage.setItem('inv-by-name', by);
+
+  const btn = document.getElementById('modal-save-btn');
+  btn.textContent = 'Saving…';
+  btn.disabled    = true;
+
+  const cur         = modalItem.current_stock;
+  const newStockIn  = modalDir === 'in'  ? modalItem.stock_in  + qty : modalItem.stock_in;
+  const newStockOut = modalDir === 'out' ? modalItem.stock_out + qty : modalItem.stock_out;
+  const newCurrent  = newStockIn - newStockOut;
+  const newTotalCost  = newCurrent * (modalItem.cost_per_unit  || 0);
+  const newTotalPrice = newCurrent * (modalItem.price_per_unit || 0);
+  const cstNow = nowCST();
+
+  try {
+    let hqPhotoUrl = '';
+    if (modalDir === 'out') {
+      hqPhotoUrl = await uploadHqPhoto(document.getElementById('modal-hq-photo'));
+    }
+
+    const logEntry = {
+      timestamp:    cstNow,
+      code:         modalItem.code,
+      name:         modalItem.name,
+      gear_type:    modalItem.gear_type,
+      size:         modalItem.size,
+      direction:    modalDir,
+      qty:          qty,
+      stock_before: cur,
+      stock_after:  newCurrent,
+      by:           by,
+      note:         note,
+      hq_photo_url: hqPhotoUrl,
+    };
+
+    const resp = await fetch('/api/inventory-update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        item_key:      itemKey(modalItem),
+        stock_in:      newStockIn,
+        stock_out:     newStockOut,
+        current_stock: newCurrent,
+        cst_now:       cstNow,
+        log_entry:     logEntry,
+      }),
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error);
+
+    // Update local data → re-render immediately
+    const key = itemKey(modalItem);
+    const idx = allItems.findIndex(i => itemKey(i) === key);
+    if (idx !== -1) {
+      allItems[idx] = { ...allItems[idx], stock_in: newStockIn, stock_out: newStockOut,
+                        current_stock: newCurrent, total_cost: newTotalCost, total_price: newTotalPrice };
+    }
+    closeModal();
+    render();
+    await loadLog();
+    showToast(`Saved — ${modalDir === 'in' ? '+' : '−'}${qty} units · stock now ${fmtN(newCurrent)}`, 'green');
+  } catch (err) {
+    showToast('Error: ' + err.message, 'red');
+  } finally {
+    btn.textContent = 'Save';
+    btn.disabled    = false;
+  }
+}
+
+// ── Bulk Modal ────────────────────────────────────────────────────────────────
+function openBulkModal(direction) {
+  bulkDir = direction;
+  bulkItems = allItems.filter(i => selectedKeys.has(itemKey(i))).map(i => ({ item: i, qty: 1 }));
+
+  document.getElementById('bulk-modal-title').textContent =
+    direction === 'in' ? 'Bulk Stock In' : 'Bulk Stock Out';
+  document.getElementById('bulk-search').value = '';
+  document.getElementById('bulk-order-search').value = '';
+  document.getElementById('bulk-order-matches').innerHTML = '';
+  closeOrderChecklist();
+  document.getElementById('bulk-qty-all').value = '';
+  document.getElementById('bulk-by').value   = localStorage.getItem('inv-by-name') || '';
+  document.getElementById('bulk-note').value = '';
+  document.getElementById('bulk-hq-photo').value = '';
+  document.getElementById('bulk-hq-photo-wrap').classList.toggle('hidden', direction !== 'out');
+
+  const sportSel = document.getElementById('bulk-filter-sport');
+  const sizeSel  = document.getElementById('bulk-filter-size');
+  const sports = [...new Set(allItems.map(i => i.sport).filter(Boolean))].sort();
+  const sizes  = [...new Set(allItems.map(i => i.size).filter(Boolean))].sort();
+  sportSel.innerHTML = '<option value="">Any Sport</option>' + sports.map(s => `<option value="${escAttr(s)}">${s}</option>`).join('');
+  sizeSel.innerHTML  = '<option value="">Any Size</option>'  + sizes.map(s => `<option value="${escAttr(s)}">${s}</option>`).join('');
+
+  renderBulkItemRows();
+  renderBulkSuggestions();
+  document.getElementById('bulk-modal-overlay').classList.remove('hidden');
+  document.getElementById('bulk-search').focus();
+}
+
+function closeBulkModal() {
+  document.getElementById('bulk-modal-overlay').classList.add('hidden');
+}
+
+document.getElementById('bulk-modal-overlay').addEventListener('click', e => {
+  if (e.target === document.getElementById('bulk-modal-overlay')) closeBulkModal();
+});
+
+function renderBulkSuggestions() {
+  const q     = document.getElementById('bulk-search').value.toLowerCase().trim();
+  const sport = document.getElementById('bulk-filter-sport').value;
+  const size  = document.getElementById('bulk-filter-size').value;
+  const box   = document.getElementById('bulk-suggestions');
+
+  if (!q && !sport && !size) { box.innerHTML = ''; return; }
+
+  const already = new Set(bulkItems.map(b => itemKey(b.item)));
+  const matches = allItems.filter(i => {
+    if (already.has(itemKey(i))) return false;
+    if (sport && i.sport !== sport) return false;
+    if (size  && i.size  !== size)  return false;
+    if (q) {
+      const hay = [i.name, i.team, i.color, i.gear_type, i.code, i.sport, i.size].join(' ').toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  }).slice(0, 20);
+
+  if (!matches.length) {
+    box.innerHTML = '<div class="px-3 py-2 text-sm text-gray-400">No matching items</div>';
+    return;
+  }
+
+  box.innerHTML = matches.map(i => {
+    const key   = itemKey(i);
+    const label = [i.name, i.team, i.size, i.color].filter(Boolean).join(' · ');
+    const src   = i.source === 'order' ? i.source_label : 'HQ Stock';
+    return `<div class="px-3 py-2 hover:bg-purple-50 cursor-pointer text-sm" data-key="${escAttr(key)}" onclick="addBulkItem(this.dataset.key)">
+      <div class="text-gray-800">${label}</div>
+      <div class="text-xs text-gray-400">${escAttr(src)} · stock ${fmtN(i.current_stock)}</div>
+    </div>`;
+  }).join('');
+}
+
+function addBulkItem(key, qty = 1) {
+  if (bulkItems.some(b => itemKey(b.item) === key)) return;
+  const item = allItems.find(i => itemKey(i) === key);
+  if (!item) return;
+  bulkItems.push({ item, qty });
+  renderBulkItemRows();
+  renderBulkSuggestions();
+  if (activeOrderLabel) renderOrderChecklist();
+}
+
+function removeBulkItem(key) {
+  bulkItems = bulkItems.filter(b => itemKey(b.item) !== key);
+  renderBulkItemRows();
+  renderBulkSuggestions();
+  if (activeOrderLabel) renderOrderChecklist();
+}
+
+// ── Pull up an entire order ──────────────────────────────────────────────────
+function renderOrderMatches() {
+  const q   = document.getElementById('bulk-order-search').value.toLowerCase().trim();
+  const box = document.getElementById('bulk-order-matches');
+  if (!q) { box.innerHTML = ''; return; }
+
+  const counts = {};
+  allItems.forEach(i => {
+    if (i.source !== 'order') return;
+    if (!i.source_label.toLowerCase().includes(q)) return;
+    counts[i.source_label] = (counts[i.source_label] || 0) + 1;
+  });
+  const labels = Object.keys(counts).sort();
+
+  if (!labels.length) {
+    box.innerHTML = '<div class="px-3 py-2 text-sm text-gray-400">No matching orders</div>';
+    return;
+  }
+  box.innerHTML = labels.map(label => `
+    <div class="px-3 py-2 hover:bg-purple-50 cursor-pointer text-sm flex items-center justify-between" data-label="${escAttr(label)}" onclick="selectOrderGroup(this.dataset.label)">
+      <span class="text-gray-800">📦 ${label}</span>
+      <span class="text-xs text-gray-400">${counts[label]} items</span>
+    </div>`).join('');
+}
+
+function selectOrderGroup(label) {
+  activeOrderLabel = label;
+  document.getElementById('bulk-order-matches').innerHTML = '';
+  document.getElementById('bulk-order-search').value = label;
+  document.getElementById('bulk-order-checklist-wrap').classList.remove('hidden');
+  renderOrderChecklist();
+}
+
+function closeOrderChecklist() {
+  activeOrderLabel = null;
+  document.getElementById('bulk-order-checklist-wrap').classList.add('hidden');
+  document.getElementById('bulk-order-checklist').innerHTML = '';
+  document.getElementById('bulk-order-checklist-title').textContent = '—';
+}
+
+function renderOrderChecklist() {
+  if (!activeOrderLabel) return;
+  const items = allItems.filter(i => i.source === 'order' && i.source_label === activeOrderLabel);
+  const checkedCount = items.filter(i => bulkItems.some(b => itemKey(b.item) === itemKey(i))).length;
+  document.getElementById('bulk-order-checklist-title').textContent =
+    `${activeOrderLabel} — ${checkedCount}/${items.length} selected`;
+
+  document.getElementById('bulk-order-checklist').innerHTML = items.map(i => {
+    const key     = itemKey(i);
+    const checked = bulkItems.some(b => itemKey(b.item) === key);
+    const label   = [i.name, i.team, i.size, i.color].filter(Boolean).join(' · ');
+    return `<label class="flex items-center gap-2 px-3 py-1.5 text-sm hover:bg-gray-50 cursor-pointer">
+      <input type="checkbox" data-key="${escAttr(key)}" ${checked ? 'checked' : ''}
+             onchange="toggleOrderChecklistItem(this.dataset.key, this.checked)">
+      <span class="text-gray-700 truncate">${label}</span>
+      <span class="text-gray-400 text-xs ml-auto shrink-0">stock ${fmtN(i.current_stock)}</span>
+    </label>`;
+  }).join('');
+}
+
+function toggleOrderChecklistItem(key, checked) {
+  if (checked) addBulkItem(key, 1); else removeBulkItem(key);
+}
+
+function toggleAllOrderChecklist(checked) {
+  if (!activeOrderLabel) return;
+  const items = allItems.filter(i => i.source === 'order' && i.source_label === activeOrderLabel);
+  items.forEach(i => {
+    const key = itemKey(i);
+    if (checked) { if (!bulkItems.some(b => itemKey(b.item) === key)) bulkItems.push({ item: i, qty: 1 }); }
+    else { bulkItems = bulkItems.filter(b => itemKey(b.item) !== key); }
+  });
+  renderBulkItemRows();
+  renderBulkSuggestions();
+  renderOrderChecklist();
+}
+
+function invertOrderChecklist() {
+  if (!activeOrderLabel) return;
+  const items = allItems.filter(i => i.source === 'order' && i.source_label === activeOrderLabel);
+  items.forEach(i => {
+    const key      = itemKey(i);
+    const selected = bulkItems.some(b => itemKey(b.item) === key);
+    if (selected) bulkItems = bulkItems.filter(b => itemKey(b.item) !== key);
+    else bulkItems.push({ item: i, qty: 1 });
+  });
+  renderBulkItemRows();
+  renderBulkSuggestions();
+  renderOrderChecklist();
+}
+
+function setBulkItemQty(key, val) {
+  const b = bulkItems.find(b => itemKey(b.item) === key);
+  if (b) b.qty = Math.max(0, parseInt(val) || 0);
+}
+
+function renderBulkItemRows() {
+  document.getElementById('bulk-modal-count').textContent = bulkItems.length;
+  if (!bulkItems.length) {
+    document.getElementById('bulk-item-rows').innerHTML =
+      '<div class="px-3 py-4 text-sm text-gray-400 text-center">No items added yet — search above or check rows in the table.</div>';
+    return;
+  }
+  const rows = bulkItems.map(b => {
+    const i     = b.item;
+    const key   = itemKey(i);
+    const src   = i.source === 'order' ? i.source_label : 'HQ Stock';
+    const label = [i.name, i.team, i.size, i.color].filter(Boolean).join(' · ');
+    return `<div class="flex items-center justify-between gap-3 px-3 py-2">
+      <div class="text-sm text-gray-700 truncate min-w-0" title="${escAttr(label)}">
+        ${label} <span class="text-gray-400 text-xs">(${escAttr(src)} · stock ${fmtN(i.current_stock)})</span>
+      </div>
+      <div class="flex items-center gap-2 shrink-0">
+        <input type="number" min="1" value="${b.qty}" data-key="${escAttr(key)}"
+               oninput="setBulkItemQty(this.dataset.key, this.value)"
+               class="bulk-qty-input w-20 border border-gray-200 rounded-lg px-2 py-1 text-sm text-center focus:outline-none focus:ring-2 focus:ring-purple-400">
+        <button data-key="${escAttr(key)}" onclick="removeBulkItem(this.dataset.key)" class="text-gray-400 hover:text-red-500 text-lg leading-none">×</button>
+      </div>
+    </div>`;
+  }).join('');
+  document.getElementById('bulk-item-rows').innerHTML = rows;
+}
+
+function applyBulkQtyToAll() {
+  const val = parseInt(document.getElementById('bulk-qty-all').value);
+  if (!val || val < 1) return;
+  bulkItems.forEach(b => { b.qty = val; });
+  renderBulkItemRows();
+}
+
+function focusBulkAddRow() {
+  document.getElementById('bulk-modal-body').scrollTo({ top: 0, behavior: 'smooth' });
+  const search = document.getElementById('bulk-search');
+  search.focus();
+  search.classList.add('ring-2', 'ring-purple-400');
+  setTimeout(() => search.classList.remove('ring-2', 'ring-purple-400'), 1200);
+}
+
+async function saveBulkMovement() {
+  const by   = document.getElementById('bulk-by').value.trim();
+  const note = document.getElementById('bulk-note').value.trim();
+  if (!by) { showToast('Enter your name', 'red'); return; }
+
+  const payloadItems = bulkItems
+    .filter(b => b.qty > 0)
+    .map(b => ({
+      item_key:  itemKey(b.item),
+      name:      b.item.name,
+      code:      b.item.code,
+      gear_type: b.item.gear_type,
+      size:      b.item.size,
+      qty:       b.qty,
+    }));
+  if (!payloadItems.length) { showToast('Add at least one item with a quantity', 'red'); return; }
+
+  localStorage.setItem('inv-by-name', by);
+  const btn = document.getElementById('bulk-modal-save-btn');
+  btn.textContent = 'Saving…';
+  btn.disabled    = true;
+
+  try {
+    let hqPhotoUrl = '';
+    if (bulkDir === 'out') {
+      hqPhotoUrl = await uploadHqPhoto(document.getElementById('bulk-hq-photo'));
+    }
+
+    const resp = await fetch('/api/inventory-bulk-update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ direction: bulkDir, by, note, hq_photo_url: hqPhotoUrl, items: payloadItems }),
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Save failed');
+
+    closeBulkModal();
+    clearSelection();
+    bulkItems = [];
+    await loadInventory();
+    showToast(`Saved — ${bulkDir === 'in' ? '+' : '−'}${data.total_qty} units across ${data.count} item(s)`, 'green');
+  } catch (err) {
+    showToast('Error: ' + err.message, 'red');
+  } finally {
+    btn.textContent = 'Save';
+    btn.disabled    = false;
+  }
+}
+
+// ── Inventory Log ─────────────────────────────────────────────────────────────
+async function loadLog() {
+  try {
+    const resp = await fetch('/api/inventory-log?limit=200');
+    const data = await resp.json();
+    if (data.ok) renderLog(data.entries);
+  } catch (_) {}
+}
+
+function toggleLog() {
+  logOpen = !logOpen;
+  document.getElementById('log-panel').classList.toggle('hidden', !logOpen);
+  document.getElementById('log-chevron').style.transform = logOpen ? 'rotate(180deg)' : '';
+  if (logOpen) loadLog();
+}
+
+function renderLog(entries) {
+  document.getElementById('log-badge').textContent = entries.length;
+  if (!entries.length) {
+    document.getElementById('log-tbody').innerHTML =
+      '<tr><td colspan="9" class="text-center py-6 text-gray-400 text-sm">No log entries yet.</td></tr>';
+    return;
+  }
+  const rows = entries.map(e => {
+    const ts = fmtCST(e.timestamp);
+    const dirBadge = e.direction === 'in'
+      ? '<span class="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-700">＋ In</span>'
+      : '<span class="px-2 py-0.5 rounded-full text-xs font-bold bg-red-100 text-red-700">－ Out</span>';
+
+    const photoLink = e.hq_photo_url
+      ? ` <a href="${e.hq_photo_url}" target="_blank" rel="noopener" class="ml-1 text-purple-600 hover:text-purple-800" title="Photo of HQ after this checkout">📷</a>`
+      : '';
+
+    if (e.bulk) {
+      const items     = e.items || [];
+      const breakdown = items.map(it => `${it.name}${it.size ? ' ' + it.size : ''} ×${it.qty}`).join(', ');
+      const noteFull  = e.note ? `${e.note} — ${breakdown}` : breakdown;
+      return `<tr class="border-b border-gray-100 hover:bg-gray-50">
+        <td class="px-4 py-2.5 text-xs text-gray-500 whitespace-nowrap">${ts}</td>
+        <td class="px-4 py-2.5 text-sm font-medium text-gray-700">${e.by || '—'}</td>
+        <td class="px-4 py-2.5 text-sm font-medium text-gray-800" title="${escAttr(breakdown)}">${items.length} items <span class="px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-purple-100 text-purple-700 align-middle">Bulk</span></td>
+        <td class="px-4 py-2.5 text-xs font-mono text-gray-400">—</td>
+        <td class="px-4 py-2.5 text-xs font-mono font-semibold text-gray-600">—</td>
+        <td class="px-4 py-2.5">${dirBadge}</td>
+        <td class="px-4 py-2.5 text-right font-bold text-gray-800">${fmtN(e.qty)}</td>
+        <td class="px-4 py-2.5 text-right text-sm text-gray-400">—</td>
+        <td class="px-4 py-2.5 text-xs text-gray-500" title="${escAttr(noteFull)}">${noteFull}${photoLink}</td>
+      </tr>`;
+    }
+
+    const arrow = Number(e.stock_after) < Number(e.stock_before) ? '↓' : '↑';
+    const arrowColor = Number(e.stock_after) < Number(e.stock_before) ? 'text-red-500' : 'text-green-500';
+    return `<tr class="border-b border-gray-100 hover:bg-gray-50">
+      <td class="px-4 py-2.5 text-xs text-gray-500 whitespace-nowrap">${ts}</td>
+      <td class="px-4 py-2.5 text-sm font-medium text-gray-700">${e.by || '—'}</td>
+      <td class="px-4 py-2.5 text-sm font-medium text-gray-800">${e.name}</td>
+      <td class="px-4 py-2.5 text-xs font-mono text-gray-400">${e.code}</td>
+      <td class="px-4 py-2.5 text-xs font-mono font-semibold text-gray-600">${e.size || '—'}</td>
+      <td class="px-4 py-2.5">${dirBadge}</td>
+      <td class="px-4 py-2.5 text-right font-bold text-gray-800">${fmtN(e.qty)}</td>
+      <td class="px-4 py-2.5 text-right text-sm">
+        <span class="text-gray-500">${fmtN(e.stock_before)}</span>
+        <span class="${arrowColor} mx-1">${arrow}</span>
+        <span class="font-bold text-gray-800">${fmtN(e.stock_after)}</span>
+      </td>
+      <td class="px-4 py-2.5 text-xs text-gray-500">${e.note || '—'}${photoLink}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('log-tbody').innerHTML = rows;
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function showToast(msg, color = 'green') {
+  let el = document.getElementById('toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast';
+    el.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:9999;padding:12px 20px;border-radius:12px;color:#fff;font-size:14px;font-weight:600;box-shadow:0 4px 20px rgba(0,0,0,.15);transition:opacity .4s';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.style.background = color === 'green' ? '#16a34a' : '#dc2626';
+  el.style.opacity = '1';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.style.opacity = '0'; }, 3500);
+}
+
+loadInventory();
+</script>
