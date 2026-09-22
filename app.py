@@ -5991,10 +5991,23 @@ def _forecast_is_remake(order: dict) -> bool:
     return any(kw in text for kw in ('remake', 're-order', 'reorder', 'redo'))
 
 
+_forecast_cache: dict = {'ts': 0, 'data': None}
+_FORECAST_CACHE_TTL = 600  # 10 minutes — matches _sheet_cache/_ring_breakdown_cache windows
+
+
 @app.route('/api/forecast-data')
 def api_forecast_data():
     from concurrent.futures import ThreadPoolExecutor
+    global _forecast_cache
     force = request.args.get('force') == '1'
+
+    # Whole-response cache: the admin page and the public mirror both hit this
+    # endpoint, and it's rarely worth re-reading ~15 Google Sheets on every page
+    # open. force=1 (Refresh button) bypasses it, matching the pattern used by
+    # /api/dashboard-data and /api/orders-summary.
+    if not force and _forecast_cache['data'] and (time.time() - _forecast_cache['ts']) < _FORECAST_CACHE_TTL:
+        return jsonify(_forecast_cache['data'])
+
     orders = load_display_orders()
 
     # Pre-fetch all order sheets in parallel (warms _ordered_gear_types' cache)
@@ -6004,11 +6017,14 @@ def api_forecast_data():
         with ThreadPoolExecutor(max_workers=10) as ex:
             list(ex.map(lambda url: _ordered_gear_types(url, force=force), sheet_urls))
 
-    # history[season][market][sport][sport_year][gear_type] = qty
-    history: dict = {}
+    # First pass: resolve each order's qty_map (now cache-warm) and collect which
+    # sheets need their combined 'Ring' total split via the Awards tab, so that
+    # network call can also be parallelized below instead of run one-by-one.
+    resolved: list = []  # [(order, market, sport, season, year, qty_map)]
     incomplete = []
     markets_seen = set()
     sports_seen = set()
+    ring_urls = set()
 
     for order in orders:
         market = order.get('market', '').strip()
@@ -6036,6 +6052,18 @@ def api_forecast_data():
                 incomplete.append(f"{market} {sport} {season} #{order.get('order_num', '')}")
                 continue
 
+        if qty_map.get('Ring') and order.get('order_sheet_url'):
+            ring_urls.add(order['order_sheet_url'])
+
+        resolved.append((market, sport, season, year, qty_map, order.get('order_sheet_url', '')))
+
+    if ring_urls:
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            list(ex.map(lambda url: _cached_ring_breakdown(url, force=force), ring_urls))
+
+    # Second pass: build history, splitting 'Ring' from the now-warm ring cache.
+    history: dict = {}
+    for market, sport, season, year, qty_map, sheet_url in resolved:
         # Rings are never one SKU — split the combined 'Ring' bucket into Champion
         # Gold / Finalist Silver using the same Awards-tab source the inventory
         # sync already trusts for this. Forecast-only: doesn't touch GEAR_CODES,
@@ -6043,7 +6071,7 @@ def api_forecast_data():
         if qty_map.get('Ring'):
             qty_map = dict(qty_map)
             ring_qty = qty_map.pop('Ring')
-            ring_rows = _parse_ring_breakdown(order.get('order_sheet_url', ''))
+            ring_rows = _cached_ring_breakdown(sheet_url, force=False)
             if ring_rows:
                 for r in ring_rows:
                     qty_map[r['name']] = qty_map.get(r['name'], 0) + r['qty']
@@ -6094,7 +6122,7 @@ def api_forecast_data():
         if g == 'Ring':
             forecast_gear_types += ['Champion Gold Ring', 'Finalist Silver Ring']
 
-    return jsonify({
+    payload = {
         'ok': True,
         'history': history,
         'incomplete': incomplete,
@@ -6104,7 +6132,9 @@ def api_forecast_data():
         'sports': sorted(sports_seen),
         'seasons': ['Summer', 'Fall'],
         'registration_based_years': registration_based,
-    })
+    }
+    _forecast_cache = {'ts': time.time(), 'data': payload}
+    return jsonify(payload)
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────
@@ -6695,6 +6725,23 @@ def _parse_ring_breakdown(sheet_url: str) -> list:
                 out.append({'name': name, 'suffix': suffix, 'qty': qty})
                 break
     return out
+
+
+_ring_breakdown_cache: dict = {}
+_RING_BREAKDOWN_CACHE_TTL = 600  # 10 minutes — same window as _sheet_cache
+
+
+def _cached_ring_breakdown(sheet_url: str, force: bool = False) -> list:
+    """Forecast-only cache in front of _parse_ring_breakdown so re-splitting
+    'Ring' totals doesn't hit the Awards tab fresh on every forecast load."""
+    if not sheet_url:
+        return []
+    cached = _ring_breakdown_cache.get(sheet_url)
+    if not force and cached and (time.time() - cached['ts']) < _RING_BREAKDOWN_CACHE_TTL:
+        return cached['rows']
+    rows = _parse_ring_breakdown(sheet_url)
+    _ring_breakdown_cache[sheet_url] = {'ts': time.time(), 'rows': rows}
+    return rows
 
 
 def _sync_delivered_to_inventory(order: dict, tn: str) -> None:
