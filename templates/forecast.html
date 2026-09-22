@@ -1,0 +1,432 @@
+{% extends "base.html" %}
+{% block title %}Forecast — MSM Shipment Tracker{% endblock %}
+
+{% block head_extra %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-6">
+  <div>
+    <h1 class="text-2xl font-bold text-gray-900">Gear Order Forecast</h1>
+    <p class="text-sm text-gray-400 mt-1" id="last-loaded">Loading…</p>
+  </div>
+  <button onclick="loadForecast(true)" id="refresh-btn"
+          class="px-4 py-2 bg-white border border-gray-300 rounded-xl text-sm font-semibold text-gray-600 hover:border-purple-400 hover:text-purple-700 transition-all flex items-center gap-2">
+    <span id="refresh-icon">↻</span> Refresh
+  </button>
+</div>
+
+<!-- Data quality notice -->
+<div id="incomplete-notice" class="hidden mb-6 px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-800">
+  <span class="font-semibold">⚠️ Some orders couldn't be read from their order sheet</span> — totals below may undercount.
+  <span id="incomplete-list" class="block text-xs text-amber-700 mt-1"></span>
+</div>
+
+<!-- Principles -->
+<div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-6 py-5 mb-6">
+  <div class="flex items-center justify-between mb-3">
+    <h2 class="font-bold text-gray-800 text-base flex items-center gap-2">🧭 Principles of Forecasting</h2>
+    <button onclick="togglePrinciples()" id="principles-toggle" class="text-xs text-gray-400 hover:text-gray-600 underline">Hide</button>
+  </div>
+  <div id="principles-body" class="grid md:grid-cols-2 gap-x-8 gap-y-2.5 text-sm text-gray-600">
+    <p><span class="font-semibold text-gray-800">Compare like seasons.</span> Summer and Fall demand are structurally different — never blend them into one baseline.</p>
+    <p><span class="font-semibold text-gray-800">Use confirmed actuals, not sheet estimates.</span> Quantities are pulled from confirmed vendor order tabs, not registration guesses.</p>
+    <p><span class="font-semibold text-gray-800">Exclude one-off corrections.</span> Remakes and error-replacement orders are removed from the baseline — they're fixes, not new demand.</p>
+    <p><span class="font-semibold text-gray-800">Weight recent seasons more heavily.</span> The baseline is a weighted moving average across every year on file — the most recent year counts most, so one odd season doesn't set the whole plan alone.</p>
+    <p><span class="font-semibold text-gray-800">Safety margin ≠ error margin.</span> The % on top should cover expected growth or new-team signage, not compensate for a baseline you don't trust.</p>
+    <p><span class="font-semibold text-gray-800">A market with no history has no baseline.</span> Don't force a number onto a new market — flag it for a manual estimate instead.</p>
+    <p><span class="font-semibold text-gray-800">Round up to production minimums after the margin.</span> Apply the % first, then round to whatever your vendor's case/print minimums require.</p>
+    <p><span class="font-semibold text-gray-800">Roll the baseline forward every cycle.</span> Once a season ships, its actuals become part of next year's baseline — don't keep forecasting off a stale year.</p>
+  </div>
+</div>
+
+<!-- Filters -->
+<div class="flex flex-wrap items-end gap-4 mb-6">
+  <div>
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1.5">Season</p>
+    <div class="flex rounded-xl border border-gray-200 overflow-hidden text-sm font-semibold">
+      <button onclick="setSeason('All')"    id="season-All"    class="px-4 py-2 bg-purple-600 text-white">All</button>
+      <button onclick="setSeason('Summer')" id="season-Summer" class="px-4 py-2 bg-white text-gray-600 hover:bg-gray-50">Summer</button>
+      <button onclick="setSeason('Fall')"   id="season-Fall"   class="px-4 py-2 bg-white text-gray-600 hover:bg-gray-50">Fall</button>
+    </div>
+  </div>
+
+  <div>
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1.5">Market</p>
+    <select id="market-select" onchange="render()"
+            class="px-4 py-2 bg-white border border-gray-200 rounded-xl text-sm font-semibold text-gray-700 focus:outline-none focus:border-purple-400">
+      <option value="All">All Markets</option>
+    </select>
+  </div>
+
+  <div>
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1.5">Sport</p>
+    <select id="sport-select" onchange="render()"
+            class="px-4 py-2 bg-white border border-gray-200 rounded-xl text-sm font-semibold text-gray-700 focus:outline-none focus:border-purple-400">
+      <option value="All">All Sports</option>
+    </select>
+  </div>
+
+  <div>
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1.5">Gear Type</p>
+    <select id="gear-select" onchange="render()"
+            class="px-4 py-2 bg-white border border-gray-200 rounded-xl text-sm font-semibold text-gray-700 focus:outline-none focus:border-purple-400">
+      <option value="All">All Gear</option>
+    </select>
+  </div>
+
+  <div>
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1.5">Safety Margin</p>
+    <div class="flex items-center gap-2 px-3 py-2 bg-white border border-gray-200 rounded-xl">
+      <input type="number" id="safety-margin" value="10" min="0" max="500" step="1" oninput="render()"
+             class="w-16 text-sm font-semibold text-gray-800 focus:outline-none">
+      <span class="text-sm text-gray-500 font-semibold">%</span>
+    </div>
+  </div>
+
+  <div>
+    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1.5">New Markets</p>
+    <div class="flex items-center gap-2 px-3 py-2 bg-white border border-gray-200 rounded-xl">
+      <input type="number" id="new-markets-count" value="0" min="0" step="1" oninput="render()"
+             class="w-16 text-sm font-semibold text-gray-800 focus:outline-none">
+      <span class="text-sm text-gray-500 font-semibold">markets</span>
+    </div>
+  </div>
+</div>
+
+<div id="sections"></div>
+
+<template id="section-template">
+  <div class="forecast-section mb-10">
+    <h2 class="section-title text-lg font-bold text-gray-900 mb-3"></h2>
+
+    <div class="empty-state hidden bg-white rounded-2xl border border-dashed border-gray-300 px-6 py-10 text-center text-sm text-gray-400 mb-4"></div>
+
+    <div class="has-data">
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+        <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+          <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">Years on File</p>
+          <p class="text-2xl font-bold text-gray-900 years-count">—</p>
+          <p class="text-xs text-gray-400 mt-0.5 latest-year-note">—</p>
+        </div>
+        <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+          <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">Baseline Units</p>
+          <p class="text-2xl font-bold text-gray-900 baseline-total">—</p>
+          <p class="text-xs text-gray-400 mt-0.5">weighted moving average</p>
+        </div>
+        <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+          <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">+ New Markets</p>
+          <p class="text-2xl font-bold text-blue-600 new-market-total">—</p>
+          <p class="text-xs text-gray-400 mt-0.5 new-market-note">no new markets set</p>
+        </div>
+        <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-5 py-4">
+          <p class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">Forecast Units</p>
+          <p class="text-2xl font-bold text-orange-600 forecast-total">—</p>
+          <p class="text-xs text-gray-400 mt-0.5">(baseline + new markets) + safety margin</p>
+        </div>
+      </div>
+
+      <div class="bg-white rounded-2xl border border-gray-200 shadow-sm px-6 py-5 mb-4">
+        <div class="chart-wrap" style="position:relative; height:280px;">
+          <canvas class="chart-canvas"></canvas>
+        </div>
+      </div>
+
+      <div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b border-gray-100 text-left text-xs font-semibold text-gray-400 uppercase tracking-wide">
+              <th class="px-5 py-3">Gear Type</th>
+              <th class="px-5 py-3">History (by year)</th>
+              <th class="px-5 py-3 text-right">Baseline</th>
+              <th class="px-5 py-3 text-right">Per New Market</th>
+              <th class="px-5 py-3 text-right">Forecast</th>
+            </tr>
+          </thead>
+          <tbody class="gear-rows"></tbody>
+        </table>
+        <div class="reg-note hidden px-5 py-3 text-xs text-gray-400 border-t border-gray-100">
+          * from the Fall 2025 registration/package-attach sheet (players × package add-ons), not a shipped order sheet — treat as a solid but not vendor-confirmed baseline.
+        </div>
+        <div class="new-market-explainer hidden px-5 py-3 text-xs text-gray-400 border-t border-gray-100">
+          "Per New Market" × the New Markets count above = units added for markets with no history yet, before the safety margin is applied to the total.
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script>
+let DATA = null;
+let currentSeason = 'All';
+const charts = {};
+// Per-gear "assumed qty for one new market" typed in by the user, keyed by
+// `${season}|${gear}` so it persists across re-renders and season sections.
+const newMarketDefaults = {};
+
+function setNewMarketDefault(input, season, gear) {
+  newMarketDefaults[`${season}|${gear}`] = parseFloat(input.value) || 0;
+  render();
+}
+
+async function loadForecast(force) {
+  document.getElementById('last-loaded').textContent = 'Loading…';
+  const icon = document.getElementById('refresh-icon');
+  icon.classList.add('spin');
+  try {
+    const res = await fetch('/api/forecast-data' + (force ? '?force=1' : ''));
+    DATA = await res.json();
+    populateSelect('market-select', DATA.markets, 'All Markets');
+    populateSelect('sport-select', DATA.sports, 'All Sports');
+    populateGearSelect();
+    render();
+    document.getElementById('last-loaded').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById('last-loaded').textContent = 'Failed to load — try Refresh';
+  } finally {
+    icon.classList.remove('spin');
+  }
+}
+
+function populateSelect(id, values, allLabel) {
+  const sel = document.getElementById(id);
+  const prev = sel.value || 'All';
+  sel.innerHTML = `<option value="All">${allLabel}</option>`;
+  (values || []).forEach(v => {
+    const opt = document.createElement('option');
+    opt.value = v; opt.textContent = v;
+    sel.appendChild(opt);
+  });
+  if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+}
+
+function populateGearSelect() {
+  const sel = document.getElementById('gear-select');
+  const prev = sel.value || 'All';
+  sel.innerHTML = '<option value="All">All Gear</option>';
+  (DATA.gear_types || []).forEach(g => {
+    const opt = document.createElement('option');
+    opt.value = g; opt.textContent = gearLabel(g);
+    sel.appendChild(opt);
+  });
+  if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+}
+
+function setSeason(s) {
+  currentSeason = s;
+  ['All', 'Summer', 'Fall'].forEach(k => {
+    const btn = document.getElementById('season-' + k);
+    if (k === s) { btn.className = 'px-4 py-2 bg-purple-600 text-white'; }
+    else { btn.className = 'px-4 py-2 bg-white text-gray-600 hover:bg-gray-50'; }
+  });
+  render();
+}
+
+function togglePrinciples() {
+  const body = document.getElementById('principles-body');
+  const btn = document.getElementById('principles-toggle');
+  body.classList.toggle('hidden');
+  btn.textContent = body.classList.contains('hidden') ? 'Show' : 'Hide';
+}
+
+function fmt(n) {
+  return Math.round(n).toLocaleString();
+}
+
+function gearLabel(gear) {
+  return (DATA.gear_display && DATA.gear_display[gear]) || gear;
+}
+
+// Weighted moving average across all years on file, weighted toward the most
+// recent year (weight = position, oldest=1 .. newest=n). With a single year
+// of history this reduces to that year's actual — the only honest baseline
+// when there's nothing yet to average against.
+function weightedBaseline(years, byYear, gear) {
+  let num = 0, den = 0;
+  years.forEach((y, i) => {
+    const w = i + 1;
+    num += w * (byYear[y][gear] || 0);
+    den += w;
+  });
+  return den ? num / den : 0;
+}
+
+function render() {
+  if (!DATA) return;
+
+  const incomplete = DATA.incomplete || [];
+  const notice = document.getElementById('incomplete-notice');
+  if (incomplete.length) {
+    notice.classList.remove('hidden');
+    document.getElementById('incomplete-list').textContent = incomplete.join(' · ');
+  } else {
+    notice.classList.add('hidden');
+  }
+
+  const market = document.getElementById('market-select').value;
+  const sport = document.getElementById('sport-select').value;
+  const gearFilter = document.getElementById('gear-select').value;
+  const margin = parseFloat(document.getElementById('safety-margin').value) || 0;
+  const newMarketsCount = parseFloat(document.getElementById('new-markets-count').value) || 0;
+  const seasons = currentSeason === 'All' ? ['Summer', 'Fall'] : [currentSeason];
+
+  const container = document.getElementById('sections');
+  container.innerHTML = '';
+  const tpl = document.getElementById('section-template');
+
+  seasons.forEach(season => {
+    const node = tpl.content.cloneNode(true);
+    const sectionEl = node.querySelector('.forecast-section');
+    const scopeBits = [
+      market === 'All' ? 'All Markets' : market,
+      sport === 'All' ? null : sport,
+    ].filter(Boolean).join(' · ');
+    node.querySelector('.section-title').textContent = `${season} — ${scopeBits}`;
+
+    const seasonData = (DATA.history && DATA.history[season]) || {};
+    const marketsToSum = market === 'All' ? Object.keys(seasonData) : (seasonData[market] ? [market] : []);
+    const regSet = new Set(DATA.registration_based_years || []);
+
+    // merge years across the chosen market + sport scope: {year: {gear: qty}}
+    // yearIsReg[y] stays true only while every contributing (market, sport) pair
+    // for that year came from the registration sheet rather than a shipped order.
+    const byYear = {};
+    const yearIsReg = {};
+    marketsToSum.forEach(mkt => {
+      const sportsObj = seasonData[mkt] || {};
+      const sportsToSum = sport === 'All' ? Object.keys(sportsObj) : (sportsObj[sport] ? [sport] : []);
+      sportsToSum.forEach(sp => {
+        const yrs = sportsObj[sp] || {};
+        Object.keys(yrs).forEach(y => {
+          byYear[y] = byYear[y] || {};
+          const isReg = regSet.has(`${season}|${mkt}|${sp}|${y}`);
+          yearIsReg[y] = (y in yearIsReg) ? (yearIsReg[y] && isReg) : isReg;
+          Object.entries(yrs[y]).forEach(([gear, qty]) => {
+            byYear[y][gear] = (byYear[y][gear] || 0) + qty;
+          });
+        });
+      });
+    });
+
+    const years = Object.keys(byYear).map(Number).sort((a, b) => a - b);
+
+    if (!years.length) {
+      const scopeLabel = [market === 'All' ? 'any market' : market, sport === 'All' ? null : sport].filter(Boolean).join(' / ');
+      node.querySelector('.empty-state').classList.remove('hidden');
+      node.querySelector('.empty-state').textContent =
+        `No ${season} orders on file yet for ${scopeLabel}. Once a ${season} season ships, its actuals will appear here as your forecasting baseline.`;
+      node.querySelector('.has-data').remove();
+      container.appendChild(node);
+      return;
+    }
+
+    let gearTypes = DATA.gear_types.filter(g => years.some(y => (byYear[y][g] || 0) > 0));
+    if (gearFilter !== 'All') gearTypes = gearTypes.filter(g => g === gearFilter);
+
+    const latestYear = years[years.length - 1];
+    let baselineTotal = 0, forecastTotal = 0, newMarketGrandTotal = 0;
+    const rows = [], chartLabels = [], chartBaseline = [], chartForecast = [];
+
+    gearTypes.forEach(gear => {
+      const baseQty = weightedBaseline(years, byYear, gear);
+      const defaultKey = `${season}|${gear}`;
+      const perMarketQty = newMarketDefaults[defaultKey] || 0;
+      const newMarketQty = perMarketQty * newMarketsCount;
+      const combined = baseQty + newMarketQty;
+      const forecastQty = Math.ceil(combined * (1 + margin / 100));
+      baselineTotal += baseQty;
+      forecastTotal += forecastQty;
+      newMarketGrandTotal += newMarketQty;
+
+      const historyStr = years.map(y => `${y}${yearIsReg[y] ? '*' : ''}: ${fmt(byYear[y][gear] || 0)}`).join('  →  ');
+
+      rows.push(`<tr class="border-b border-gray-50 last:border-0">
+        <td class="px-5 py-3 font-semibold text-gray-800">${gearLabel(gear)}</td>
+        <td class="px-5 py-3 text-gray-400 text-xs">${historyStr}</td>
+        <td class="px-5 py-3 text-right text-gray-700">${fmt(baseQty)}</td>
+        <td class="px-5 py-3 text-right">
+          <input type="number" min="0" step="1" value="${perMarketQty || ''}" placeholder="0"
+                 onchange="setNewMarketDefault(this, '${season}', '${gear}')"
+                 class="w-20 text-right text-sm text-gray-700 border border-gray-200 rounded-lg px-2 py-1 focus:outline-none focus:border-purple-400">
+        </td>
+        <td class="px-5 py-3 text-right font-bold text-orange-600">${fmt(forecastQty)}</td>
+      </tr>`);
+
+      chartLabels.push(gearLabel(gear));
+      chartBaseline.push(Math.round(baseQty));
+      chartForecast.push(forecastQty);
+    });
+
+    if (!gearTypes.length) {
+      node.querySelector('.empty-state').classList.remove('hidden');
+      node.querySelector('.empty-state').textContent = `No history for that gear type in ${season}.`;
+      node.querySelector('.has-data').remove();
+      container.appendChild(node);
+      return;
+    }
+
+    node.querySelector('.years-count').textContent = years.length;
+    node.querySelector('.latest-year-note').textContent = years.length > 1 ? `${years[0]}–${latestYear}, weighted to ${latestYear}` : `${latestYear} only`;
+    node.querySelector('.baseline-total').textContent = fmt(baselineTotal);
+    node.querySelector('.forecast-total').textContent = fmt(forecastTotal);
+    node.querySelector('.new-market-total').textContent = fmt(newMarketGrandTotal);
+    node.querySelector('.new-market-note').textContent = newMarketsCount > 0
+      ? `${newMarketsCount} new market${newMarketsCount === 1 ? '' : 's'} × per-gear qty below`
+      : 'no new markets set';
+    if (years.some(y => yearIsReg[y])) node.querySelector('.reg-note').classList.remove('hidden');
+    if (newMarketsCount > 0) node.querySelector('.new-market-explainer').classList.remove('hidden');
+    node.querySelector('.gear-rows').innerHTML = rows.join('');
+
+    container.appendChild(node);
+
+    const canvas = sectionEl.querySelector('.chart-canvas');
+    const chartId = season;
+    if (charts[chartId]) { charts[chartId].destroy(); }
+    charts[chartId] = new Chart(canvas.getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels: chartLabels,
+        datasets: [
+          {
+            label: 'Baseline (weighted avg)',
+            data: chartBaseline,
+            backgroundColor: '#2a78d6',
+            borderRadius: 4,
+            categoryPercentage: 0.6,
+            barPercentage: 0.85,
+          },
+          {
+            label: newMarketsCount > 0 ? `Forecast (+${margin}% + ${newMarketsCount} new mkt)` : `Forecast (+${margin}%)`,
+            data: chartForecast,
+            backgroundColor: '#eb6834',
+            borderRadius: 4,
+            categoryPercentage: 0.6,
+            barPercentage: 0.85,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { position: 'top', align: 'end', labels: { boxWidth: 10, boxHeight: 10, usePointStyle: true, color: '#52514e', font: { size: 12 } } },
+          tooltip: {
+            backgroundColor: '#0b0b0b',
+            titleFont: { size: 12 }, bodyFont: { size: 12 },
+            callbacks: { label: ctx => `${ctx.dataset.label}: ${fmt(ctx.parsed.y)}` },
+          },
+        },
+        scales: {
+          x: { grid: { display: false }, ticks: { color: '#898781', font: { size: 11 } } },
+          y: { beginAtZero: true, grid: { color: '#e1e0d9' }, ticks: { color: '#898781', font: { size: 11 } } },
+        },
+      },
+    });
+  });
+}
+
+loadForecast(false);
+</script>
+{% endblock %}

@@ -87,6 +87,7 @@ def block_external_admin():
             request.path.startswith('/api/order-sheet') or
             request.path.startswith('/api/shipment-status') or
             request.path.startswith('/api/dashboard-data') or
+            request.path.startswith('/api/forecast-data') or
             request.path.startswith('/api/calendar-events') or
             request.path.startswith('/api/events') or
             request.path.startswith('/api/inventory-data') or
@@ -269,6 +270,7 @@ MARKET_CODES = {
 
 GEAR_CODES = {
     'Jersey': 'JRS',
+    'Flex Jersey': 'FLX',  # reversible/flex-fabric jersey, tracked separately from regular Jersey
     'Hoodie': 'HOD',
     'Tee': 'TEE',
     'Cap': 'CAP',
@@ -4787,7 +4789,7 @@ _SHEET_CACHE_TTL = 600    # 10 minutes
 
 # Maps substrings in order-sheet item names → gear_task key
 _SHEET_GEAR_MAP = [
-    ('flex jersey', 'Jersey'),
+    ('flex jersey', 'Flex Jersey'),
     ('jersey',      'Jersey'),
     ('hoodie',      'Hoodie'),
     ('tee',         'Tee'),
@@ -4805,6 +4807,7 @@ _SHEET_GEAR_MAP = [
 # If the matching tab has only 1 numeric row (a single summary), treat qty as 0.
 _GEAR_TAB_KW = {
     'Jersey':      ['jersey'],
+    'Flex Jersey': ['flex'],
     'Hoodie':      ['hoodie'],
     'Tee':         ['tee'],
     'Cap':         ['cap'],
@@ -4965,7 +4968,7 @@ def _ordered_gear_types(sheet_url: str, force: bool = False) -> dict | None:
                 break
 
         # Gear types without per-row size breakdowns — their tabs have only 1 summary row
-        _SINGLE_ROW_OK = {'Cap', 'Ring', 'Hypechain', 'Name Banner', 'Park Banner', 'Awards'}
+        _SINGLE_ROW_OK = {'Cap', 'Ring', 'Hypechain', 'Name Banner', 'Park Banner', 'Awards', 'Flex Jersey'}
 
         if gear_gid is None:
             confirmed[gear_type] = qty
@@ -5262,6 +5265,11 @@ def dashboard():
     return render_template('dashboard.html')
 
 
+@app.route('/forecast')
+def forecast():
+    return render_template('forecast.html')
+
+
 @app.route('/contents')
 def contents_lookup():
     orders = load_display_orders()
@@ -5409,6 +5417,13 @@ def public_dashboard():
     if not pub_authed():
         return redirect('/public/login?next=/public/dashboard')
     return render_template('public_dashboard.html')
+
+
+@app.route('/public/forecast')
+def public_forecast():
+    if not pub_authed():
+        return redirect('/public/login?next=/public/forecast')
+    return render_template('public_forecast.html')
 
 
 @app.route('/calendar')
@@ -5948,6 +5963,148 @@ def api_dashboard_data():
         })
 
     return jsonify({'ok': True, 'orders': result})
+
+
+def _forecast_season_year(order_date_str: str) -> int | None:
+    """Sport-year bucket: April-March cycle, matching the dashboard's own logic
+    (a season is planned/ordered starting in spring for that calendar year)."""
+    try:
+        dt = datetime.strptime(order_date_str, '%Y-%m-%d')
+    except (TypeError, ValueError):
+        return None
+    return dt.year if dt.month >= 4 else dt.year - 1
+
+
+def _forecast_is_remake(order: dict) -> bool:
+    """Remakes/error-replacement orders are corrections, not incremental demand —
+    exclude them from the forecasting baseline so they don't inflate it.
+
+    A remake doesn't always say so in order_num (e.g. Dallas BSBL "3" and DFW BSBL
+    "2" are plain-numbered but are dedicated remake orders — the "Remake" label
+    only lives on the ClickUp task name). `remake_qty` being set locally is the
+    reliable signal for those; the keyword check catches the ones that do name
+    themselves in order_num/sport (e.g. "DFW BSBL Remake 3").
+    """
+    if order.get('remake_qty'):
+        return True
+    text = f"{order.get('order_num', '')} {order.get('sport', '')}".lower()
+    return any(kw in text for kw in ('remake', 're-order', 'reorder', 'redo'))
+
+
+@app.route('/api/forecast-data')
+def api_forecast_data():
+    from concurrent.futures import ThreadPoolExecutor
+    force = request.args.get('force') == '1'
+    orders = load_display_orders()
+
+    # Pre-fetch all order sheets in parallel (warms _ordered_gear_types' cache)
+    # instead of hitting Google Sheets sequentially, one order at a time.
+    sheet_urls = list({o.get('order_sheet_url', '') for o in orders if o.get('order_sheet_url')})
+    if sheet_urls:
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            list(ex.map(lambda url: _ordered_gear_types(url, force=force), sheet_urls))
+
+    # history[season][market][sport][sport_year][gear_type] = qty
+    history: dict = {}
+    incomplete = []
+    markets_seen = set()
+    sports_seen = set()
+
+    for order in orders:
+        market = order.get('market', '').strip()
+        season = order.get('season', '').strip()
+        sport = order.get('sport', '').strip() or 'Unknown'
+        if not market or not season:
+            continue
+        markets_seen.add(market)
+        sports_seen.add(sport)
+
+        if _forecast_is_remake(order):
+            continue
+
+        year = _forecast_season_year(order.get('order_date', ''))
+        if year is None:
+            continue
+
+        # force=False here: the sheet was already (re-)fetched in the prefetch pass above,
+        # so this just reads the now-warm cache instead of hitting Sheets again per-order.
+        qty_map = order.get('ordered_quantities') or _ordered_gear_types(order.get('order_sheet_url', ''), force=False)
+        if not qty_map:
+            if order.get('total_jersey_qty'):
+                qty_map = {'Jersey': order['total_jersey_qty']}
+            else:
+                incomplete.append(f"{market} {sport} {season} #{order.get('order_num', '')}")
+                continue
+
+        # Rings are never one SKU — split the combined 'Ring' bucket into Champion
+        # Gold / Finalist Silver using the same Awards-tab source the inventory
+        # sync already trusts for this. Forecast-only: doesn't touch GEAR_CODES,
+        # so shipment/inventory/ClickUp gear_task matching on 'Ring' is unaffected.
+        if qty_map.get('Ring'):
+            qty_map = dict(qty_map)
+            ring_qty = qty_map.pop('Ring')
+            ring_rows = _parse_ring_breakdown(order.get('order_sheet_url', ''))
+            if ring_rows:
+                for r in ring_rows:
+                    qty_map[r['name']] = qty_map.get(r['name'], 0) + r['qty']
+            else:
+                qty_map['Ring'] = ring_qty  # Awards tab unreadable/blank — keep combined rather than lose it
+
+        year_bucket = (
+            history.setdefault(season, {})
+                   .setdefault(market, {})
+                   .setdefault(sport, {})
+                   .setdefault(year, {})
+        )
+        for gear, qty in qty_map.items():
+            try:
+                year_bucket[gear] = year_bucket.get(gear, 0) + int(qty)
+            except (TypeError, ValueError):
+                continue
+
+    # Seed in registration-derived history (e.g. Fall 2025, before this app existed)
+    # from data/prior_season_history.json — never overwrites a (season, market,
+    # sport, year) bucket that already has live order-derived data.
+    registration_based = []
+    prior_path = DATA_FOLDER / 'prior_season_history.json'
+    if prior_path.exists():
+        try:
+            prior = json.loads(prior_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            prior = {}
+        for season, markets in prior.items():
+            if season.startswith('_'):
+                continue
+            for market, sports in markets.items():
+                markets_seen.add(market)
+                for sport, years in sports.items():
+                    sports_seen.add(sport)
+                    for year, gear_map in years.items():
+                        existing = history.setdefault(season, {}).setdefault(market, {}).setdefault(sport, {})
+                        if year not in existing:
+                            existing[year] = dict(gear_map)
+                            registration_based.append(f'{season}|{market}|{sport}|{year}')
+
+    # Forecast-local gear list: Ring stays (rare unsplit-sheet fallback) and the
+    # two real SKUs are added alongside it — kept out of GEAR_CODES/ALL_GEAR_TYPES
+    # so shipment/inventory/ClickUp gear_task matching on 'Ring' isn't touched.
+    forecast_gear_types = []
+    for g in ALL_GEAR_TYPES:
+        forecast_gear_types.append(g)
+        if g == 'Ring':
+            forecast_gear_types += ['Champion Gold Ring', 'Finalist Silver Ring']
+
+    return jsonify({
+        'ok': True,
+        'history': history,
+        'incomplete': incomplete,
+        'gear_types': forecast_gear_types,
+        'gear_display': GEAR_DISPLAY,
+        'markets': sorted(markets_seen),
+        'sports': sorted(sports_seen),
+        'seasons': ['Summer', 'Fall'],
+        'registration_based_years': registration_based,
+    })
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────
