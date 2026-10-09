@@ -6087,8 +6087,9 @@ def api_forecast_data():
             history.setdefault(season, {})
                    .setdefault(market, {})
                    .setdefault(sport, {})
-                   .setdefault(year, {})
-        )
+                   .setdefault(str(year), {})  # str: prior_season_history.json merge below uses
+        )                                      # JSON string keys — must match or jsonify's key-sort
+                                                # crashes on mixed str/int dict keys
         for gear, qty in qty_map.items():
             try:
                 year_bucket[gear] = year_bucket.get(gear, 0) + int(qty)
