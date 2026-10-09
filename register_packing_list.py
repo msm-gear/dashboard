@@ -17,16 +17,24 @@ Market key format: "<Market> <Sport> <Season> <Order#>"
   Order#: 1, 2, 3, Freshman, etc.
 """
 
+import os
 import sys
 import json
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from datetime import datetime
 
 DATA_FILE          = Path(__file__).parent / 'data' / 'orders.json'
 PACKING_DOCS_FOLDER = Path(__file__).parent / 'uploads' / 'packing_docs'
 CHROME             = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+# The tracker runs on the MSM server (tracker.msm-hq.com). On the laptop this script makes the PDF
+# with Chrome, then hands both files to the server copy of this script to register them there.
+SERVER     = 'root@161.35.49.217'
+SERVER_KEY = os.path.expanduser('~/.ssh/msm_hetzner')
+SERVER_DIR = '/srv/msm/shipment-tracker'
+ON_SERVER  = Path(__file__).resolve().parent == Path(SERVER_DIR)
 
 
 def find_order(orders, key: str):
@@ -66,7 +74,27 @@ def html_to_pdf(html_path: Path, pdf_path: Path):
     return pdf_path
 
 
-def register(html_path: str, order_key: str, label: str = None):
+def register_remote(html_path: str, order_key: str, label: str = None):
+    """Laptop: PDF locally (Chrome), then register on the server."""
+    html_path = Path(html_path).resolve()
+    if not html_path.exists():
+        print(f'ERROR: HTML file not found: {html_path}')
+        sys.exit(1)
+    ssh = ['ssh', '-i', SERVER_KEY, SERVER]
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_path = Path(tmp) / 'packing.pdf'
+        print(f'Converting {html_path.name} → PDF ...')
+        html_to_pdf(html_path, pdf_path)
+        remote_tmp = subprocess.run(ssh + ['mktemp -d'], capture_output=True, text=True, check=True).stdout.strip()
+        subprocess.run(['scp', '-q', '-i', SERVER_KEY, str(html_path), str(pdf_path), f'{SERVER}:{remote_tmp}/'], check=True)
+        cmd = ['sudo', '-u', 'msm', f'{SERVER_DIR}/.venv/bin/python', f'{SERVER_DIR}/register_packing_list.py', '--from-files',
+               f'{remote_tmp}/{html_path.name}', f'{remote_tmp}/packing.pdf', order_key] + ([label] if label else [])
+        quoted = ' '.join("'" + c.replace("'", "'\\''") + "'" for c in cmd)
+        r = subprocess.run(ssh + [f'chmod -R a+r {remote_tmp} && {quoted}; rc=$?; rm -rf {remote_tmp}; exit $rc'])
+        sys.exit(r.returncode)
+
+
+def register(html_path: str, order_key: str, label: str = None, pdf_ready: str = None):
     html_path = Path(html_path).resolve()
     if not html_path.exists():
         print(f'ERROR: HTML file not found: {html_path}')
@@ -102,8 +130,11 @@ def register(html_path: str, order_key: str, label: str = None):
     html_dest = folder / html_path.name
     shutil.copy2(html_path, html_dest)
 
-    print(f'Converting {html_path.name} → {pdf_name} ...')
-    html_to_pdf(html_path, pdf_path)
+    if pdf_ready:                       # PDF already made on the laptop
+        shutil.copy2(pdf_ready, pdf_path)
+    else:
+        print(f'Converting {html_path.name} → {pdf_name} ...')
+        html_to_pdf(html_path, pdf_path)
     size_kb = pdf_path.stat().st_size // 1024
     print(f'PDF created: {pdf_path} ({size_kb} KB)')
 
@@ -127,12 +158,18 @@ def register(html_path: str, order_key: str, label: str = None):
         json.dump(orders, f, indent=2)
 
     print(f'Registered "{label}" in order {order_id[:8]}…')
-    print(f'Download: http://localhost:5003/packing-doc/{order_id}/{pdf_name}')
+    print(f'Download: https://tracker.msm-hq.com/packing-doc/{order_id}/{pdf_name}')
     return order_id, pdf_name
 
 
 if __name__ == '__main__':
+    if len(sys.argv) >= 5 and sys.argv[1] == '--from-files':     # server side of a laptop run
+        register(sys.argv[2], sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else None, pdf_ready=sys.argv[3])
+        sys.exit(0)
     if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(1)
-    register(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+    if ON_SERVER or os.environ.get('TRACKER_LOCAL') == '1':
+        register(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+    else:
+        register_remote(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)

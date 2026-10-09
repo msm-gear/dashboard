@@ -7,6 +7,7 @@ import re
 import difflib
 import tempfile
 import os
+import sys
 import json
 import uuid
 import csv
@@ -1273,7 +1274,8 @@ def _start_fedex_poller():
     threading.Thread(target=loop, daemon=True).start()
 
 
-_start_fedex_poller()
+if os.getenv('TRACKER_BACKGROUND', '1') != '0':   # off only while testing a second copy
+    _start_fedex_poller()
 
 
 # ── ClickUp → local sync ──────────────────────────────────────────────────────
@@ -1548,7 +1550,8 @@ def _start_clickup_sync():
     threading.Thread(target=loop, daemon=True).start()
 
 
-_start_clickup_sync()
+if os.getenv('TRACKER_BACKGROUND', '1') != '0':   # off only while testing a second copy
+    _start_clickup_sync()
 
 
 TRACKING_STATUSES = [
@@ -1620,6 +1623,8 @@ def _build_mac_message(order: dict, tn: str, tag: str, notes: str) -> str:
 
 
 def _show_mac_popup(message: str):
+    if sys.platform != 'darwin':   # on the server there is no desktop — Slack/email notifications still go out
+        return
     safe = message.replace('\\', '\\\\').replace('"', '\\"')
     script = f'''
 set msg to "{safe}"
@@ -5444,7 +5449,7 @@ def public_order_sheet():
             return redirect('/public/orders-login')
     elif not pub_authed():
         return redirect('/public/login?next=/public/order-sheet')
-    return send_file('/Users/mba/order-sheet-tool/index.html')
+    return send_file(os.getenv('ORDER_SHEET_TOOL_HTML', '/Users/mba/order-sheet-tool/index.html'))
 
 
 @app.route('/public/logos/<path:filename>')
