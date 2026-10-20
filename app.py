@@ -1855,7 +1855,15 @@ def _get_clickup_task(task_id: str, force: bool = False):
             f"https://api.clickup.com/api/v2/task/{task_id}",
             headers=clickup_headers(), timeout=6,
         )
-        task = resp.json() if resp.status_code == 200 else None
+        if resp.status_code != 200:
+            # Rate limit (429) / 5xx is not "no task" — keep the last good copy
+            # instead of caching None for the full TTL (made orders vanish from
+            # the summary whenever ClickUp throttled us).
+            if task_id in _clickup_task_cache and _clickup_task_cache[task_id][1] is not None:
+                return _clickup_task_cache[task_id][1]
+            _clickup_task_cache[task_id] = (now - _CLICKUP_CACHE_TTL + 20, None)
+            return None
+        task = resp.json()
     except Exception:
         # ClickUp slow/unreachable — serve stale cache rather than blow up the request
         if task_id in _clickup_task_cache:
@@ -2601,8 +2609,21 @@ def api_orders_summary():
 
     # Pre-fetch all ClickUp tasks in parallel to avoid a serial stampede of HTTP calls
     all_task_ids = list({tid for o in orders for tid in o.get('gear_tasks', {}).values() if tid})
+
+    def _prefetch(tid):
+        # A forced refresh skips tasks already cached as Delivered/Counted — they
+        # don't change, and re-fetching all ~130 tasks blew ClickUp's 100/min limit.
+        cached = _clickup_task_cache.get(tid, (0, None))[1]
+        if force and cached is not None:
+            try:
+                if int(_get_task_cf(cached, CF_PHASE)) >= 4:
+                    return _get_clickup_task(tid)
+            except (TypeError, ValueError):
+                pass
+        return _get_clickup_task(tid, force=force)
+
     with ThreadPoolExecutor(max_workers=10) as ex:
-        list(ex.map(lambda tid: _get_clickup_task(tid, force=force), all_task_ids))
+        list(ex.map(_prefetch, all_task_ids))
 
     for order in orders:
         gear_tasks = order.get('gear_tasks', {})
