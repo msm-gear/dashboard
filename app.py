@@ -1,6 +1,7 @@
 from __future__ import annotations
 from flask import Flask, render_template, request, session, jsonify, redirect, url_for, send_file, send_from_directory
 from PIL import Image, ImageOps, ImageChops, ImageCms
+import base64
 import io
 import openpyxl
 import re
@@ -2810,6 +2811,80 @@ def push_update_phase():
     return jsonify({'ok': True, 'message': f"Updated {updated} task(s) to {PHASE_LABELS[phase]}."})
 
 
+RECEIVING_LABELS = {0: 'Incorrect', 1: 'Missing', 2: 'Off Colors', 3: 'Accurate'}
+
+
+@app.route('/api/receiving', methods=['POST'])
+def api_receiving():
+    """Receiving condition reported from the Order Portal (gear.msm-hq.com) for one gear type of a
+    delivered shipment. Same ClickUp update as the Receiving Condition form on /orders (phase 5 —
+    Counted, Receiving Condition field, comment) on the gear task + its subtasks for this tracking #,
+    plus the issue photos as task attachments. Server-internal only (the portal runs on this server)."""
+    if request.headers.get('CF-Connecting-IP'):
+        return jsonify({'ok': False, 'error': 'Not available.'}), 404
+    if not get_settings()['clickup_token']:
+        return jsonify({'ok': False, 'error': 'ClickUp not configured.'})
+    body    = request.get_json() or {}
+    order_id = body.get('order_id', '')
+    tn      = (body.get('tracking_number') or '').strip()
+    gear    = (body.get('gear_type') or '').strip()
+    comment = (body.get('comment') or '').strip()
+    try:
+        rcv = int(body.get('receiving_orderindex'))
+        assert rcv in RECEIVING_LABELS
+    except (TypeError, ValueError, AssertionError):
+        return jsonify({'ok': False, 'error': 'Bad receiving condition.'})
+
+    orders = load_orders()
+    order  = next((o for o in orders if o.get('id') == order_id), None)
+    if not order:
+        return jsonify({'ok': False, 'error': 'Order not found.'})
+    task_id = (order.get('gear_tasks') or {}).get(gear)
+
+    # keep the report on the tracker order too (shown with the shipment)
+    rec = order.setdefault('receiving', {}).setdefault(tn, {})
+    rec[gear] = {'condition': RECEIVING_LABELS[rcv], 'orderindex': rcv, 'comment': comment,
+                 'by': body.get('by', ''), 'at': datetime.now().isoformat()}
+    save_orders(orders)
+    if not task_id:
+        return jsonify({'ok': False, 'error': f'No ClickUp task for {gear} on this order.'})
+
+    errors, updated = [], 0
+    def _comment(tid):
+        if comment:
+            requests.post(f"https://api.clickup.com/api/v2/task/{tid}/comment",
+                          headers=clickup_headers(), json={'comment_text': comment}, timeout=25)
+    try:
+        r = set_clickup_field(task_id, CF_PHASE, 5)
+        if r.status_code not in (200, 201):
+            errors.append(f'{gear}: ClickUp {r.status_code}')
+        else:
+            updated += 1
+            set_clickup_field(task_id, CF_RECEIVING, rcv)
+            _comment(task_id)
+            for ph in body.get('photos') or []:
+                try:
+                    requests.post(f"https://api.clickup.com/api/v2/task/{task_id}/attachment",
+                                  headers={'Authorization': get_settings()['clickup_token']},
+                                  files={'attachment': (ph.get('name') or 'photo.jpg',
+                                                        base64.b64decode(ph.get('data') or ''),
+                                                        ph.get('mime') or 'image/jpeg')}, timeout=60)
+                except requests.exceptions.RequestException:
+                    errors.append(f"{gear}: photo {ph.get('name')} not attached (ClickUp slow)")
+            for sub in _get_clickup_subtasks(task_id):
+                if tn and _get_task_cf(sub, CF_TRACKING) != tn:
+                    continue
+                set_clickup_field(sub['id'], CF_PHASE, 5)
+                set_clickup_field(sub['id'], CF_RECEIVING, rcv)
+                _comment(sub['id'])
+    except requests.exceptions.RequestException:
+        errors.append(f'{gear}: ClickUp was slow responding — verify task {task_id} in ClickUp.')
+    _cu_task_cache.pop(task_id, None)   # dashboard re-reads the new condition
+    if errors:
+        return jsonify({'ok': False, 'error': '; '.join(errors), 'updated': updated, 'task_id': task_id})
+    return jsonify({'ok': True, 'message': f'ClickUp {gear}: Counted · {RECEIVING_LABELS[rcv]}', 'task_id': task_id})
+
+
 @app.route('/push/update-ship', methods=['POST'])
 def push_update_ship():
     """Mark a gear type as Shipped: set tracking #, ship date actual, phase=3 on task + subtasks."""
@@ -4381,6 +4456,9 @@ def _build_tracking_payload():
             'season':       order.get('season', ''),
             'order_num':    order.get('num_for_code', order.get('order_num', '')),
             'order_date':   order.get('order_date', ''),
+            'eta_to_zees':  order.get('eta_to_zees', ''),
+            'order_sheet_url': order.get('order_sheet_url', ''),
+            'receiving':    order.get('receiving', {}),
             'shipped_at':   order.get('shipped_at', ''),
             'gear_tasks':   order.get('gear_tasks', {}),
             'shipments':    shipments,
