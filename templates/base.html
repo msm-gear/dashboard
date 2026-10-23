@@ -25,9 +25,11 @@
       <a href="/" class="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
         📂 Upload Packing List
       </a>
+      {% if order_form_enabled %}
       <a href="/order-form" class="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
         📋 New Order
       </a>
+      {% endif %}
       <a href="/orders" class="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
         🗂 My Orders
       </a>
