@@ -4436,7 +4436,9 @@ def _collect_shipments(order: dict) -> list:
         _individual = []  # single-gear groups (one gear per physical box)
         _shared     = []  # multi-gear groups (multiple gear types share a box)
         for grp in _noted.values():
-            if any(b == 0 for b in grp['box_counts']):
+            # Packing-list counts are already distinct physical boxes per gear —
+            # shared notes don't mean shared boxes there, so add them up.
+            if tn in pl_tns or any(b == 0 for b in grp['box_counts']):
                 total = sum(b for b in grp['box_counts'] if b > 0) or 1
             else:
                 total = max(grp['box_counts']) if grp['box_counts'] else 1
