@@ -1856,6 +1856,17 @@ def _get_clickup_task(task_id: str, force: bool = False):
             f"https://api.clickup.com/api/v2/task/{task_id}",
             headers=clickup_headers(), timeout=6,
         )
+        if resp.status_code == 429:
+            # Wait for ClickUp's rate-limit window to reset (capped), then retry once
+            try:
+                wait = float(resp.headers.get('X-RateLimit-Reset', 0)) - time.time()
+            except ValueError:
+                wait = 0
+            time.sleep(min(max(wait, 2), 15))
+            resp = requests.get(
+                f"https://api.clickup.com/api/v2/task/{task_id}",
+                headers=clickup_headers(), timeout=6,
+            )
         if resp.status_code != 200:
             # Rate limit (429) / 5xx is not "no task" — keep the last good copy
             # instead of caching None for the full TTL (made orders vanish from
@@ -2585,7 +2596,25 @@ def orders_list():
 
 
 _orders_summary_cache: dict = {'ts': 0, 'data': None}
-_ORDERS_SUMMARY_TTL = 300  # 5 minutes
+_ORDERS_SUMMARY_TTL = 60   # pending orders refresh every minute
+_SUMMARY_TASK_MAX_AGE = 60
+
+
+def _summary_task(tid: str, max_age: int = _SUMMARY_TASK_MAX_AGE):
+    """ClickUp task for the summary: Delivered/Counted tasks never change, so any
+    cached copy is reused forever; pending tasks are re-fetched once older than
+    max_age (0 = always).  Keeps a refresh to the ~20 pending tasks instead of all
+    ~130, which is what kept tripping ClickUp's 100/min limit."""
+    fetched_at, cached = _clickup_task_cache.get(tid, (0, None))
+    if cached is not None:
+        try:
+            if int(_get_task_cf(cached, CF_PHASE)) >= 4:
+                return cached
+        except (TypeError, ValueError):
+            pass
+        if time.time() - fetched_at < max_age:
+            return cached
+    return _get_clickup_task(tid, force=True)
 
 
 @app.route('/api/orders-summary')
@@ -2611,17 +2640,10 @@ def api_orders_summary():
     # Pre-fetch all ClickUp tasks in parallel to avoid a serial stampede of HTTP calls
     all_task_ids = list({tid for o in orders for tid in o.get('gear_tasks', {}).values() if tid})
 
+    max_age = 0 if force else _SUMMARY_TASK_MAX_AGE
+
     def _prefetch(tid):
-        # A forced refresh skips tasks already cached as Delivered/Counted — they
-        # don't change, and re-fetching all ~130 tasks blew ClickUp's 100/min limit.
-        cached = _clickup_task_cache.get(tid, (0, None))[1]
-        if force and cached is not None:
-            try:
-                if int(_get_task_cf(cached, CF_PHASE)) >= 4:
-                    return _get_clickup_task(tid)
-            except (TypeError, ValueError):
-                pass
-        return _get_clickup_task(tid, force=force)
+        return _summary_task(tid, max_age)
 
     with ThreadPoolExecutor(max_workers=10) as ex:
         list(ex.map(_prefetch, all_task_ids))
@@ -2631,13 +2653,13 @@ def api_orders_summary():
         if not gear_tasks:
             continue
 
-        # Fetch first task for shared date fields (already warm from the prefetch above)
-        first_task = _get_clickup_task(next(iter(gear_tasks.values())))
-        if not first_task:
-            continue
+        # Fetch first task for shared date fields (already warm from the prefetch above).
+        # Fall back to the other gear tasks — one throttled fetch shouldn't hide the order,
+        # and if ClickUp gave us nothing at all, still list it with unknown phases.
+        first_task = next((t for t in map(_summary_task, gear_tasks.values()) if t), None) or {}
 
         def _cf(cf_id):
-            return _get_task_cf(first_task, cf_id)
+            return _get_task_cf(first_task, cf_id) if first_task else None
 
         proofs_ready_est    = _ms_to_date(_cf(CF_PROOFS_READY))
         proofs_approved_est = _ms_to_date(_cf(CF_PROOFS_APPROVED))
@@ -2650,7 +2672,7 @@ def api_orders_summary():
         # Per-gear phases (from gear_tasks ClickUp data) — already warm from the prefetch above
         gear_phases = {}
         for gear, task_id in gear_tasks.items():
-            task = first_task if task_id == next(iter(gear_tasks.values())) else _get_clickup_task(task_id)
+            task = first_task if task_id == first_task.get('id') else _summary_task(task_id)
             if task:
                 val = _get_task_cf(task, CF_PHASE)
                 try:
@@ -3144,8 +3166,19 @@ def push_update_ship():
     return jsonify({'ok': True, 'message': f"Marked {updated} task(s) as Shipped."})
 
 
+# New Order page is laptop-only; the server sets ORDER_FORM_DISABLED=1
+ORDER_FORM_ENABLED = os.getenv('ORDER_FORM_DISABLED', '0') != '1'
+
+
+@app.context_processor
+def _inject_order_form_flag():
+    return {'order_form_enabled': ORDER_FORM_ENABLED}
+
+
 @app.route('/order-form')
 def order_form():
+    if not ORDER_FORM_ENABLED:
+        return 'Not found', 404
     settings = get_settings()
     has_settings = all(settings.values())
     today = datetime.now().strftime('%Y-%m-%d')

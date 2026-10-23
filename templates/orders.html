@@ -6,7 +6,7 @@
 <div class="flex items-center justify-between mb-6">
   <div>
     <h1 class="text-2xl font-bold text-gray-900">Saved Orders</h1>
-    <p class="text-gray-500 text-sm mt-1">{{ orders|length }} order(s) on file</p>
+    <p class="text-gray-500 text-sm mt-1"><span id="ord-shown-count">{{ orders|length }}</span> order(s) on file</p>
   </div>
   <div class="flex items-center gap-3">
     <button id="cu-sync-btn" onclick="syncFromClickUp()"
@@ -17,6 +17,24 @@
   </div>
 </div>
 
+<!-- ── Filters ─────────────────────────────────────────────────────────── -->
+{% set markets = orders|map(attribute='market')|select|unique|sort|list %}
+<div class="flex flex-wrap items-center gap-3 mb-6">
+  <select id="flt-year" onchange="applyOrderFilters()" class="px-3 py-2 rounded-xl border border-gray-300 text-sm text-gray-700 bg-white">
+    <option value="">All years</option>
+  </select>
+  <select id="flt-season" onchange="applyOrderFilters()" class="px-3 py-2 rounded-xl border border-gray-300 text-sm text-gray-700 bg-white">
+    <option value="">All seasons</option>
+    <option value="Summer">Summer</option>
+    <option value="Fall">Fall</option>
+  </select>
+  <select id="flt-market" onchange="applyOrderFilters()" class="px-3 py-2 rounded-xl border border-gray-300 text-sm text-gray-700 bg-white">
+    <option value="">All markets</option>
+    {% for m in markets %}<option value="{{ m }}">{{ m }}</option>{% endfor %}
+  </select>
+  <button onclick="resetOrderFilters()" class="text-xs text-gray-400 hover:text-blue-600">Clear</button>
+</div>
+
 <!-- ── Pending Orders Summary ─────────────────────────────────────────── -->
 <div id="ord-summary-wrap" class="bg-white rounded-2xl border border-gray-200 shadow-sm mb-6 overflow-hidden">
   <div class="px-5 py-3 flex items-center justify-between bg-gray-50 border-b border-gray-100">
@@ -25,7 +43,7 @@
       <span id="ord-summary-count" class="text-xs text-gray-400">Loading…</span>
     </div>
     <div class="flex items-center gap-3">
-      <button onclick="loadOrdSummary()" id="summary-refresh-btn"
+      <button onclick="loadOrdSummary(true)" id="summary-refresh-btn"
               class="text-xs text-gray-400 hover:text-purple-600 flex items-center gap-1 transition-colors">
         <span id="summary-refresh-icon">↻</span> Refresh
       </button>
@@ -208,7 +226,8 @@
 
 <div class="space-y-4">
 {% for order in orders %}
-<div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
+<div class="order-card bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden"
+     data-market="{{ order.market }}" data-season="{{ order.season }}" data-year="{{ (order.get('order_date') or order.get('created_at', ''))[:4] }}">
 
   <!-- Order header -->
   <div class="px-6 py-4 flex items-center justify-between gap-4">
@@ -1025,13 +1044,13 @@ function toggleOrdSummary() {
   if (chevron) chevron.classList.toggle('rotate-180', !_ordSummaryCollapsed);
 }
 
-async function loadOrdSummary() {
+async function loadOrdSummary(force = false) {
   const btn  = document.getElementById('summary-refresh-btn');
   const icon = document.getElementById('summary-refresh-icon');
   if (btn)  btn.disabled = true;
   if (icon) icon.innerHTML = '<svg class="spin w-3 h-3 inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>';
   try {
-    const resp = await fetch('/api/orders-summary');
+    const resp = await fetch('/api/orders-summary' + (force ? '?force=1' : ''));
     const data = await resp.json();
     if (!data.ok) { renderOrdSummaryEmpty('Failed to load'); return; }
 
@@ -1086,7 +1105,8 @@ async function loadOrdSummary() {
       if (minPhase <= 2 && o.ship_est)            estParts.push(`Ship: ${fmtSummaryDate(o.ship_est)}`);
       else if (minPhase === 3 && o.delivery_est)  estParts.push(`Delivery: ${fmtSummaryDate(o.delivery_est)}`);
 
-      return `<tr class="border-t border-gray-100 hover:bg-gray-50 transition-colors">
+      return `<tr class="ord-summary-row border-t border-gray-100 hover:bg-gray-50 transition-colors"
+                  data-market="${o.market}" data-season="${o.season}" data-year="${(o.order_date || '').slice(0, 4)}">
         <td class="px-4 py-3 whitespace-nowrap">
           <span class="font-semibold text-gray-900 text-xs">${o.market}</span>
           <span class="text-gray-400 text-xs"> ${o.season} ${o.sport} · Order #${o.order_num}</span>
@@ -1120,6 +1140,7 @@ async function loadOrdSummary() {
           <tbody>${rows}</tbody>
         </table>
       </div>`;
+    applyOrderFilters();
 
   } catch (e) {
     renderOrdSummaryEmpty('Error: ' + e.message);
@@ -1135,6 +1156,69 @@ function renderOrdSummaryEmpty(msg) {
     `<p class="px-5 py-4 text-xs text-gray-400">${msg}</p>`;
 }
 
+// ── Year / Season / Market filters ─────────────────────────────────────────
+const _FLT_KEY = 'msm-orders-filters';
+
+function _fltValues() {
+  return {
+    year:   document.getElementById('flt-year').value,
+    season: document.getElementById('flt-season').value,
+    market: document.getElementById('flt-market').value,
+  };
+}
+
+function _fltMatch(el, f) {
+  return (!f.year   || el.dataset.year   === f.year)
+      && (!f.season || el.dataset.season === f.season)
+      && (!f.market || el.dataset.market === f.market);
+}
+
+function applyOrderFilters() {
+  const f = _fltValues();
+  try { localStorage.setItem(_FLT_KEY, JSON.stringify(f)); } catch {}
+
+  let shown = 0;
+  document.querySelectorAll('.order-card').forEach(el => {
+    const ok = _fltMatch(el, f);
+    el.classList.toggle('hidden', !ok);
+    if (ok) shown++;
+  });
+  document.getElementById('ord-shown-count').textContent = shown;
+
+  const rows = document.querySelectorAll('.ord-summary-row');
+  if (rows.length) {
+    let pending = 0;
+    rows.forEach(el => {
+      const ok = _fltMatch(el, f);
+      el.classList.toggle('hidden', !ok);
+      if (ok) pending++;
+    });
+    document.getElementById('ord-summary-count').textContent =
+      `${pending} pending order${pending !== 1 ? 's' : ''}`;
+  }
+}
+
+function resetOrderFilters() {
+  ['flt-year', 'flt-season', 'flt-market'].forEach(id => document.getElementById(id).value = '');
+  applyOrderFilters();
+}
+
+(function initOrderFilters() {
+  const yearSel = document.getElementById('flt-year');
+  const years = [...new Set([...document.querySelectorAll('.order-card')].map(el => el.dataset.year).filter(Boolean))]
+    .sort().reverse();
+  years.forEach(y => yearSel.add(new Option(y, y)));
+
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(_FLT_KEY) || '{}'); } catch {}
+  for (const [k, id] of [['year', 'flt-year'], ['season', 'flt-season'], ['market', 'flt-market']]) {
+    const sel = document.getElementById(id);
+    if (saved[k] && [...sel.options].some(o => o.value === saved[k])) sel.value = saved[k];
+  }
+  applyOrderFilters();
+})();
+
 loadOrdSummary();
+setInterval(() => { if (!document.hidden) loadOrdSummary(); }, 60000);
 </script>
 {% endblock %}
