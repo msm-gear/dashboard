@@ -5319,6 +5319,7 @@ def api_shipment_status():
                 bucket['error'] += error_qty
                 tns = list(dict.fromkeys(i['tn'] for i in ship_items if i['tn']))
                 bucket['error_items'].append({
+                    'order_id':   order.get('id', ''),
                     'order':      order_num,
                     'sport':      sport,
                     'gear_type':  gear_type,
