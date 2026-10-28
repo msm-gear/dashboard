@@ -132,6 +132,17 @@ def carrier_info(tn: str) -> dict | None:
                 info = {'picked_up': _iso_day(dts.get('ACTUAL_PICKUP') or dts.get('SHIP')),
                         'delivered': _iso_day(dts.get('ACTUAL_DELIVERY')) if code == 'DL' else None,
                         'source': 'FedEx'}
+                # Multi-box shipment: delivered only when EVERY child box is delivered (date = last box)
+                more = (tr.get('additionalTrackingInfo') or {}).get('hasAssociatedShipments') or \
+                    int((tr.get('packageDetails') or {}).get('count') or 1) > 1
+                kids = app._fedex_children(tn, token) if more else []
+                if len(kids) > 1:
+                    if all(k['tag'] == 'Delivered' for k in kids):
+                        info['delivered'] = max(_iso_day(k['delivered_at']) or info['delivered'] or date.min for k in kids)
+                    else:
+                        info['delivered'] = None
+                        info['in_transit'] = True
+                        info['boxes'] = '%d of %d boxes delivered' % (sum(k['tag'] == 'Delivered' for k in kids), len(kids))
         else:
             res = app._fetch_17track(tn)   # UPS/USPS: 17track gives latest event only
             if res and res.get('tag') == 'Delivered':

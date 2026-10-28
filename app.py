@@ -881,6 +881,62 @@ def _detect_carrier(tn: str) -> str:
 _17TRACK_CARRIER = {'fedex': 100003, 'ups': 100002, 'usps': 100001}
 
 
+_STAGE_ORDER = ['Pending', 'LabelCreated', 'PickedUp', 'InTransitIntl', 'AtCustoms', 'ClearedCustoms',
+                'InTransitDom', 'OutForDelivery', 'Delivered']
+
+
+def _fedex_children(master_tn: str, token: str) -> list:
+    """FedEx multi-piece shipment (MPS): every box has its own child tracking number under the master.
+    → [{tracking_number, tag, last_event, location, country, event_time, delivered_at}] (master included), or []."""
+    try:
+        r = requests.post(
+            'https://apis.fedex.com/track/v1/associatedshipments',
+            json={'includeDetailedScans': False, 'associatedType': 'STANDARD_MPS',
+                  'masterTrackingNumberInfo': {'trackingNumberInfo': {'trackingNumber': master_tn}}},
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json', 'X-locale': 'en_US'},
+            timeout=20,
+        )
+        r.raise_for_status()
+        out = []
+        for c in (r.json().get('output', {}).get('completeTrackResults') or []):
+            for x in c.get('trackResults', []):
+                tn = (x.get('trackingNumberInfo') or {}).get('trackingNumber', '')
+                latest = x.get('latestStatusDetail') or {}
+                code = latest.get('code', '') or latest.get('derivedCode', '')
+                if not tn or not code:
+                    continue
+                loc = latest.get('scanLocation') or {}
+                dts = {d['type']: d['dateTime'] for d in x.get('dateAndTimes', []) or []}
+                desc = latest.get('description', '') or latest.get('statusByLocale', '')
+                tag = _fedex_code_to_stage(code, desc, loc.get('countryCode', ''))
+                out.append({'tracking_number': tn, 'tag': tag, 'last_event': desc,
+                            'location': ', '.join(filter(None, [loc.get('city', ''), loc.get('stateOrProvinceCode', '')])),
+                            'country': loc.get('countryCode', ''),
+                            'event_time': dts.get('ACTUAL_DELIVERY') or dts.get('ACTUAL_PICKUP') or dts.get('SHIP', ''),
+                            'delivered_at': (dts.get('ACTUAL_DELIVERY') or '')[:10] if tag == 'Delivered' else ''})
+        uniq = {c['tracking_number']: c for c in out}
+        return sorted(uniq.values(), key=lambda c: c['tracking_number'])
+    except Exception:
+        return []
+
+
+def _rollup_children(children: list) -> dict:
+    """Master status from its boxes: Delivered only when every box is delivered; otherwise the box
+    furthest behind (an Exception wins). Summary text says how many boxes are delivered."""
+    n = len(children)
+    done = [c for c in children if c['tag'] == 'Delivered']
+    exc = next((c for c in children if c['tag'] == 'Exception'), None)
+    if len(done) == n:
+        last = max(done, key=lambda c: c.get('delivered_at') or c.get('event_time') or '')
+        return {'tag': 'Delivered', 'last_event': f'All {n} boxes delivered', 'location': last['location'],
+                'event_time': last.get('event_time', ''), 'boxes_total': n, 'boxes_delivered': n}
+    worst = exc or min((c for c in children if c['tag'] != 'Delivered'),
+                       key=lambda c: _STAGE_ORDER.index(c['tag']) if c['tag'] in _STAGE_ORDER else 0)
+    return {'tag': worst['tag'], 'last_event': f"{len(done)} of {n} boxes delivered — {worst['tracking_number']}: {worst['last_event']}",
+            'location': worst['location'], 'event_time': worst.get('event_time', ''),
+            'boxes_total': n, 'boxes_delivered': len(done)}
+
+
 def _fetch_fedex(tracking_number: str) -> dict | None:
     if _detect_carrier(tracking_number) != 'fedex':
         return None  # FedEx API only handles FedEx numbers
@@ -928,7 +984,16 @@ def _fetch_fedex(tracking_number: str) -> dict | None:
         if not code:
             return None
         stage = _fedex_code_to_stage(code, desc, country)
-        return {'tag': stage, 'last_event': desc, 'location': location, 'event_time': event_time}
+        res = {'tag': stage, 'last_event': desc, 'location': location, 'event_time': event_time,
+               'master_only': {'tag': stage, 'last_event': desc, 'location': location, 'event_time': event_time}}
+        # Multi-box shipment: the master can say Delivered while a child box is still on its way
+        info = track_results.get('additionalTrackingInfo') or {}
+        count = int((track_results.get('packageDetails') or {}).get('count') or 1)
+        if info.get('hasAssociatedShipments') or count > 1:
+            children = _fedex_children(tracking_number, token)
+            if len(children) > 1:
+                res.update(_rollup_children(children), children=children)
+        return res
     except Exception:
         return None
 
@@ -1209,6 +1274,9 @@ def check_all_fedex_statuses(notify_changes: bool = False) -> dict:
                 continue
             new     = results[tn]
             cur     = statuses.get(tn, {})
+            # Past-year orders are left as they were: no box roll-up (could reopen an old delivered order)
+            if new.get('children') and str(order.get('order_date') or order.get('created_at') or '')[:4] < str(datetime.now().year):
+                new = dict(new['master_only'])
             new_tag = new['tag']
 
             # Extract delivery date from carrier event timestamp
@@ -1221,8 +1289,10 @@ def check_all_fedex_statuses(notify_changes: bool = False) -> dict:
                 except (ValueError, TypeError):
                     pass
 
-            # Skip if status unchanged AND delivered_at already recorded
-            if new_tag == cur.get('tag') and (new_tag != 'Delivered' or cur.get('delivered_at')):
+            # Skip if status unchanged AND delivered_at already recorded (and the boxes haven't moved)
+            box_sig = [(c['tracking_number'], c['tag']) for c in new.get('children') or []]
+            cur_sig = [(c['tracking_number'], c['tag']) for c in cur.get('children') or []]
+            if new_tag == cur.get('tag') and (new_tag != 'Delivered' or cur.get('delivered_at')) and box_sig == cur_sig:
                 continue
 
             note = new['last_event']
@@ -1236,8 +1306,12 @@ def check_all_fedex_statuses(notify_changes: bool = False) -> dict:
                 'updated_at': _now_cst().isoformat(),
                 'auto':       True,
             }
+            if new.get('children'):
+                entry.update(children=new['children'], boxes_total=new['boxes_total'], boxes_delivered=new['boxes_delivered'])
             if new_tag == 'Delivered':
                 entry['delivered_at'] = delivered_at or cur.get('delivered_at', '')
+            elif cur.get('tag') == 'Delivered' and new.get('children'):
+                entry['reopened'] = f"was marked Delivered {cur.get('delivered_at', '')} — not every box has arrived"
             statuses[tn] = entry
             updated += 1
 
@@ -4490,6 +4564,12 @@ def _collect_shipments(order: dict) -> list:
             'location':        saved.get('location', ''),
             'updated_at':      saved.get('updated_at', ''),
             'delivered_at':    saved.get('delivered_at', ''),
+            # FedEx multi-box shipment: one child tracking number per box, logged under this master
+            'children':        [dict(c, status_label=_tag_info(c.get('tag'))[0], status_color=_tag_info(c.get('tag'))[1])
+                                for c in saved.get('children') or []],
+            'boxes_total':     saved.get('boxes_total'),
+            'boxes_delivered': saved.get('boxes_delivered'),
+            'reopened':        saved.get('reopened', ''),
         })
 
     return shipments

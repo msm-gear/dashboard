@@ -259,6 +259,27 @@ async function copySummary(uid, s, order) {
 }
 
 // ── Shipment card ─────────────────────────────────────────────────────────────
+// FedEx multi-box shipment: each box's own tracking number, logged under the master
+function renderChildren(s) {
+  const kids = s.children || [];
+  if (kids.length < 2) return '';
+  const done = kids.filter(c => c.tag === 'Delivered').length;
+  return `<div class="mb-4 rounded-lg border ${done < kids.length ? 'border-amber-300 bg-amber-50/40' : 'border-gray-100'} px-3 py-2">
+    <div class="flex items-center justify-between text-xs font-semibold text-gray-600 mb-1">
+      <span>📦 ${kids.length} boxes under this tracking number</span>
+      <span class="${done < kids.length ? 'text-amber-700' : 'text-green-700'}">${done} of ${kids.length} delivered</span></div>
+    ${s.reopened ? `<div class="text-xs text-amber-800 mb-1">⚠️ ${s.reopened}</div>` : ''}
+    <div class="divide-y divide-gray-100">${kids.map(c => {
+      const st = ALL_STATUSES.find(x => x.tag === c.tag) || { label: c.status_label || c.tag, color: c.status_color || 'gray' };
+      return `<div class="flex flex-wrap items-center gap-x-3 gap-y-1 py-1.5 text-xs">
+        <a href="${carrierUrl(c.tracking_number, s.carrier)}" target="_blank" rel="noopener" class="font-mono text-blue-600 hover:underline">${c.tracking_number}</a>
+        ${c.tracking_number === s.tracking_number ? '<span class="text-gray-400">(master)</span>' : ''}
+        ${badge(st.label, st.color)}
+        <span class="text-gray-500">${c.last_event || ''}${c.location ? ' · ' + c.location : ''}</span>
+        ${c.delivered_at ? `<span class="ml-auto text-gray-400">Delivered ${c.delivered_at}</span>` : ''}</div>`;
+    }).join('')}</div></div>`;
+}
+
 function renderShipment(s, order, idx) {
   const orderId  = order.id;
   const uid      = `${orderId.slice(0,8)}-${idx}`;
@@ -338,6 +359,7 @@ function renderShipment(s, order, idx) {
     <div class="mb-4 px-1">
       ${renderStepper(s.tag)}
     </div>
+    ${renderChildren(s)}
 
     <!-- Update form -->
     <div class="flex flex-wrap items-center gap-2 pt-3 border-t border-gray-100">
