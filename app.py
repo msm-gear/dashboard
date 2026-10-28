@@ -512,6 +512,27 @@ def build_task_name(market: str, season: str, sport: str, gear: str, order_num: 
     return f"{market} {season} {sport} {gear} {order_num}"
 
 
+def season_gear(gear: str, season: str) -> str:
+    """Jackets are season-gated: Fall orders get Cage Jacket, Summer orders Windbreaker."""
+    if season == 'Fall' and gear == 'Windbreaker':
+        return 'Cage Jacket'
+    if season == 'Summer' and gear == 'Cage Jacket':
+        return 'Windbreaker'
+    return gear
+
+
+def _order_gear_qty(order: dict, force: bool = False) -> dict | None:
+    """_ordered_gear_types for an order's sheet, with jackets mapped to the order's season."""
+    qty_map = _ordered_gear_types(order.get('order_sheet_url', ''), force=force)
+    if not qty_map:
+        return qty_map
+    out: dict = {}
+    for g, q in qty_map.items():
+        k = season_gear(g, order.get('season', ''))
+        out[k] = out.get(k, 0) + q
+    return out
+
+
 def normalize_gear(raw: str) -> str:
     raw = raw.strip().lower()
     mapping = {
@@ -3475,14 +3496,15 @@ def push_clickup():
     if not rows:
         return jsonify({'ok': False, 'error': 'No shipment data loaded.'})
 
-    by_gear = defaultdict(list)
-    for r in rows:
-        by_gear[r['gear_type']].append(r)
-
     market, order_num = _pick_canonical_market(rows)
 
     sport       = meta.get('sport', 'BSBL')
     season      = meta.get('season', '') or 'Summer'
+
+    by_gear = defaultdict(list)
+    for r in rows:
+        r['gear_type'] = season_gear(r['gear_type'], season)
+        by_gear[r['gear_type']].append(r)
     order_date  = meta.get('order_date', '')
     ship_date   = meta.get('ship_date', '')
     order_sheet = meta.get('order_sheet_url', '')
@@ -3834,7 +3856,7 @@ def push_clickup_order_only():
     order_date  = body.get('order_date', '')
     eta_zees    = body.get('eta_to_zees', '')
     order_sheet = body.get('order_sheet_url', '')
-    gear_types  = body.get('gear_types', [])
+    gear_types  = list(dict.fromkeys(season_gear(g, season) for g in body.get('gear_types', [])))
 
     if not market or not gear_types:
         return jsonify({'ok': False, 'error': 'Market and at least one gear type are required.'})
@@ -5270,7 +5292,7 @@ def api_shipment_status():
         packing_list      = order.get('packing_list', [])
         sheet_url         = order.get('order_sheet_url', '')
 
-        ordered_gear = _ordered_gear_types(sheet_url, force=force)  # None = couldn't read sheet
+        ordered_gear = _order_gear_qty(order, force=force)  # None = couldn't read sheet
 
         for gear_type, task_id in gear_tasks.items():
             has_evidence = any(
@@ -6102,7 +6124,7 @@ def api_dashboard_data():
             'order_status':     order_status,
             'remake_qty':       order.get('remake_qty'),
             'order_jersey_qty': order.get('total_jersey_qty'),
-            'total_gear_qty':   sum((_ordered_gear_types(order.get('order_sheet_url','')) or {}).values()) or order.get('total_jersey_qty'),
+            'total_gear_qty':   sum((_order_gear_qty(order) or {}).values()) or order.get('total_jersey_qty'),
         })
 
     return jsonify({'ok': True, 'orders': result})
@@ -6187,7 +6209,7 @@ def api_forecast_data():
 
         # force=False here: the sheet was already (re-)fetched in the prefetch pass above,
         # so this just reads the now-warm cache instead of hitting Sheets again per-order.
-        qty_map = order.get('ordered_quantities') or _ordered_gear_types(order.get('order_sheet_url', ''), force=False)
+        qty_map = order.get('ordered_quantities') or _order_gear_qty(order, force=False)
         if not qty_map:
             if order.get('total_jersey_qty'):
                 qty_map = {'Jersey': order['total_jersey_qty']}
@@ -6906,7 +6928,7 @@ def _sync_delivered_to_inventory(order: dict, tn: str) -> None:
         return
 
     synced      = order.setdefault('inventory_synced_gears', [])
-    ordered_qty = _ordered_gear_types(order_sheet_url) or {}
+    ordered_qty = _order_gear_qty(order) or {}
     sport_name  = dict(SPORTS).get(order.get('sport', ''), order.get('sport', ''))
     season      = order.get('season', '')
     year        = _order_year(order)
@@ -7444,7 +7466,7 @@ def api_packing_verifier_data(order_id):
     packing_list_rows = order.get('packing_list', [])
     has_packing_list  = bool(packing_list_rows)
 
-    ordered_qty_map = _ordered_gear_types(order.get('order_sheet_url', '')) or {}
+    ordered_qty_map = _order_gear_qty(order) or {}
 
     shipped_by_gear = {}
     for ms in manual_shipments:
@@ -7646,7 +7668,7 @@ def api_generate_packing_list(order_id):
     gear_tasks        = order.get('gear_tasks', {})
     sheet_url         = order.get('order_sheet_url', '')
 
-    ordered_qty_map = _ordered_gear_types(sheet_url) or order.get('ordered_quantities', {})
+    ordered_qty_map = _order_gear_qty(order) or order.get('ordered_quantities', {})
 
     # Collect unique tracking numbers in order of first appearance
     seen_tns = []
