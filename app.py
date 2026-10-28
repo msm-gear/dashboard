@@ -271,8 +271,7 @@ MARKET_CODES = {
 }
 
 GEAR_CODES = {
-    'Jersey': 'JRS',
-    'Flex Jersey': 'FLX',  # reversible/flex-fabric jersey, tracked separately from regular Jersey
+    'Jersey': 'JRS',       # includes Flex Jerseys — never a separate gear type / ClickUp task
     'Hoodie': 'HOD',
     'Tee': 'TEE',
     'Cap': 'CAP',
@@ -4928,7 +4927,7 @@ _SHEET_CACHE_TTL = 600    # 10 minutes
 
 # Maps substrings in order-sheet item names → gear_task key
 _SHEET_GEAR_MAP = [
-    ('flex jersey', 'Flex Jersey'),
+    ('flex jersey', 'Jersey'),   # Flex Jerseys always count as Jerseys (qty added in)
     ('jersey',      'Jersey'),
     ('hoodie',      'Hoodie'),
     ('tee',         'Tee'),
@@ -4946,7 +4945,6 @@ _SHEET_GEAR_MAP = [
 # If the matching tab has only 1 numeric row (a single summary), treat qty as 0.
 _GEAR_TAB_KW = {
     'Jersey':      ['jersey'],
-    'Flex Jersey': ['flex'],
     'Hoodie':      ['hoodie'],
     'Tee':         ['tee'],
     'Cap':         ['cap'],
@@ -5071,6 +5069,7 @@ def _ordered_gear_types(sheet_url: str, force: bool = False) -> dict | None:
 
     # Parse home page: col B (index 1) = item name, col E (index 4) = qty
     candidate_qty: dict[str, int] = {}
+    flex_qty = 0
     for row in csv.reader(StringIO(csv_resp.text)):
         if len(row) < 5:
             continue
@@ -5084,9 +5083,13 @@ def _ordered_gear_types(sheet_url: str, force: bool = False) -> dict | None:
             continue
         for substr, gear_type in _SHEET_GEAR_MAP:
             if substr in name_cell:
-                if gear_type not in candidate_qty:
+                if substr == 'flex jersey':
+                    flex_qty += int(qty)
+                elif gear_type not in candidate_qty:
                     candidate_qty[gear_type] = int(qty)
                 break
+    if flex_qty:
+        candidate_qty['Jersey'] = candidate_qty.get('Jersey', 0) + flex_qty
 
     if not candidate_qty:
         _sheet_cache[sheet_id] = {'ts': time.time(), 'gear_types': {}}
@@ -5107,7 +5110,7 @@ def _ordered_gear_types(sheet_url: str, force: bool = False) -> dict | None:
                 break
 
         # Gear types without per-row size breakdowns — their tabs have only 1 summary row
-        _SINGLE_ROW_OK = {'Cap', 'Ring', 'Hypechain', 'Name Banner', 'Park Banner', 'Awards', 'Flex Jersey'}
+        _SINGLE_ROW_OK = {'Cap', 'Ring', 'Hypechain', 'Name Banner', 'Park Banner', 'Awards'}
 
         if gear_gid is None:
             confirmed[gear_type] = qty
