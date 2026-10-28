@@ -260,10 +260,18 @@ async function copySummary(uid, s, order) {
 
 // ── Shipment card ─────────────────────────────────────────────────────────────
 // FedEx multi-box shipment: each box's own tracking number, logged under the master
-function renderChildren(s) {
+async function setBoxGear(orderId, tn, row) {
+  const gear = row.querySelector('select').value, box = row.querySelector('input').value.trim();
+  const r = await fetch('/api/box-gear', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ order_id: orderId, tracking_number: tn, gear, box }) }).then(r => r.json()).catch(() => ({ ok: false }));
+  row.querySelector('.bg-saved').textContent = r.ok ? '✓ saved' : '✗ not saved';
+}
+
+function renderChildren(s, orderId) {
   const kids = s.children || [];
   if (kids.length < 2) return '';
   const done = kids.filter(c => c.tag === 'Delivered').length;
+  const gears = [...new Set((s.gear_summary || []).map(g => g.gear))];
   return `<div class="mb-4 rounded-lg border ${done < kids.length ? 'border-amber-300 bg-amber-50/40' : 'border-gray-100'} px-3 py-2">
     <div class="flex items-center justify-between text-xs font-semibold text-gray-600 mb-1">
       <span>📦 ${kids.length} boxes under this tracking number</span>
@@ -275,6 +283,12 @@ function renderChildren(s) {
         <a href="${carrierUrl(c.tracking_number, s.carrier)}" target="_blank" rel="noopener" class="font-mono text-blue-600 hover:underline">${c.tracking_number}</a>
         ${c.tracking_number === s.tracking_number ? '<span class="text-gray-400">(master)</span>' : ''}
         ${badge(st.label, st.color)}
+        <span class="inline-flex items-center gap-1" title="Which gear is in this box (ClickUp is set to Delivered per gear once all its boxes arrive)">
+          <select class="border border-gray-200 rounded px-1 py-0.5 text-xs bg-white" onchange="setBoxGear('${orderId}','${c.tracking_number}',this.closest('div'))">
+            <option value="">gear?</option>${gears.map(g => `<option ${c.gear === g ? 'selected' : ''}>${g}</option>`).join('')}</select>
+          <input class="border border-gray-200 rounded px-1 py-0.5 text-xs w-14" placeholder="box #" value="${c.box || ''}"
+                 onchange="setBoxGear('${orderId}','${c.tracking_number}',this.closest('div'))">
+          <span class="bg-saved text-gray-400"></span></span>
         <span class="text-gray-500">${c.last_event || ''}${c.location ? ' · ' + c.location : ''}</span>
         ${c.delivered_at ? `<span class="ml-auto text-gray-400">Delivered ${c.delivered_at}</span>` : ''}</div>`;
     }).join('')}</div></div>`;
@@ -359,7 +373,7 @@ function renderShipment(s, order, idx) {
     <div class="mb-4 px-1">
       ${renderStepper(s.tag)}
     </div>
-    ${renderChildren(s)}
+    ${renderChildren(s, orderId)}
 
     <!-- Update form -->
     <div class="flex flex-wrap items-center gap-2 pt-3 border-t border-gray-100">

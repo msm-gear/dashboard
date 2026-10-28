@@ -937,6 +937,56 @@ def _rollup_children(children: list) -> dict:
             'boxes_total': n, 'boxes_delivered': len(done)}
 
 
+def _box_gear(order: dict, child_tn: str) -> dict:
+    """{'gear', 'box'} set for one box of a multi-box shipment ({} if unknown)."""
+    return (order.get('box_gear') or {}).get(child_tn) or {}
+
+
+def _gears_ready(order: dict, master_tn: str, children: list) -> list:
+    """Gears of this shipment whose boxes have ALL arrived. A box with no gear set holds back every gear."""
+    ship = next((s for s in _collect_shipments(order) if s['tracking_number'] == master_tn), None)
+    gears = [g['gear'] for g in (ship or {}).get('gear_summary', [])]
+    ready = []
+    for g in gears:
+        mine = [c for c in children if _box_gear(order, c['tracking_number']).get('gear') in (g, None)]
+        if mine and all(c['tag'] == 'Delivered' for c in mine):
+            ready.append(g)
+    return ready
+
+
+def _box_comment(order: dict, master_tn: str, children: list) -> str:
+    n = len(children)
+    done = sum(c['tag'] == 'Delivered' for c in children)
+    lines = [f"📬 Sub-tracking for FedEx {master_tn} — {n} boxes, {done} of {n} delivered"]
+    for c in children:
+        bg = _box_gear(order, c['tracking_number'])
+        what = ' '.join(filter(None, [bg.get('gear', ''), f"box {bg['box']}" if bg.get('box') else ''])) or 'box'
+        st = f"Delivered {c['delivered_at']}" if c['tag'] == 'Delivered' else f"{_tag_info(c['tag'])[0]}"
+        lines.append(f"• {c['tracking_number']}{' (master)' if c['tracking_number'] == master_tn else ''} — {what} — {st}")
+    return '\n'.join(lines)
+
+
+def _post_box_comments(order: dict, master_tn: str, children: list) -> None:
+    """ClickUp comment on each gear task in this shipment listing its boxes' tracking numbers.
+    Posted when the boxes are first found and again whenever a box is delivered (not on every scan)."""
+    sig = ','.join(f"{c['tracking_number']}:{int(c['tag'] == 'Delivered')}" for c in children) + \
+        '|' + ','.join(f"{k}={v.get('gear')}{v.get('box')}" for k, v in sorted((order.get('box_gear') or {}).items()))
+    seen = order.setdefault('box_comment_sig', {})
+    if seen.get(master_tn) == sig or not get_settings().get('clickup_token'):
+        return
+    ship = next((s for s in _collect_shipments(order) if s['tracking_number'] == master_tn), None)
+    text = _box_comment(order, master_tn, children)
+    for g in [x['gear'] for x in (ship or {}).get('gear_summary', [])]:
+        tid = (order.get('gear_tasks') or {}).get(g)
+        if tid:
+            try:
+                requests.post(f"https://api.clickup.com/api/v2/task/{tid}/comment", headers=clickup_headers(),
+                              json={'comment_text': text}, timeout=25)
+            except requests.exceptions.RequestException:
+                return          # try again next poll
+    seen[master_tn] = sig
+
+
 def _fetch_fedex(tracking_number: str) -> dict | None:
     if _detect_carrier(tracking_number) != 'fedex':
         return None  # FedEx API only handles FedEx numbers
@@ -1288,6 +1338,25 @@ def check_all_fedex_statuses(notify_changes: bool = False) -> dict:
                     delivered_at = et
                 except (ValueError, TypeError):
                     pass
+
+            # Multi-box shipment: comment the boxes on ClickUp, and deliver each gear once ITS boxes are in
+            if new.get('children') and new_tag != 'Delivered' and order.get('gear_tasks') and get_settings()['clickup_token']:
+                _post_box_comments(order, tn, new['children'])
+                done_g = order.setdefault('gear_delivered_synced', {}).setdefault(tn, [])
+                fresh = [g for g in _gears_ready(order, tn, new['children']) if g not in done_g]
+                if fresh:
+                    last = max((c.get('delivered_at') or '' for c in new['children'] if c['tag'] == 'Delivered'), default='')
+                    try:
+                        ms = int(datetime.strptime(last, '%Y-%m-%d').replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+                    except ValueError:
+                        ms = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+                    try:
+                        if not _sync_delivered_to_clickup(order, tn, ms, all_orders=orders, gears_only=fresh):
+                            done_g.extend(fresh)
+                    except Exception:
+                        pass
+            elif new.get('children') and order.get('gear_tasks'):
+                _post_box_comments(order, tn, new['children'])
 
             # Skip if status unchanged AND delivered_at already recorded (and the boxes haven't moved)
             box_sig = [(c['tracking_number'], c['tag']) for c in new.get('children') or []]
@@ -2044,7 +2113,7 @@ def _delivery_order_status(estimated_ms, actual_ms) -> int:
 
 
 def _sync_delivered_to_clickup(order: dict, tn: str, actual_delivery_ms: int,
-                               all_orders: list = None) -> list:
+                               all_orders: list = None, gears_only: list | None = None) -> list:
     """
     For all gears in this shipment:
       - Set CF_PHASE = 4 (Delivered), CF_DELIVERY_DATE_ACT, CF_ORDER_STATUS on parent task.
@@ -2064,6 +2133,8 @@ def _sync_delivered_to_clickup(order: dict, tn: str, actual_delivery_ms: int,
         return [f'Tracking {tn} not found in order.']
 
     gears = [s['gear'] for s in ship['gear_summary']]
+    if gears_only is not None:          # multi-box shipment: only the gears whose boxes have all arrived
+        gears = [g for g in gears if g in gears_only]
 
     # Build a cross-order task ID lookup for gears missing from this order
     fallback_tasks: dict = {}
@@ -4565,7 +4636,9 @@ def _collect_shipments(order: dict) -> list:
             'updated_at':      saved.get('updated_at', ''),
             'delivered_at':    saved.get('delivered_at', ''),
             # FedEx multi-box shipment: one child tracking number per box, logged under this master
-            'children':        [dict(c, status_label=_tag_info(c.get('tag'))[0], status_color=_tag_info(c.get('tag'))[1])
+            'children':        [dict(c, status_label=_tag_info(c.get('tag'))[0], status_color=_tag_info(c.get('tag'))[1],
+                                     gear=_box_gear(order, c['tracking_number']).get('gear', ''),
+                                     box=_box_gear(order, c['tracking_number']).get('box', ''))
                                 for c in saved.get('children') or []],
             'boxes_total':     saved.get('boxes_total'),
             'boxes_delivered': saved.get('boxes_delivered'),
@@ -4834,6 +4907,25 @@ def update_tracking_status():
         parts.append(f'ClickUp: {"; ".join(cu_errors)}')
 
     return jsonify({'ok': True, 'message': ' '.join(parts)})
+
+
+@app.route('/api/box-gear', methods=['POST'])
+def api_box_gear():
+    """Set which gear (and box #) a child tracking number of a multi-box shipment holds."""
+    body = request.get_json() or {}
+    orders = load_orders()
+    order = next((o for o in orders if o.get('id') == body.get('order_id')), None)
+    tn = (body.get('tracking_number') or '').strip()
+    if not order or not tn:
+        return jsonify({'ok': False, 'error': 'Order / tracking # not found.'})
+    bg = order.setdefault('box_gear', {})
+    gear, box = (body.get('gear') or '').strip(), str(body.get('box') or '').strip()
+    if gear or box:
+        bg[tn] = {'gear': gear, 'box': box}
+    else:
+        bg.pop(tn, None)
+    save_orders(orders)
+    return jsonify({'ok': True})
 
 
 @app.route('/api/sync-delivered', methods=['POST'])
