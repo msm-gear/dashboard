@@ -1357,6 +1357,8 @@ def check_all_fedex_statuses(notify_changes: bool = False) -> dict:
                         pass
             elif new.get('children') and order.get('gear_tasks'):
                 _post_box_comments(order, tn, new['children'])
+            if new.get('children') and order.get('inventory_pending_boxes'):
+                _release_pending_boxes(order, new['children'])
 
             # Skip if status unchanged AND delivered_at already recorded (and the boxes haven't moved)
             box_sig = [(c['tracking_number'], c['tag']) for c in new.get('children') or []]
@@ -7208,6 +7210,55 @@ def _sync_delivered_to_inventory(order: dict, tn: str) -> None:
     _save_inv_stock(stock)
     if log_entries is not None:
         _save_inv_log(log_entries)
+
+
+def _inventory_box(order: dict, gear: str, teams: list, sign: int, note: str) -> int:
+    """Add (sign=+1) or take back (sign=-1) one box's worth of a team+size gear in HQ Inventory —
+    used when a multi-box shipment was stocked in before every box had arrived. Returns units moved."""
+    norm = lambda x: re.sub(r'[^a-z0-9]', '', str(x or '').lower())
+    want = {norm(t) for t in teams}
+    rows = [r for r in _parse_order_gear_breakdown(order.get('order_sheet_url', ''), gear) if norm(r['team']) in want]
+    if not rows:
+        return 0
+    sport_name = dict(SPORTS).get(order.get('sport', ''), order.get('sport', ''))
+    year = _order_year(order)
+    inv_type = _ORDER_GEAR_TO_INV_TYPE.get(gear, gear)
+    gear_code = _INVENTORY_SKU_PREFIX.get(gear) or GEAR_CODES.get(gear, gear[:3].upper())
+    item_name = _order_item_name(gear, year, sport_name)
+    stock, log_entries, now, moved = _load_inv_stock(), _load_inv_log(), _fmt_cst(), 0
+    for r in rows:
+        meta = {'gear_type': inv_type, 'name': item_name, 'sport': sport_name,
+                'code': f"{gear_code}{year[-2:]}-{_team_abbr(r['team'])}-{r['size']}", 'season': order.get('season', ''),
+                'status': 'Active', 'color': r['color'], 'size': r['size'], 'team': r['team']}
+        key = _item_key(meta)
+        saved = stock.get(key, {})
+        before = saved.get('current_stock', 0) or 0
+        new_in = max(0, (saved.get('stock_in', 0) or 0) + sign * r['qty'])
+        new_out = saved.get('stock_out', 0) or 0
+        stock[key] = {'stock_in': new_in, 'stock_out': new_out, 'current_stock': new_in - new_out, 'last_updated': now}
+        log_entries.insert(0, {'id': str(uuid.uuid4()), 'timestamp': now, 'server_time': now, 'code': meta['code'],
+                               'name': item_name, 'gear_type': inv_type, 'size': r['size'],
+                               'direction': 'in' if sign > 0 else 'out', 'qty': r['qty'], 'stock_before': before,
+                               'stock_after': new_in - new_out, 'by': 'Auto (Delivery)', 'note': note})
+        moved += r['qty']
+    _save_inv_stock(stock)
+    _save_inv_log(log_entries)
+    return moved
+
+
+def _release_pending_boxes(order: dict, children: list) -> None:
+    """A box taken back out of inventory (not delivered yet) goes back in once FedEx shows it delivered."""
+    pend = order.get('inventory_pending_boxes') or {}
+    for c in children:
+        p = pend.get(c['tracking_number'])
+        if p and c['tag'] == 'Delivered':
+            label = f"{order.get('market')} {order.get('season')} Order #{order.get('order_num')}"
+            try:
+                _inventory_box(order, p['gear'], p['teams'], +1,
+                               f"Auto-received on delivery — {label} · {p['gear']} box {p.get('box', '')} (FedEx {c['tracking_number']})")
+                pend.pop(c['tracking_number'], None)
+            except Exception:
+                pass
 
 
 @app.route('/inventory')
