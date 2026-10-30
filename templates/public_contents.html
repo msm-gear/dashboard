@@ -37,7 +37,7 @@
         {% for r in rows %}
         <tr class="hover:bg-gray-50 contents-row"
             data-search="{{ [r.gear, r.order_label, r.tracking, r.contents, r.market, r.sport] | join(' ') | lower }}">
-          <td class="px-5 py-3 font-semibold text-gray-800">{{ r.gear | gear_display }}</td>
+          <td class="px-5 py-3 font-semibold text-gray-800">{{ r.gear | gear_label }}</td>
           <td class="px-4 py-3 text-gray-600 whitespace-nowrap">{{ r.order_label }}</td>
           <td class="px-4 py-3 font-mono text-xs text-blue-600 whitespace-nowrap">{{ r.tracking }}</td>
           <td class="px-4 py-3 text-center">

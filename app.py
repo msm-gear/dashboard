@@ -50,6 +50,12 @@ FlaskSession(app)
 def gear_display_filter(gear: str) -> str:
     return GEAR_DISPLAY.get(gear, gear)
 
+
+@app.template_filter('gear_label')
+def gear_label(gear: str) -> str:
+    """Name reading: Name Banner and Park Banner are always just 'Banner' on the pages."""
+    return 'Banner' if gear in _OLD_BANNER_GEARS else gear_display_filter(gear)
+
 PUBLIC_PASS = 'GearUp@MSM2026'
 
 ORDERS_PASSES = {'GearUp2Sell26!', 'GearUp@MSM2026'}  # Zee | MSM
@@ -280,13 +286,16 @@ GEAR_CODES = {
     'Ring': 'RNG',
     'Hypechain': 'HYC',
     'Awards': 'AWD',       # Rings & Hype Chains shipped together
-    'Park Banner': 'BAN',
+    'Banner': 'BAN',       # Name + Park Banner are one gear from Fall 2026 on
+    'Park Banner': 'BAN',  # orders created before that keep separate tasks
     'Name Banner': 'NBN',
     'Hybrid Pullover': 'HYP',
     'Drawstring Bag':  'BAG',
 }
 
 ALL_GEAR_TYPES = list(GEAR_CODES.keys())  # preserves insertion order
+_OLD_BANNER_GEARS = {'Name Banner', 'Park Banner'}
+ORDER_FORM_GEAR_TYPES = [g for g in ALL_GEAR_TYPES if g not in _OLD_BANNER_GEARS]
 
 GEAR_DISPLAY = {
     'Drawstring Bag': 'Drawstring Bags',
@@ -361,7 +370,7 @@ def date_to_mmddyy(date_str: str) -> str:
 # Accessories (rings/chains/banners) take top priority so they can be tracked.
 # Jersey/Hoodie/etc. rank below them.
 GEAR_PRIORITY = [
-    'Ring', 'Hypechain', 'Awards', 'Park Banner', 'Name Banner',
+    'Ring', 'Hypechain', 'Awards', 'Banner', 'Park Banner', 'Name Banner',
     'Cage Jacket', 'Cap', 'Windbreaker', 'Hybrid Pullover',
     'Jersey', 'Hoodie', 'Tee',
 ]
@@ -462,6 +471,7 @@ _DIRECT_GEARS = {
     'Cap':         14,
     'Hypechain':   7,
     'Name Banner': 5,
+    'Banner':      5,
     'Ring':        14,
 }
 
@@ -521,6 +531,13 @@ def season_gear(gear: str, season: str) -> str:
     return gear
 
 
+def banner_gear(gear: str, order: dict | None) -> str:
+    """Name/Park Banner are one 'Banner' gear, unless the order already has the old separate tasks."""
+    if gear in _OLD_BANNER_GEARS and not (_OLD_BANNER_GEARS & set((order or {}).get('gear_tasks', {}))):
+        return 'Banner'
+    return gear
+
+
 def _order_gear_qty(order: dict, force: bool = False) -> dict | None:
     """_ordered_gear_types for an order's sheet, with jackets mapped to the order's season."""
     qty_map = _ordered_gear_types(order.get('order_sheet_url', ''), force=force)
@@ -528,7 +545,7 @@ def _order_gear_qty(order: dict, force: bool = False) -> dict | None:
         return qty_map
     out: dict = {}
     for g, q in qty_map.items():
-        k = season_gear(g, order.get('season', ''))
+        k = banner_gear(season_gear(g, order.get('season', '')), order)
         out[k] = out.get(k, 0) + q
     return out
 
@@ -2720,7 +2737,7 @@ def orders_list():
             gt = m.get('gear_type', '')
             if gt and gt not in all_gears:
                 all_gears.append(gt)
-        o['display_gears'] = all_gears
+        o['display_gears'] = list(dict.fromkeys(gear_label(g) for g in all_gears))
 
     # Build flat list of unique (order, individual-tn) pairs — one row per tracking number
     manual_tns = []
@@ -2782,6 +2799,16 @@ def _summary_task(tid: str, max_age: int = _SUMMARY_TASK_MAX_AGE):
         if time.time() - fetched_at < max_age:
             return cached
     return _get_clickup_task(tid, force=True)
+
+
+def _banner_phases(gear_phases: dict) -> dict:
+    """Show old Name/Park Banner tasks as one Banner row, at the phase of the one furthest behind."""
+    old = [gear_phases[g] for g in gear_phases if g in _OLD_BANNER_GEARS]
+    out = {g: p for g, p in gear_phases.items() if g not in _OLD_BANNER_GEARS}
+    if old:
+        known = [p for p in old if p is not None]
+        out['Banner'] = min(known) if known else None
+    return out
 
 
 @app.route('/api/orders-summary')
@@ -2869,7 +2896,7 @@ def api_orders_summary():
             'sport':       order.get('sport', ''),
             'order_num':   order.get('num_for_code', order.get('order_num', '')),
             'order_date':  order.get('order_date', ''),
-            'gear_phases': gear_phases,
+            'gear_phases': _banner_phases(gear_phases),
             'proofs_ready_est':    proofs_ready_est,
             'proofs_approved_est': proofs_approved_est,
             'ship_est':     ship_est,
@@ -3353,7 +3380,7 @@ def order_form():
                            sports=SPORTS,
                            seasons=SEASONS,
                            markets=MARKETS,
-                           gear_types=ALL_GEAR_TYPES,
+                           gear_types=ORDER_FORM_GEAR_TYPES,
                            has_settings=has_settings,
                            today=today)
 
@@ -3649,8 +3676,9 @@ def push_clickup():
     season      = meta.get('season', '') or 'Summer'
 
     by_gear = defaultdict(list)
+    _existing = find_order(market, order_num, sport, season)
     for r in rows:
-        r['gear_type'] = season_gear(r['gear_type'], season)
+        r['gear_type'] = banner_gear(season_gear(r['gear_type'], season), _existing)
         by_gear[r['gear_type']].append(r)
     order_date  = meta.get('order_date', '')
     ship_date   = meta.get('ship_date', '')
@@ -4003,7 +4031,8 @@ def push_clickup_order_only():
     order_date  = body.get('order_date', '')
     eta_zees    = body.get('eta_to_zees', '')
     order_sheet = body.get('order_sheet_url', '')
-    gear_types  = list(dict.fromkeys(season_gear(g, season) for g in body.get('gear_types', [])))
+    _existing   = find_order(market, order_num, sport, season)
+    gear_types  = list(dict.fromkeys(banner_gear(season_gear(g, season), _existing) for g in body.get('gear_types', [])))
 
     if not market or not gear_types:
         return jsonify({'ok': False, 'error': 'Market and at least one gear type are required.'})
@@ -4584,7 +4613,7 @@ def _collect_shipments(order: dict) -> list:
         label, color = _tag_info(tag)
         gear_notes = info.get('gear_notes', {})
         gear_summary = [
-            {'gear': g, 'boxes': c, 'notes': gear_notes.get(g, '')}
+            {'gear': g, 'label': gear_label(g), 'boxes': c, 'notes': gear_notes.get(g, '')}
             for g, c in sorted(info['gear_types'].items())
         ]
         # Build display groups: gear types with the same non-empty notes share a line;
@@ -4598,7 +4627,8 @@ def _collect_shipments(order: dict) -> list:
                 if n not in _noted:
                     _noted[n] = {'gears': [], 'box_counts': []}
                 _noted[n]['box_counts'].append(g['boxes'])
-                _noted[n]['gears'].append(g['gear'])
+                if g['label'] not in _noted[n]['gears']:
+                    _noted[n]['gears'].append(g['label'])
             else:
                 _solo.append(g)
         _individual = []  # single-gear groups (one gear per physical box)
@@ -4616,11 +4646,13 @@ def _collect_shipments(order: dict) -> list:
                 _individual.append(line)
             else:
                 _shared.append(line)
-        for g in sorted(_solo, key=lambda x: x['gear']):
-            if g['boxes'] == 0:
-                continue
-            bw = 'box' if g['boxes'] == 1 else 'boxes'
-            _individual.append(f"{g['gear']} × {g['boxes']} {bw}")
+        _solo_boxes: dict = {}
+        for g in _solo:
+            if g['boxes']:
+                _solo_boxes[g['label']] = _solo_boxes.get(g['label'], 0) + g['boxes']
+        for label, boxes in sorted(_solo_boxes.items()):
+            bw = 'box' if boxes == 1 else 'boxes'
+            _individual.append(f"{label} × {boxes} {bw}")
         gear_groups = sorted(_individual) + _shared
         shipments.append({
             'tracking_number': tn,
@@ -5149,6 +5181,7 @@ _GEAR_TAB_KW = {
     'Hypechain':   ['hype', 'necklace'],
     'Name Banner': ['name banner'],
     'Park Banner': ['park banner'],
+    'Banner':      ['banner'],
 }
 
 
@@ -5476,7 +5509,7 @@ def api_shipment_status():
             if ordered_gear is not None and gear_type not in ordered_gear and not has_evidence:
                 continue
 
-            bucket      = market_gear[market][gear_type]
+            bucket      = market_gear[market][gear_label(gear_type)]
             task_info   = _get_task_error_info(task_id)  # warm from prefetch above
             is_error    = bool(task_info and task_info.get('is_error'))
             reason      = (task_info or {}).get('reason') if is_error else None
@@ -5960,6 +5993,7 @@ def api_order_sheet_teams():
         'Hypechain':   ['hype chain', 'hypechain'],
         'Name Banner': ['name banner', 'banner'],
         'Park Banner': ['park banner', 'banner'],
+        'Banner':      ['banner'],
     }
     keywords = GEAR_KEYWORDS.get(gear_type, [gear_type.lower()])
 
@@ -7999,12 +8033,13 @@ def api_generate_packing_list(order_id):
             team_count = len(all_teams)
 
             # Gears where item counts take priority over size data
-            _ITEM_COUNT_GEARS = {'Ring', 'Hypechain', 'Park Banner', 'Name Banner', 'Drawstring Bag', 'Awards'}
+            _ITEM_COUNT_GEARS = {'Ring', 'Hypechain', 'Banner', 'Park Banner', 'Name Banner', 'Drawstring Bag', 'Awards'}
             _ITEM_KWS = {
                 'Ring': ('ring', 'champion', 'finalist'),
                 'Hypechain': ('necklace', 'hypechain'),
                 'Park Banner': ('parkbanner', 'parkbannner', 'park banner'),
                 'Name Banner': ('namebanner', 'name banner'),
+                'Banner': ('parkbanner', 'parkbannner', 'park banner', 'namebanner', 'name banner'),
                 'Cap': ('cap',),
                 'Drawstring Bag': ('bag',),
             }

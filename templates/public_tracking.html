@@ -210,7 +210,7 @@ function renderShipment(s, order, idx) {
   const info  = ALL_STATUSES.find(st => st.tag === s.tag) || { label: s.status_label, color: 'gray' };
   const stuck = stuckInfo(s);
   const gearTags = s.gear_summary.map(g =>
-    `<span class="inline-block bg-gray-100 text-gray-700 text-xs px-2.5 py-1 rounded-full font-medium">${g.gear} × ${g.boxes} box${g.boxes !== 1 ? 'es' : ''}</span>`
+    `<span class="inline-block bg-gray-100 text-gray-700 text-xs px-2.5 py-1 rounded-full font-medium">${g.label || g.gear} × ${g.boxes} box${g.boxes !== 1 ? 'es' : ''}</span>`
   ).join(' ');
   const updatedStr = fmtRelative(s.updated_at);
   const stuckBanner = stuck ? `

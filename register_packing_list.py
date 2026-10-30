@@ -90,7 +90,7 @@ def register_remote(html_path: str, order_key: str, label: str = None):
         cmd = ['sudo', '-u', 'msm', f'{SERVER_DIR}/.venv/bin/python', f'{SERVER_DIR}/register_packing_list.py', '--from-files',
                f'{remote_tmp}/{html_path.name}', f'{remote_tmp}/packing.pdf', order_key] + ([label] if label else [])
         quoted = ' '.join("'" + c.replace("'", "'\\''") + "'" for c in cmd)
-        r = subprocess.run(ssh + [f'chmod -R a+r {remote_tmp} && {quoted}; rc=$?; rm -rf {remote_tmp}; exit $rc'])
+        r = subprocess.run(ssh + [f'chmod -R a+rX {remote_tmp} && {quoted}; rc=$?; rm -rf {remote_tmp}; exit $rc'])
         sys.exit(r.returncode)
 
 
